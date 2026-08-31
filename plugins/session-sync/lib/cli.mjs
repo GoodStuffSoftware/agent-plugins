@@ -14,7 +14,8 @@
  */
 
 import { push, pull, preflight, remoteNewer } from './sync.mjs';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { notify } from './notify.mjs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 
@@ -22,6 +23,7 @@ const REMOTE = process.env.CLAUDE_SESSION_SYNC_REMOTE || 'gdrive:Claude/live';
 const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 const LOG = join(STATE_DIR, 'sync.log');
 const LAST_PULL = join(STATE_DIR, 'last-pull.txt');
+const SETUP_NAGGED = join(STATE_DIR, 'setup-reminded.txt');
 
 function ensureState() { try { mkdirSync(STATE_DIR, { recursive: true }); } catch {} }
 function log(line) {
@@ -34,6 +36,36 @@ function log(line) {
 const cmd = process.argv[2] || 'status';
 const strict = process.argv.includes('--strict');
 const quiet = process.argv.includes('--quiet');
+
+/**
+ * An unconfigured plugin is INERT, and silence is how it stays that way: the
+ * hook runs, finds no rclone, logs, exits 0, and the user never learns their
+ * conversations aren't syncing. Tell them — once. Nagging every session for a
+ * setup step they may have deliberately deferred is its own failure.
+ */
+function remindSetupOnce(reason) {
+  log(`not configured: ${reason}`);
+  if (quiet || existsSync(SETUP_NAGGED)) return;
+  try {
+    ensureState();
+    writeFileSync(SETUP_NAGGED, new Date().toISOString());
+    notify(
+      'Claude session sync is not set up',
+      `${reason} Your conversations are NOT syncing. Run /session-sync:setup to finish.`,
+      { persist: true, tag: 'session-sync-setup' },
+    );
+  } catch {}
+}
+
+// Sync commands are pointless without a working rclone + remote. Check once,
+// up front, so the failure is a clear message rather than a stack trace.
+if (cmd === 'push' || cmd === 'pull' || cmd === 'auto-pull') {
+  const p = preflight(REMOTE);
+  if (!p.rclone) { remindSetupOnce('rclone is not installed.'); process.exit(0); }
+  if (!p.remoteConfigured) { remindSetupOnce(`No rclone remote matching "${REMOTE}".`); process.exit(0); }
+  // Configured again after a lapse — allow a future reminder.
+  try { if (existsSync(SETUP_NAGGED)) unlinkSync(SETUP_NAGGED); } catch {}
+}
 
 try {
   if (cmd === 'status') {

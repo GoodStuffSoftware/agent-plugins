@@ -76,9 +76,24 @@ These cost real debugging time. If you're building something similar, they'll sa
 
 Every one of those first surfaced as a sync that reported success and transferred nothing. If you take one thing from this repo, take that: **check bytes moved, not exit codes.**
 
-## Requirements
+## Requirements, and the rclone dependency
 
-Node 18+ (Claude Code already requires it), rclone, and a configured rclone remote. Windows / macOS / Linux — Windows paths are verified on real machines; macOS and Linux use Electron's standard userData locations and are probed rather than assumed.
+Node 18+ (Claude Code already requires it), **rclone**, and a configured rclone remote.
+
+rclone is a separate install, and that is a deliberate trade. `/session-sync:setup` can run the
+install for you (`winget` / `brew` / `apt`) with your approval, but `rclone config` is yours to
+run — it is a browser sign-in to your own cloud account.
+
+**What the dependency buys:** rclone holds the credentials, so this plugin never sees, stores or
+transmits a token. It also brings 40+ storage backends, resumable transfers, retry and rate
+limiting — all things a hand-rolled uploader gets wrong. Bundling a ~50 MB binary per platform or
+vendoring cloud SDKs would mean *we* handle your OAuth tokens; using git as the transport (what
+most alternatives do) breaks down past a few gigabytes and is against GitHub's acceptable use
+policy for bulk storage.
+
+**Until setup is done the plugin is inert** — it notifies you once, logs, and exits cleanly. A
+missing or broken rclone can never fail a Claude session: every hook path exits 0 unless you pass
+`--strict`. Windows / macOS / Linux — Windows paths are verified on real machines; macOS and Linux use Electron's standard userData locations and are probed rather than assumed.
 
 ## License
 
