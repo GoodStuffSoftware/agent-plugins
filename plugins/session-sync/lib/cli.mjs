@@ -18,6 +18,7 @@
 import { push, pull, preflight, remoteNewer } from './sync.mjs';
 import { notify } from './notify.mjs';
 import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE } from './config.mjs';
+import { acquireLock } from './lock.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -28,6 +29,7 @@ const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 const LOG = join(STATE_DIR, 'sync.log');
 const LAST_PULL = join(STATE_DIR, 'last-pull.txt');
 const SETUP_NAGGED = join(STATE_DIR, 'setup-reminded.txt');
+const LOCK_FILE = join(STATE_DIR, 'sync.lock');
 
 function ensureState() { try { mkdirSync(STATE_DIR, { recursive: true }); } catch {} }
 function log(line) {
@@ -177,13 +179,21 @@ try {
   }
 
   if (cmd === 'push') {
-    log(`push -> ${REMOTE}`);
-    const r = await push(REMOTE, { quiet, onLog: log });
-    log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
-    process.exit(r.ok || !strict ? 0 : 1);
+    // Hooks fire per conversation; several ending together would otherwise race.
+    const lock = acquireLock(LOCK_FILE);
+    if (!lock.acquired) { log(`push skipped — ${lock.reason}`); process.exit(0); }
+    try {
+      log(`push -> ${REMOTE}`);
+      const r = await push(REMOTE, { quiet, onLog: log });
+      log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
+      process.exit(r.ok || !strict ? 0 : 1);
+    } finally { lock.release(); }
   }
 
   if (cmd === 'pull') {
+    const lock = acquireLock(LOCK_FILE);
+    if (!lock.acquired) { log(`pull skipped — ${lock.reason}`); process.exit(0); }
+    process.on('exit', () => lock.release());
     log(`pull <- ${REMOTE}`);
     const r = await pull(REMOTE, { quiet, onLog: log });
     if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); }
@@ -192,6 +202,9 @@ try {
   }
 
   if (cmd === 'auto-pull') {
+    const lock = acquireLock(LOCK_FILE);
+    if (!lock.acquired) { log(`auto-pull skipped — ${lock.reason}`); process.exit(0); }
+    process.on('exit', () => lock.release());
     // Cheap: reads one tiny marker file. Safe to call often.
     const since = existsSync(LAST_PULL) ? readFileSync(LAST_PULL, 'utf8').trim() : null;
     const hit = await remoteNewer(REMOTE, since);

@@ -2,6 +2,8 @@
   "hooks": {
     "SessionStart": [
       {
+        "_comment": "startup and resume ONLY. SessionStart also fires on 'compact', 'clear' and 'fork' — all of which happen mid-conversation on the SAME machine, where there is nothing to restore. Pulling then is at best wasted work and at worst writes over files the running session is using.",
+        "matcher": "startup|resume",
         "hooks": [
           {
             "type": "command",
@@ -13,6 +15,8 @@
     ],
     "SessionEnd": [
       {
+        "_comment": "Hooks fire PER CONVERSATION, not per client. Several conversations ending together means several concurrent pushes at one remote, so cli.mjs takes a lock and later arrivals no-op rather than race. 'clear' is excluded: clearing context is not finishing work, and it would push on every /clear.",
+        "matcher": "logout|prompt_input_exit|resume|other",
         "hooks": [
           {
             "type": "command",
