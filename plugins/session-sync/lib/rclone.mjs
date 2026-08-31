@@ -145,3 +145,26 @@ function findShallow(root, name, depth) {
   }
   return null;
 }
+
+/**
+ * Is this remote actually a local filesystem path?
+ *
+ * Matters because the pacing flags exist for Google Drive's API quota. Applying
+ * --tpslimit 8 to a USB copy throttles ~9,700 files to about twenty minutes for
+ * no reason at all.
+ *
+ * rclone's own rule: "name:" is a remote if a remote by that name is configured;
+ * a Windows drive letter is otherwise treated as a path. We mirror that, and
+ * fall back to asking the filesystem.
+ */
+export function isLocalRemote(remote, conf = findRcloneConf()) {
+  if (!remote) return false;
+  const s = String(remote);
+  if (s.startsWith('/') || s.startsWith('./') || s.startsWith('\\')) return true;
+  const i = s.indexOf(':');
+  if (i < 1) return true;                       // no remote prefix at all
+  const name = s.slice(0, i);
+  if (name.length === 1) return true;           // C:\... — a drive letter
+  if (conf && hasRemote(name, conf)) return false;   // a real configured remote
+  return existsSync(s);                          // otherwise: does it exist on disk?
+}

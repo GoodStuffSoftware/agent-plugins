@@ -13,12 +13,12 @@
 import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync, unlinkSync } from 'node:fs';
-import { relative, dirname } from 'node:path';
+import { relative, dirname, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveAll, SESSION_DIRS } from './paths.mjs';
 import { planIncremental, commitManifest } from './manifest.mjs';
 import { classifyReplacement, lostCount } from './transcript.mjs';
-import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote } from './rclone.mjs';
+import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote, isLocalRemote } from './rclone.mjs';
 import { notify } from './notify.mjs';
 
 const MARKER = '.last-push';
@@ -59,6 +59,7 @@ function withExcludes(args, excludes) {
  */
 export async function push(remote, { quiet = false, onLog = () => {}, force = false } = {}) {
   const { map, resolved } = buildMap(remote);
+  const paced = !isLocalRemote(remote);   // API pacing is pointless on a local disk
   if (resolved.missing.length) {
     onLog(`warning: session store(s) not found: ${resolved.missing.join(', ')} — the desktop sidebar may not restore on the far side`);
   }
@@ -98,9 +99,9 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
       // never appear in the list. (Its match is by basename, so it is if
       // anything stricter than the rclone patterns.)
       const listFile = writeFileList(m.files);
-      args = ['copy', m.local, m.remote, ...copyFlags(), '--files-from', listFile, '--no-traverse'];
+      args = ['copy', m.local, m.remote, ...copyFlags({ paced }), '--files-from', listFile, '--no-traverse'];
     } else {
-      args = withExcludes(['copy', m.local, m.remote, ...copyFlags()], m.excludes);
+      args = withExcludes(['copy', m.local, m.remote, ...copyFlags({ paced })], m.excludes);
     }
     const { code, stderr } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
     if (code !== 0) { failed++; onLog(`ERROR (${code}): ${m.label}${stderr ? ' — ' + stderr.trim().split('\n')[0] : ''}`); }
@@ -130,6 +131,7 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
  */
 export async function pull(remote, { quiet = false, onLog = () => {} } = {}) {
   const { map } = buildMap(remote);
+  const paced = !isLocalRemote(remote);
   if (!quiet) notify('Restoring your conversations…', 'Pulling the latest from your remote. Please wait before asking anything — history is still loading.', { persist: true, tag: 'sync' });
 
   const t0 = Date.now();
@@ -145,7 +147,7 @@ export async function pull(remote, { quiet = false, onLog = () => {} } = {}) {
     // '--update' keeps a NEWER local file: a stale remote can never clobber
     // work you just did on this machine.
     const args = withExcludes(
-      ['copy', m.remote, m.local, ...copyFlags(), '--backup-dir', join(backupDir, m.label.replace(/[^\w.-]/g, '_'))],
+      ['copy', m.remote, m.local, ...copyFlags({ paced }), '--backup-dir', join(backupDir, m.label.replace(/[^\w.-]/g, '_'))],
       m.excludes,
     );
     const { code } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
@@ -227,13 +229,20 @@ export function preflight(remote) {
   const rclone = findRclone();
   const conf = findRcloneConf();
   const remoteName = String(remote).split(':')[0];
+  // A local filesystem path is a perfectly valid rclone target and has no
+  // [section] in rclone.conf. Demanding one refused legitimate configs such as
+  // a USB drive, which is the fastest way to seed a new machine.
+  const local = isLocalRemote(remote, conf);
+  const configured = local ? existsSync(String(remote).replace(/\//g, sep)) || existsSync(String(remote))
+                           : (!!conf && hasRemote(remoteName, conf));
   return {
     ...resolved,
     rclone,
     rcloneConf: conf,
     remote,
-    remoteConfigured: !!conf && hasRemote(remoteName, conf),
-    ready: !!rclone && !!conf && hasRemote(remoteName, conf) && resolved.claudeHomeExists,
+    remoteIsLocal: local,
+    remoteConfigured: configured,
+    ready: !!rclone && configured && resolved.claudeHomeExists,
   };
 }
 
