@@ -1,7 +1,7 @@
 {
   "name": "session-sync",
   "description": "Roam Claude Code conversations between machines. Syncs the transcripts AND the desktop app's session index, so chats come back in the sidebar instead of only via `claude --resume`.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Good Stuff Software",
     "url": "https://github.com/GoodStuffSoftware"
@@ -9,5 +9,12 @@
   "homepage": "https://github.com/GoodStuffSoftware/agent-plugins/tree/main/plugins/session-sync",
   "repository": "https://github.com/GoodStuffSoftware/agent-plugins",
   "license": "MIT",
-  "keywords": ["sync", "backup", "sessions", "roaming", "rclone", "multi-machine"]
+  "keywords": [
+    "sync",
+    "backup",
+    "sessions",
+    "roaming",
+    "rclone",
+    "multi-machine"
+  ]
 }
