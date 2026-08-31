@@ -1,0 +1,15 @@
+{
+  "name": "@goodstuffsoftware/claude-session-sync",
+  "version": "0.1.0",
+  "description": "Roam Claude Code conversations between machines - restored in the desktop sidebar, not just resumable from the terminal.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/marker.test.mjs",
+    "status": "node lib/cli.mjs status"
+  }
+}

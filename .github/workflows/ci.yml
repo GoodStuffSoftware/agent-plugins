@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Unit tests
+        working-directory: plugins/session-sync
+        run: npm test
+
+      # Path resolution must not throw on a machine with no Claude install and
+      # no rclone. `status` exits 1 when the machine isn't set up, which is the
+      # correct answer here - we only assert it ran and produced valid JSON.
+      - name: Path resolution does not crash on a bare machine
+        working-directory: plugins/session-sync
+        shell: bash
+        run: |
+          set +e
+          out="$(node lib/cli.mjs status)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ $code -gt 1 ]; then
+            echo "::error::status exited $code - expected 0 (ready) or 1 (not configured)"
+            exit 1
+          fi
+          echo "$out" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.platform)throw new Error("no platform in status output");console.log("resolved platform:",j.platform)})'
+
+  validate:
+    name: claude plugin validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate marketplace manifest
+        run: claude plugin validate . --strict
+
+      - name: Validate plugin manifest
+        run: claude plugin validate ./plugins/session-sync --strict
