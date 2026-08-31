@@ -182,12 +182,13 @@ try {
     // Hooks fire per conversation; several ending together would otherwise race.
     const lock = acquireLock(LOCK_FILE);
     if (!lock.acquired) { log(`push skipped — ${lock.reason}`); process.exit(0); }
-    try {
-      log(`push -> ${REMOTE}`);
-      const r = await push(REMOTE, { quiet, onLog: log });
-      log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
-      process.exit(r.ok || !strict ? 0 : 1);
-    } finally { lock.release(); }
+    // NOT try/finally: process.exit() does not run finally blocks, which leaked
+    // the lock file on every run. 'exit' fires on explicit exit too.
+    process.on('exit', () => lock.release());
+    log(`push -> ${REMOTE}`);
+    const r = await push(REMOTE, { quiet, onLog: log });
+    log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
+    process.exit(r.ok || !strict ? 0 : 1);
   }
 
   if (cmd === 'pull') {

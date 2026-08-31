@@ -12,15 +12,18 @@
 
 import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync, unlinkSync } from 'node:fs';
+import { relative, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveAll, SESSION_DIRS } from './paths.mjs';
 import { planIncremental, commitManifest } from './manifest.mjs';
+import { classifyReplacement, lostCount } from './transcript.mjs';
 import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote } from './rclone.mjs';
 import { notify } from './notify.mjs';
 
 const MARKER = '.last-push';
 const MANIFEST_FILE = join(homedir(), '.claude', 'session-sync', 'manifest.json');
+const CONFLICT_ROOT = join(homedir(), '.claude', 'session-sync', 'conflicts');
 
 /** Write an rclone --files-from list (one relative path per line). */
 function writeFileList(files) {
@@ -131,21 +134,43 @@ export async function pull(remote, { quiet = false, onLog = () => {} } = {}) {
 
   const t0 = Date.now();
   let failed = 0;
+
+  // Anything about to be OVERWRITTEN goes here first instead of being destroyed.
+  // Without this, a transcript you extended on this machine is silently replaced
+  // by the remote copy and those messages are gone.
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupDir = join(CONFLICT_ROOT, stamp);
+
   for (const m of map) {
     // '--update' keeps a NEWER local file: a stale remote can never clobber
     // work you just did on this machine.
-    const args = withExcludes(['copy', m.remote, m.local, ...copyFlags()], m.excludes);
+    const args = withExcludes(
+      ['copy', m.remote, m.local, ...copyFlags(), '--backup-dir', join(backupDir, m.label.replace(/[^\w.-]/g, '_'))],
+      m.excludes,
+    );
     const { code } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
     if (code !== 0) { failed++; onLog(`ERROR (${code}): ${m.label}`); } else onLog(`ok: ${m.label}`);
   }
+
+  // Decide which displaced files were real conflicts and which were harmless.
+  const conflicts = reconcileBackups(backupDir, map, onLog);
 
   const secs = Math.round((Date.now() - t0) / 1000);
   if (failed) {
     if (!quiet) notify('Restore failed', 'Continuing on local data. Check the sync log.', { persist: true, tag: 'sync' });
     return { ok: false, failed, secs };
   }
-  if (!quiet) notify('Conversations restored', `Up to date (${secs}s). If a chat is not listed yet, restart Claude.`, { persist: true, tag: 'sync' });
-  return { ok: true, failed: 0, secs };
+  if (conflicts.length) {
+    const total = conflicts.reduce((n, c) => n + c.lost, 0);
+    if (!quiet) notify(
+      `${conflicts.length} conversation(s) differ between machines`,
+      `Both versions kept — ${total} message(s) exist only in the local copy. See ${CONFLICT_ROOT}.`,
+      { persist: true, tag: 'sync-conflict' },
+    );
+  } else if (!quiet) {
+    notify('Conversations restored', `Up to date (${secs}s). If a chat is not listed yet, restart Claude.`, { persist: true, tag: 'sync' });
+  }
+  return { ok: true, failed: 0, secs, conflicts };
 }
 
 /**
@@ -210,4 +235,51 @@ export function preflight(remote) {
     remoteConfigured: !!conf && hasRemote(remoteName, conf),
     ready: !!rclone && !!conf && hasRemote(remoteName, conf) && resolved.claudeHomeExists,
   };
+}
+
+
+/**
+ * Walk what rclone moved aside during a pull and keep only genuine conflicts.
+ *
+ * fast-forward / identical -> the replacement contains everything the displaced
+ *   copy had, so the copy is noise. Delete it; leaving it would train the user
+ *   to ignore a directory that sometimes matters.
+ * diverged / unknown -> both files hold messages the other lacks. Keep it and
+ *   report it. We never merge: see transcript.mjs.
+ */
+function reconcileBackups(backupDir, map, onLog = () => {}) {
+  if (!existsSync(backupDir)) return [];
+  const conflicts = [];
+
+  const walk = (dir, onFile) => {
+    let entries;
+    try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(dir, e.name);
+      if (e.isDirectory()) walk(p, onFile);
+      else if (e.isFile()) onFile(p);
+    }
+  };
+
+  for (const m of map) {
+    const sub = join(backupDir, m.label.replace(/[^\w.-]/g, '_'));
+    if (!existsSync(sub)) continue;
+    walk(sub, (displaced) => {
+      const rel = relative(sub, displaced);
+      const current = join(m.local, rel);
+      const verdict = existsSync(current) ? classifyReplacement(displaced, current) : 'unknown';
+
+      if (verdict === 'fast-forward' || verdict === 'identical') {
+        try { unlinkSync(displaced); } catch {}
+        return;
+      }
+      const lost = existsSync(current) ? lostCount(displaced, current) : 0;
+      conflicts.push({ file: rel, kept: displaced, lost, verdict });
+      onLog(`CONFLICT (${verdict}): ${rel} — ${lost} message(s) only in the displaced copy, kept at ${displaced}`);
+    });
+  }
+
+  // Remove the timestamp folder entirely if nothing was worth keeping.
+  if (!conflicts.length) { try { rmSync(backupDir, { recursive: true, force: true }); } catch {} }
+  return conflicts;
 }
