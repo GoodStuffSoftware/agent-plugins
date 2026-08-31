@@ -105,8 +105,8 @@ export async function pull(remote, { quiet = false, onLog = () => {} } = {}) {
  * Machine identity for the marker.
  *
  * NORMALISED ON PURPOSE. Different writers report the host differently:
- * Node's os.hostname() gave "Kristen-laptop" while PowerShell's $env:COMPUTERNAME
- * gave "KRISTEN-LAPTOP" on the SAME machine. A case-sensitive compare therefore
+ * Node's os.hostname() gave "Workstation-01" while PowerShell's $env:COMPUTERNAME
+ * gave "WORKSTATION-01" on the SAME machine. A case-sensitive compare therefore
  * read our own marker as "another machine pushed" and kicked off a full pull —
  * on every session start, forever. Caught in testing 2026-08-30.
  */
