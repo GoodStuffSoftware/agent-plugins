@@ -6,8 +6,10 @@
  *   node lib/cli.mjs push           local -> remote
  *   node lib/cli.mjs pull           remote -> local
  *   node lib/cli.mjs auto-pull      pull ONLY if another machine pushed since ours
+ *   node lib/cli.mjs config          print settings
+ *   node lib/cli.mjs config remote <remote:path>   change where backups go
  *
- * Remote comes from CLAUDE_SESSION_SYNC_REMOTE, else "gdrive:Claude/live".
+ * Remote resolves as: CLAUDE_SESSION_SYNC_REMOTE > config.json > "gdrive:Claude/live".
  *
  * Hooks call this. Exit code 0 always for hook-invoked paths unless --strict:
  * a sync problem should surface as a notification, never as a blocked session.
@@ -15,11 +17,13 @@
 
 import { push, pull, preflight, remoteNewer } from './sync.mjs';
 import { notify } from './notify.mjs';
+import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE } from './config.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join, dirname } from 'node:path';
 
-const REMOTE = process.env.CLAUDE_SESSION_SYNC_REMOTE || 'gdrive:Claude/live';
+const CFG = loadConfig();
+const REMOTE = CFG.remote;
 const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 const LOG = join(STATE_DIR, 'sync.log');
 const LAST_PULL = join(STATE_DIR, 'last-pull.txt');
@@ -35,7 +39,7 @@ function log(line) {
 
 const cmd = process.argv[2] || 'status';
 const strict = process.argv.includes('--strict');
-const quiet = process.argv.includes('--quiet');
+const quiet = process.argv.includes('--quiet') || CFG.notifications === false;
 
 /**
  * An unconfigured plugin is INERT, and silence is how it stays that way: the
@@ -118,6 +122,41 @@ Check three folders arrived — \`dot-claude/\`, \`claude-code-sessions/\`,
 Log: ${join(STATE_DIR, 'sync.log')}
 State: ${home}${p === 'win32' ? '\\.claude\\session-sync' : '/.claude/session-sync'}
 `;
+}
+
+// ---- config: read, or set a key ------------------------------------------
+// `config`                      -> print current settings as JSON
+// `config remote gdrive:X/Y`    -> set where backups go
+// `config enabled false`        -> pause syncing on this machine
+if (cmd === 'config') {
+  const key = process.argv[3];
+  const value = process.argv.slice(4).join(' ');
+  if (!key) { console.log(JSON.stringify(describeConfig(), null, 2)); process.exit(0); }
+
+  if (key === 'remote') {
+    const v = validateRemote(value);
+    if (!v.ok) { console.error(v.error); process.exit(2); }
+    saveConfig({ remote: v.value });
+    log(`config: remote -> ${v.value}`);
+    console.log(JSON.stringify({ ok: true, remote: v.value, warning: v.warning || null, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  if (key === 'enabled' || key === 'notifications') {
+    const on = /^(true|1|yes|on)$/i.test(value);
+    saveConfig({ [key]: on });
+    log(`config: ${key} -> ${on}`);
+    console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications`);
+  process.exit(2);
+}
+
+// Paused on this machine? Do nothing, quietly — this is a deliberate choice,
+// not a fault, so it must not notify or warn.
+if (CFG.enabled === false && (cmd === 'push' || cmd === 'pull' || cmd === 'auto-pull')) {
+  log(`${cmd}: skipped — syncing is disabled on this machine (config.enabled=false)`);
+  process.exit(0);
 }
 
 // Sync commands are pointless without a working rclone + remote. Check once,

@@ -33,7 +33,41 @@ Do not attempt a silent install; tell the user what you're about to run and let 
 
 **After installing, open a NEW terminal.** A shell started before the install won't have rclone on PATH — this plugin resolves the binary directly so it usually still works, but any manual `rclone` command the user runs will not.
 
-## 3. Configure a remote (if `remoteConfigured` is false)
+## 3. Choose where backups are stored
+
+Ask the user where they want backups kept, rather than assuming. The default is
+`gdrive:Claude/live` — a `Claude/live` folder at the root of an rclone remote named
+`gdrive`. That is only a default; any rclone backend and any path works.
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config                          # show current
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config remote s3:my-bucket/claude   # change it
+```
+
+The value is `<rclone remote name>:<path>`. Examples worth offering:
+
+| Where they want it | Value |
+|---|---|
+| Google Drive, tidy subfolder | `gdrive:Claude/live` |
+| Existing Drive folder | `gdrive:Backups/ClaudeHistory` |
+| S3 / R2 bucket | `s3:my-bucket/claude` |
+| A NAS over SFTP | `nas:/volume1/backups/claude` |
+
+Setting it writes `~/.claude/session-sync/config.json` — no environment variables, and it
+persists for scheduled runs and hooks. Malformed values are rejected rather than saved, and
+pointing at a remote root (`gdrive:`) warns, since backups would mix with their other files.
+
+Other settings:
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config enabled false        # pause on this machine
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config notifications false  # silence toasts
+```
+
+`CLAUDE_SESSION_SYNC_REMOTE` still overrides the config file if set — useful for CI, but tell
+the user if `source` reads `env`, because editing the config then appears to do nothing.
+
+## 4. Configure the remote itself (if `remoteConfigured` is false)
 
 The user runs this themselves — it opens a browser for their cloud account, and it needs credentials you must never handle:
 
@@ -55,7 +89,7 @@ Verify: `rclone lsd gdrive:`
 
 rclone's built-in Google client_id is shared by every rclone user and has a small global quota. Syncing thousands of transcript files can hit `rateLimitExceeded`. The scripts pace requests to stay under it, but the real fix is a personal client_id (~10 minutes, one time): <https://rclone.org/drive/#making-your-own-client-id>
 
-## 4. First sync and verify
+## 5. First sync and verify
 
 Push this machine's data up:
 
@@ -71,7 +105,7 @@ rclone lsf gdrive:Claude/live --dirs-only
 
 You want to see **three** entries: `dot-claude/`, `claude-code-sessions/`, `local-agent-mode-sessions/`. If the last two are absent, the desktop sidebar will not restore on other machines — see Troubleshooting.
 
-## 5. Explain the model before finishing
+## 6. Explain the model before finishing
 
 Tell the user plainly:
 

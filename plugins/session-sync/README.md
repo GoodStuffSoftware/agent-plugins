@@ -46,7 +46,45 @@ node lib/cli.mjs status      # what's configured, what would sync
 node lib/cli.mjs push        # local  -> remote
 node lib/cli.mjs pull        # remote -> local
 node lib/cli.mjs auto-pull   # pull only if another machine is ahead
+node lib/cli.mjs config      # current settings
 ```
+
+### Choosing where backups go
+
+The default is `gdrive:Claude/live` — a `Claude/live` folder on an rclone remote named
+`gdrive`. It is only a default. Any rclone backend, any path:
+
+```bash
+node lib/cli.mjs config remote s3:my-bucket/claude
+node lib/cli.mjs config remote gdrive:Backups/ClaudeHistory
+node lib/cli.mjs config remote nas:/volume1/backups/claude
+```
+
+Or just ask Claude — `/session-sync:setup` walks it. Settings live in
+`~/.claude/session-sync/config.json`, so they persist for hooks and scheduled runs; no
+environment variables to keep in sync across shells. Malformed values are refused rather than
+saved, and pointing at a remote root warns instead of quietly mixing the backup in with
+everything else.
+
+| Setting | Effect |
+|---|---|
+| `remote` | where backups are stored |
+| `enabled false` | pause syncing on this machine without uninstalling |
+| `notifications false` | silence the start/finish toasts (failures still notify) |
+
+`CLAUDE_SESSION_SYNC_REMOTE` overrides the file when set — handy for CI, and `config` reports
+`source: "env"` so an edit that appears to do nothing is explainable.
+
+### Only what changed gets sent
+
+After the first sync, a local manifest (`path → size:mtime`) is compared on disk — about a
+second for ~9,600 files — and only changed paths go to rclone via `--files-from`. An idle
+session transfers nothing at all rather than paying for a full remote comparison to discover
+that. The manifest is a cache: delete it, or point at a different remote, and the next sync is
+simply a full one.
+
+Deletions are reported, never propagated. Push only ever copies — a stale remote file costs
+storage, a wrongly-deleted one costs the data.
 
 ### Switching machines without closing Claude
 
