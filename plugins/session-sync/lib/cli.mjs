@@ -16,7 +16,7 @@
 import { push, pull, preflight, remoteNewer } from './sync.mjs';
 import { notify } from './notify.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, platform } from 'node:os';
 import { join, dirname } from 'node:path';
 
 const REMOTE = process.env.CLAUDE_SESSION_SYNC_REMOTE || 'gdrive:Claude/live';
@@ -43,26 +43,89 @@ const quiet = process.argv.includes('--quiet');
  * conversations aren't syncing. Tell them — once. Nagging every session for a
  * setup step they may have deliberately deferred is its own failure.
  */
-function remindSetupOnce(reason) {
+function remindSetupOnce(reason, missing) {
   log(`not configured: ${reason}`);
   if (quiet || existsSync(SETUP_NAGGED)) return;
   try {
     ensureState();
     writeFileSync(SETUP_NAGGED, new Date().toISOString());
+    // A toast is ~2 lines. Put the ACTUAL commands somewhere they persist and
+    // can be copy-pasted, and point the toast at it. "Run the setup skill" is
+    // not instructions if the user is not in a Claude session when they see it.
+    const instructionsPath = join(STATE_DIR, 'SETUP-REQUIRED.md');
+    writeFileSync(instructionsPath, setupInstructions(reason, missing));
     notify(
-      'Claude session sync is not set up',
-      `${reason} Your conversations are NOT syncing. Run /session-sync:setup to finish.`,
+      'Claude conversations are NOT syncing',
+      `${reason} Steps to fix: ${instructionsPath} — or run /session-sync:setup in Claude.`,
       { persist: true, tag: 'session-sync-setup' },
     );
+    log(`wrote setup instructions to ${instructionsPath}`);
   } catch {}
+}
+
+function setupInstructions(reason, missing) {
+  const p = platform();
+  const install = p === 'win32' ? 'winget install Rclone.Rclone'
+    : p === 'darwin' ? 'brew install rclone'
+    : 'sudo apt install rclone      # or: curl https://rclone.org/install.sh | sudo bash';
+  const home = p === 'win32' ? '%USERPROFILE%' : '~';
+
+  return `# session-sync needs setup
+
+**${reason}**
+Until this is fixed your Claude conversations are **not** being backed up or synced.
+
+The fastest route is to ask Claude: \`/session-sync:setup\` — it will walk these
+same steps and check the result. Otherwise, by hand:
+
+${missing === 'rclone' ? `## 1. Install rclone
+
+    ${install}
+
+Then open a NEW terminal so it is on your PATH.
+
+## 2. Configure a remote` : `## Configure a remote`}
+
+    rclone config
+
+- \`n\` for a new remote
+- **Name it exactly \`gdrive\`** (or set CLAUDE_SESSION_SYNC_REMOTE to point elsewhere)
+- Choose your storage type — Google Drive, S3, R2, Dropbox, WebDAV and 40+ others work
+- Leave client_id / client_secret blank unless you have your own
+- A browser opens: sign in and approve
+
+Verify it worked:
+
+    rclone lsd gdrive:
+
+## 3. First sync
+
+    node "${join(process.env.CLAUDE_PLUGIN_ROOT || '<plugin dir>', 'lib', 'cli.mjs')}" push
+
+Check three folders arrived — \`dot-claude/\`, \`claude-code-sessions/\`,
+\`local-agent-mode-sessions/\`. Without the last two, conversations restore for
+\`claude --resume\` but will **not** appear in the Claude Desktop sidebar.
+
+## Notes
+
+- Nothing syncs until the above is done; the plugin stays inert and will not
+  interfere with Claude in the meantime.
+- Credentials are never synced — you sign in normally on each machine.
+- Using Google Drive? rclone's built-in client_id is shared and rate-limited.
+  If you see \`rateLimitExceeded\`, make your own (10 min, one time):
+  https://rclone.org/drive/#making-your-own-client-id
+
+Log: ${join(STATE_DIR, 'sync.log')}
+State: ${home}${p === 'win32' ? '\\.claude\\session-sync' : '/.claude/session-sync'}
+`;
 }
 
 // Sync commands are pointless without a working rclone + remote. Check once,
 // up front, so the failure is a clear message rather than a stack trace.
 if (cmd === 'push' || cmd === 'pull' || cmd === 'auto-pull') {
   const p = preflight(REMOTE);
-  if (!p.rclone) { remindSetupOnce('rclone is not installed.'); process.exit(0); }
-  if (!p.remoteConfigured) { remindSetupOnce(`No rclone remote matching "${REMOTE}".`); process.exit(0); }
+  if (!p.rclone) { remindSetupOnce('rclone is not installed.', 'rclone'); process.exit(0); }
+  if (!p.remoteConfigured) { remindSetupOnce(`No rclone remote matching "${REMOTE}".`, 'remote'); process.exit(0); }
   // Configured again after a lapse — allow a future reminder.
   try { if (existsSync(SETUP_NAGGED)) unlinkSync(SETUP_NAGGED); } catch {}
 }

@@ -10,15 +10,25 @@
  * the worst case is a lost edit to one of those, not a corrupted history.
  */
 
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolveAll, SESSION_DIRS } from './paths.mjs';
+import { planIncremental, commitManifest } from './manifest.mjs';
 import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote } from './rclone.mjs';
 import { notify } from './notify.mjs';
 
 const MARKER = '.last-push';
+const MANIFEST_FILE = join(homedir(), '.claude', 'session-sync', 'manifest.json');
+
+/** Write an rclone --files-from list (one relative path per line). */
+function writeFileList(files) {
+  const dir = mkdtempSync(join(tmpdir(), 'session-sync-list-'));
+  const f = join(dir, 'files.txt');
+  writeFileSync(f, files.join('\n') + '\n', 'utf8');
+  return f;
+}
 
 /** Build the local<->remote mapping for whatever this machine actually has. */
 export function buildMap(remote) {
@@ -44,20 +54,45 @@ function withExcludes(args, excludes) {
  * PUSH — local -> remote. Read-only against local files, so it is safe to run
  * while Claude is open; it does not need the app closed.
  */
-export async function push(remote, { quiet = false, onLog = () => {} } = {}) {
+export async function push(remote, { quiet = false, onLog = () => {}, force = false } = {}) {
   const { map, resolved } = buildMap(remote);
   if (resolved.missing.length) {
     onLog(`warning: session store(s) not found: ${resolved.missing.join(', ')} — the desktop sidebar may not restore on the far side`);
   }
-  if (!quiet) notify('Backing up Claude…', 'Syncing conversations and memory. Safe to keep working.', { tag: 'sync' });
+
+  // Work out what actually changed BEFORE touching the network.
+  const { plan, nextForRemote } = planIncremental(map, MANIFEST_FILE, remote, {
+    excludeDirs: ['cache', 'shell-snapshots', 'statsig', 'node_modules'],
+    excludeFiles: ['.credentials.json', '.claude.json', 'mcp.json',
+                   '.deckhand-bus-token', '.deckhand-machine-oauth.json'],
+  });
+
+  const todo = plan.filter((p) => force || p.full || p.files.length);
+  if (!todo.length) {
+    // Nothing changed. Say so and stop — no scan, no transfer, no toast.
+    const gone = plan.reduce((n, p) => n + (p.removed?.length || 0), 0);
+    onLog(`nothing to push — no local changes since last sync${gone ? ` (${gone} file(s) removed locally; left on the remote)` : ''}`);
+    return { ok: true, failed: 0, mins: '0.0', skipped: true };
+  }
+
+  const summary = todo.map((p) => p.full ? `${p.label}: full` : `${p.label}: +${p.counts.added}/~${p.counts.changed}`).join(', ');
+  onLog(`pushing — ${summary}`);
+  if (!quiet) notify('Backing up Claude…', `Syncing ${summary}. Safe to keep working.`, { tag: 'sync' });
 
   const t0 = Date.now();
   let failed = 0;
-  for (const m of map) {
-    const args = withExcludes(['copy', m.local, m.remote, ...copyFlags()], m.excludes);
+  for (const m of todo) {
+    let args = withExcludes(['copy', m.local, m.remote, ...copyFlags()], m.excludes);
+    let listFile = null;
+    if (!m.full && m.files.length) {
+      // Hand rclone the exact paths instead of making it walk and compare the
+      // whole tree against a rate-limited remote.
+      listFile = writeFileList(m.files);
+      args = [...args, '--files-from', listFile, '--no-traverse'];
+    }
     const { code, stderr } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
     if (code !== 0) { failed++; onLog(`ERROR (${code}): ${m.label}${stderr ? ' — ' + stderr.trim().split('\n')[0] : ''}`); }
-    else onLog(`ok: ${m.label}`);
+    else onLog(`ok: ${m.label}${m.full ? ' (full)' : ` (${m.files.length} file(s))`}`);
   }
 
   const mins = ((Date.now() - t0) / 60000).toFixed(1);
@@ -66,6 +101,9 @@ export async function push(remote, { quiet = false, onLog = () => {} } = {}) {
     return { ok: false, failed, mins };
   }
 
+  // Only now is the new state a valid baseline. Committing it after a partial
+  // failure would make the next run skip files that never landed.
+  commitManifest(MANIFEST_FILE, remote, nextForRemote);
   await writeMarker(remote, onLog);
   if (!quiet) notify('Claude backed up', `Conversations and memory are current (${mins} min). Safe to pick up on another machine.`, { tag: 'sync' });
   return { ok: true, failed: 0, mins };
