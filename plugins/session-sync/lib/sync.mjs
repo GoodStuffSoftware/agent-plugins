@@ -82,13 +82,22 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
   const t0 = Date.now();
   let failed = 0;
   for (const m of todo) {
-    let args = withExcludes(['copy', m.local, m.remote, ...copyFlags()], m.excludes);
-    let listFile = null;
+    let args;
     if (!m.full && m.files.length) {
       // Hand rclone the exact paths instead of making it walk and compare the
       // whole tree against a rate-limited remote.
-      listFile = writeFileList(m.files);
-      args = [...args, '--files-from', listFile, '--no-traverse'];
+      //
+      // NOTE: --files-from CANNOT be combined with --exclude. rclone refuses:
+      //   "the usage of --files-from overrides all other filters, it should be
+      //    used alone or with --files-from-raw or --files-from0"
+      // That is safe here because the file list comes from scanTree(), which
+      // applied the SAME exclusions when building it — an excluded file can
+      // never appear in the list. (Its match is by basename, so it is if
+      // anything stricter than the rclone patterns.)
+      const listFile = writeFileList(m.files);
+      args = ['copy', m.local, m.remote, ...copyFlags(), '--files-from', listFile, '--no-traverse'];
+    } else {
+      args = withExcludes(['copy', m.local, m.remote, ...copyFlags()], m.excludes);
     }
     const { code, stderr } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
     if (code !== 0) { failed++; onLog(`ERROR (${code}): ${m.label}${stderr ? ' — ' + stderr.trim().split('\n')[0] : ''}`); }
