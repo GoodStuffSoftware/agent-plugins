@@ -1,9 +1,9 @@
-# Good Stuff Software — Claude Code plugins
+# Good Stuff Software — agent plugins
 
-A small [plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces) for Claude Code.
+A plugin marketplace for AI coding agents. Claude Code today; the layout is deliberately agent-agnostic so other targets can be added without restructuring.
 
 ```
-/plugin marketplace add GoodStuffSoftware/claude-plugins
+/plugin marketplace add GoodStuffSoftware/agent-plugins
 ```
 
 ## Plugins
@@ -34,3 +34,26 @@ is the most useful thing you can send.
 ## License
 
 MIT
+
+## Releases
+
+Versions are driven by [Release Please](https://github.com/googleapis/release-please) from conventional commits, and each plugin under `plugins/` versions **independently**.
+
+```bash
+git commit -m "fix(session-sync): handle a BOM in the sync marker"   # -> patch
+git commit -m "feat(session-sync): support SFTP remotes"             # -> minor
+git commit -m "feat(session-sync)!: rename the remote layout"        # -> major
+```
+
+Merging the release PR tags `session-sync@vX.Y.Z` and bumps that plugin's `plugin.json`. CI then syncs the marketplace entry:
+
+```bash
+node scripts/sync-plugins.mjs           # apply
+node scripts/sync-plugins.mjs --check   # CI: fail if out of sync
+```
+
+The check runs on every PR, because a `plugin.json` bump that never reaches `marketplace.json` means users silently never receive the update.
+
+## Credits
+
+Structure and release tooling adapted from work by others — see [CREDITS.md](CREDITS.md).

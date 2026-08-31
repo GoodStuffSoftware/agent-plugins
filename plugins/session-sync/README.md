@@ -24,7 +24,7 @@ It is *not* enough for the desktop app. The app builds its session index on firs
 ## Install
 
 ```
-/plugin marketplace add GoodStuffSoftware/claude-plugins
+/plugin marketplace add GoodStuffSoftware/agent-plugins
 /plugin install session-sync@goodstuff
 /session-sync:setup
 ```

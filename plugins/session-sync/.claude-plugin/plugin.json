@@ -6,8 +6,8 @@
     "name": "Good Stuff Software",
     "url": "https://github.com/GoodStuffSoftware"
   },
-  "homepage": "https://github.com/GoodStuffSoftware/claude-plugins/tree/main/plugins/session-sync",
-  "repository": "https://github.com/GoodStuffSoftware/claude-plugins",
+  "homepage": "https://github.com/GoodStuffSoftware/agent-plugins/tree/main/plugins/session-sync",
+  "repository": "https://github.com/GoodStuffSoftware/agent-plugins",
   "license": "MIT",
   "keywords": ["sync", "backup", "sessions", "roaming", "rclone", "multi-machine"]
 }

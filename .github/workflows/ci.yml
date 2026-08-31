@@ -59,5 +59,17 @@ jobs:
       - name: Validate marketplace manifest
         run: claude plugin validate . --strict
 
-      - name: Validate plugin manifest
-        run: claude plugin validate ./plugins/session-sync --strict
+      - name: Validate every plugin manifest
+        shell: bash
+        run: |
+          for d in plugins/*/; do
+            if [ -f "$d/.claude-plugin/plugin.json" ]; then
+              echo "--- $d"
+              claude plugin validate "$d" --strict
+            fi
+          done
+
+      # A plugin.json version that never reached marketplace.json means users
+      # don't get the update. Fail the build rather than ship it silently.
+      - name: Plugin versions are in sync
+        run: node scripts/sync-plugins.mjs --check

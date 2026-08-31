@@ -1,6 +1,6 @@
 {
   "name": "goodstuff",
-  "description": "Claude Code plugins from Good Stuff Software — practical tools built from real multi-machine use.",
+  "description": "Agent plugins from Good Stuff Software — practical tools built from real multi-machine use.",
   "owner": {
     "name": "Good Stuff Software",
     "url": "https://github.com/GoodStuffSoftware"
@@ -9,7 +9,8 @@
     {
       "name": "session-sync",
       "source": "./plugins/session-sync",
-      "description": "Roam Claude Code conversations between machines - restored in the desktop sidebar, not just resumable from the terminal."
+      "description": "Roam Claude Code conversations between machines - restored in the desktop sidebar, not just resumable from the terminal.",
+      "version": "0.1.0"
     }
   ]
 }
