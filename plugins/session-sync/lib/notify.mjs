@@ -68,7 +68,13 @@ function linuxToast(title, body, persist) {
 }
 
 function detach(cmd, args) {
-  const c = spawn(cmd, args, { detached: true, stdio: 'ignore', windowsHide: true });
+  // Windows: a DETACHED child ignores windowsHide (DETACHED_PROCESS wins), so a
+  // detached powershell.exe pops a visible console for every toast. Not detaching
+  // is safe there: Windows does not kill children when the parent exits.
+  const opts = process.platform === 'win32'
+    ? { stdio: 'ignore', windowsHide: true }
+    : { detached: true, stdio: 'ignore', windowsHide: true };
+  const c = spawn(cmd, args, opts);
   c.on('error', () => {});   // notifier missing (headless, no notify-send) — fine
   c.unref();
 }
