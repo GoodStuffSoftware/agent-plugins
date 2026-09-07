@@ -60,8 +60,10 @@ pointing at a remote root (`gdrive:`) warns, since backups would mix with their 
 Other settings:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config enabled false        # pause on this machine
-node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config notifications false  # silence toasts
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config enabled false          # pause on this machine
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config notifications false    # silence EVERYTHING, failures included
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config notifyMode all         # a toast every sync, not just the first ever
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config debounceMinutes 15     # widen the gap between hook-triggered syncs
 ```
 
 `CLAUDE_SESSION_SYNC_REMOTE` still overrides the config file if set — useful for CI, but tell

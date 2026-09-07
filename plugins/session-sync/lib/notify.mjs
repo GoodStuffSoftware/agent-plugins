@@ -6,7 +6,7 @@
  * every path here swallows its own errors.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { platform } from 'node:os';
 
 /**
@@ -84,6 +84,21 @@ function detach(cmd, args) {
  * "Claude Session Sync" instead of "Windows PowerShell".
  * HKCU only — no admin, and fully reversible:
  *   Remove-Item "HKCU:\SOFTWARE\Classes\AppUserModelId\Claude.SessionSync" -Recurse
+ *
+ * DELIBERATELY SYNCHRONOUS (spawnSync), unlike every toast above. This is a
+ * ONE-TIME-EVER setup step (the caller gates it behind its own marker file),
+ * not a per-run notification, so a single ~0.3s blocking PowerShell call is a
+ * fair price for correctness. Fire-and-forget (spawn+unref, like `detach()`)
+ * was tried first and measurably failed: when the calling process exits
+ * within milliseconds of spawning it — which is now routine, since a
+ * hook-triggered push hands off to a background worker and returns almost
+ * immediately (see cli.mjs's spawnDetachedSelf) — the non-detached
+ * powershell.exe here did not survive long enough to write the registry key.
+ * Confirmed by direct reproduction on 2026-09-07: a bare fire-and-forget call
+ * with nothing keeping the caller alive silently registered nothing, while
+ * the identical call with even a few seconds' delay before the caller exited
+ * worked every time. Returns whether the registry write actually succeeded,
+ * so the caller only remembers "done" when it is actually done.
  */
 export function registerWindowsSender(displayName = 'Claude Session Sync', iconPath = null) {
   if (platform() !== 'win32') return false;
@@ -91,11 +106,14 @@ export function registerWindowsSender(displayName = 'Claude Session Sync', iconP
     ? `New-ItemProperty -Path $k -Name IconUri -Value '${iconPath}' -PropertyType String -Force | Out-Null`
     : '';
   const ps = `
+$ErrorActionPreference='Stop'
 $k = 'HKCU:\\SOFTWARE\\Classes\\AppUserModelId\\Claude.SessionSync'
 New-Item -Path $k -Force | Out-Null
 New-ItemProperty -Path $k -Name DisplayName -Value '${displayName}' -PropertyType String -Force | Out-Null
 ${icon}
 `;
-  detach('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps]);
-  return true;
+  try {
+    const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], { windowsHide: true });
+    return r.status === 0;
+  } catch { return false; }
 }

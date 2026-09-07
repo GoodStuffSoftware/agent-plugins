@@ -9,7 +9,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test test/marker.test.mjs test/manifest.test.mjs test/config.test.mjs test/lock.test.mjs test/transcript.test.mjs",
+    "test": "node --test test/marker.test.mjs test/manifest.test.mjs test/config.test.mjs test/lock.test.mjs test/transcript.test.mjs test/sync.test.mjs test/hooks.test.mjs test/cli.test.mjs",
     "status": "node lib/cli.mjs status"
   }
 }

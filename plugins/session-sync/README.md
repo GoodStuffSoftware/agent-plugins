@@ -40,6 +40,12 @@ SessionEnd   ──▶ push
 
 No timers, no daemon. Storage is any of rclone's 40+ backends — Google Drive, S3, R2, Dropbox, WebDAV, a NAS over SFTP. Default remote is `gdrive:Claude/live`; override with `CLAUDE_SESSION_SYNC_REMOTE`.
 
+A hook-triggered sync hands off to a detached background process and returns immediately —
+a real push has taken over four hours on a large, rarely-synced `~/.claude`, which is well past
+both hook timeouts and the lifetime of the conversation that triggered it. A manual
+`push`/`pull`/`auto-pull` (typed by hand, or run by the `sync` skill) always runs synchronously
+instead, so its result is real when the command returns.
+
 ```bash
 # manual, any time
 node lib/cli.mjs status      # what's configured, what would sync
@@ -70,7 +76,9 @@ everything else.
 |---|---|
 | `remote` | where backups are stored |
 | `enabled false` | pause syncing on this machine without uninstalling |
-| `notifications false` | silence the start/finish toasts (failures still notify) |
+| `notifications false` | silence EVERYTHING, including failures — a full opt-out |
+| `notifyMode` | how chatty routine (non-failure) toasts are: `first-run` (default — one toast ever, to confirm it's alive, then quiet), `all` (a toast every time), `failures` (never, only failures/conflicts show) |
+| `debounceMinutes` | hook-triggered syncs only: skip if the last one succeeded within this many minutes (default `5`; `0` disables it). Never applies to a manual `push`/`pull` — the sync skill's "push before switching machines" always runs immediately. |
 
 `CLAUDE_SESSION_SYNC_REMOTE` overrides the file when set — handy for CI, and `config` reports
 `source: "env"` so an edit that appears to do nothing is explainable.

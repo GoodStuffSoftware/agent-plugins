@@ -124,8 +124,15 @@ export function resolveAll() {
     // Credentials and machine-bound tokens never leave the machine. A copied
     // auth token fails on the far side rather than helping, and putting live
     // tokens in cloud storage is a needless exposure.
+    //
+    // session-sync/** is this PLUGIN'S OWN bookkeeping (sync.log, manifest.json,
+    // sync.lock, config.json) living inside the tree it watches. sync.log is
+    // appended to on every single run, so leaving it in-scope guaranteed every
+    // run saw "something changed" and re-synced — a self-sustaining loop that
+    // defeated the "nothing to push" skip entirely. Excluded 2026-09-07.
     excludes: [
       'cache/**',
+      'session-sync/**',
       '.credentials.json',
       '.claude.json',
       'mcp.json',

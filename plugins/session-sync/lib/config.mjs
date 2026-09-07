@@ -26,8 +26,27 @@ export const DEFAULTS = Object.freeze({
   remote: 'gdrive:Claude/live',
   // Turn syncing off on one machine without uninstalling (e.g. a shared box).
   enabled: true,
-  // Desktop notifications for sync start/finish. Failures always notify.
+  // Desktop notifications for sync start/finish. Failures always notify;
+  // this is the master kill switch — false silences EVERYTHING, failures
+  // included, because that's a deliberate opt-out, not a filter.
   notifications: true,
+  // How chatty ROUTINE (non-failure) toasts are, once `notifications` is true:
+  //   'all'       — a toast for every start and every success (the old, only,
+  //                 behaviour — noisy on a machine with many short sessions).
+  //   'first-run' — show the routine "backing up" / "backed up" / "restored"
+  //                 toasts once, ever, to confirm the plugin is alive, then
+  //                 go quiet. DEFAULT.
+  //   'failures'  — routine toasts never show; only failures and conflicts do.
+  // Failures, the pull "please wait" warning, and conflict notices are NEVER
+  // gated by this — see notify.mjs's own doc comment on `persist`.
+  notifyMode: 'first-run',
+  // Minimum minutes between two successful pushes, independent of the sync
+  // lock. The lock only stops two pushes running AT ONCE; on its own, a hook
+  // that fires seconds after the last one finished gets a fresh lock instantly
+  // and syncs again. This is what actually caps "N conversations in an hour
+  // = N syncs." auto-pull's cheap remoteNewer() check is never throttled by
+  // this — only the expensive, notifying pull() call is.
+  debounceMinutes: 5,
   // Extra rclone --exclude patterns, on top of the built-in credential excludes.
   extraExcludes: [],
 });
@@ -99,6 +118,8 @@ export function describeConfig(cfg = loadConfig()) {
     source: cfg.remoteFrom,          // env | config | default
     enabled: cfg.enabled !== false,
     notifications: cfg.notifications !== false,
+    notifyMode: cfg.notifyMode || DEFAULTS.notifyMode,
+    debounceMinutes: Number.isFinite(cfg.debounceMinutes) ? cfg.debounceMinutes : DEFAULTS.debounceMinutes,
     extraExcludes: cfg.extraExcludes || [],
     configFile: CONFIG_FILE,
     configExists: existsSync(CONFIG_FILE),

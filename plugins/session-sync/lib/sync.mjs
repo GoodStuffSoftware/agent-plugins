@@ -24,6 +24,38 @@ import { notify } from './notify.mjs';
 const MARKER = '.last-push';
 const MANIFEST_FILE = join(homedir(), '.claude', 'session-sync', 'manifest.json');
 const CONFLICT_ROOT = join(homedir(), '.claude', 'session-sync', 'conflicts');
+const FIRST_SUCCESS_MARKER = join(homedir(), '.claude', 'session-sync', '.first-success-notified');
+
+/**
+ * Gate a ROUTINE (non-failure) toast behind `notifyMode`.
+ *   'all'       — always show it (legacy behaviour, still the default for
+ *                 direct callers of push()/pull() that don't pass a mode).
+ *   'failures'  — never show it; only ERROR/conflict notify() calls remain.
+ *   'first-run' — show it once, ever, to confirm the plugin is actually
+ *                 talking to the remote, then go quiet. This is cli.mjs's
+ *                 configured default: failures and the pull "please wait"
+ *                 warning are never gated by this at all (see their own
+ *                 notify() calls), only the four routine start/success toasts.
+ *
+ * `markerFile`/`notifyFn` are test-only escape hatches (default to the real
+ * marker path and the real notify()), same pattern as push()'s `manifestFile`
+ * — this lets a test exercise the actual gating decision AND its on-disk
+ * side effect without touching the real state dir or popping a real toast.
+ *
+ * Returns whether it actually notified, for tests to assert on directly.
+ */
+export function notifyRoutine(mode, title, body, opts = {}, { markerFile = FIRST_SUCCESS_MARKER, notifyFn = notify } = {}) {
+  if (mode === 'failures') return false;
+  if (mode === 'first-run') {
+    if (existsSync(markerFile)) return false;
+    try {
+      mkdirSync(dirname(markerFile), { recursive: true });
+      writeFileSync(markerFile, new Date().toISOString());
+    } catch { /* best-effort — worst case it notifies once more than intended */ }
+  }
+  notifyFn(title, body, opts);
+  return true;
+}
 
 /** Write an rclone --files-from list (one relative path per line). */
 function writeFileList(files) {
@@ -56,17 +88,24 @@ function withExcludes(args, excludes) {
 /**
  * PUSH — local -> remote. Read-only against local files, so it is safe to run
  * while Claude is open; it does not need the app closed.
+ *
+ * `map` and `manifestFile` are test-only escape hatches: production callers
+ * never pass them, so buildMap(remote)/MANIFEST_FILE (real ~/.claude,
+ * real state dir) are used exactly as before. Tests pass a throwaway map and
+ * manifest path so they can drive a real push() end-to-end (real rclone,
+ * against a local-folder "remote") without ever touching the user's actual
+ * home directory.
  */
-export async function push(remote, { quiet = false, onLog = () => {}, force = false } = {}) {
-  const { map, resolved } = buildMap(remote);
+export async function push(remote, { quiet = false, onLog = () => {}, force = false, map: mapOverride = null, manifestFile = MANIFEST_FILE, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER } = {}) {
+  const { map, resolved } = mapOverride ? { map: mapOverride, resolved: { missing: [] } } : buildMap(remote);
   const paced = !isLocalRemote(remote);   // API pacing is pointless on a local disk
   if (resolved.missing.length) {
     onLog(`warning: session store(s) not found: ${resolved.missing.join(', ')} — the desktop sidebar may not restore on the far side`);
   }
 
   // Work out what actually changed BEFORE touching the network.
-  const { plan, nextForRemote } = planIncremental(map, MANIFEST_FILE, remote, {
-    excludeDirs: ['cache', 'shell-snapshots', 'statsig', 'node_modules'],
+  const { plan, nextForRemote } = planIncremental(map, manifestFile, remote, {
+    excludeDirs: ['cache', 'shell-snapshots', 'statsig', 'node_modules', 'session-sync'],
     excludeFiles: ['.credentials.json', '.claude.json', 'mcp.json',
                    '.deckhand-bus-token', '.deckhand-machine-oauth.json'],
   });
@@ -81,7 +120,7 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
 
   const summary = todo.map((p) => p.full ? `${p.label}: full` : `${p.label}: +${p.counts.added}/~${p.counts.changed}`).join(', ');
   onLog(`pushing — ${summary}`);
-  if (!quiet) notify('Backing up Claude…', `Syncing ${summary}. Safe to keep working.`, { tag: 'sync' });
+  if (!quiet) notifyRoutine(notifyMode, 'Backing up Claude…', `Syncing ${summary}. Safe to keep working.`, { tag: 'sync' }, { markerFile: firstRunMarker });
 
   const t0 = Date.now();
   let failed = 0;
@@ -116,10 +155,17 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
 
   // Only now is the new state a valid baseline. Committing it after a partial
   // failure would make the next run skip files that never landed.
-  commitManifest(MANIFEST_FILE, remote, nextForRemote);
+  const committed = commitManifest(manifestFile, remote, nextForRemote);
+  if (!committed) {
+    // saveManifest() swallows its own write errors (disk full, AV lock, a
+    // permissions hiccup) and returns false rather than throwing — this used
+    // to vanish silently, so the next run re-scanned everything and reported
+    // it as "changed" forever with no clue why. Surface it instead.
+    onLog(`warning: manifest commit did not persist to ${manifestFile} — the next sync will re-diff more than it needs to`);
+  }
   await writeMarker(remote, onLog);
-  if (!quiet) notify('Claude backed up', `Conversations and memory are current (${mins} min). Safe to pick up on another machine.`, { tag: 'sync' });
-  return { ok: true, failed: 0, mins };
+  if (!quiet) notifyRoutine(notifyMode, 'Claude backed up', `Conversations and memory are current (${mins} min). Safe to pick up on another machine.`, { tag: 'sync' }, { markerFile: firstRunMarker });
+  return { ok: true, failed: 0, mins, committed };
 }
 
 /**
@@ -129,7 +175,7 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
  * stores (IndexedDB, Local Storage) are never synced, so there is no database
  * to corrupt. Worst case a brand-new chat needs an app restart to appear.
  */
-export async function pull(remote, { quiet = false, onLog = () => {} } = {}) {
+export async function pull(remote, { quiet = false, onLog = () => {}, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER } = {}) {
   const { map } = buildMap(remote);
   const paced = !isLocalRemote(remote);
   if (!quiet) notify('Restoring your conversations…', 'Pulling the latest from your remote. Please wait before asking anything — history is still loading.', { persist: true, tag: 'sync' });
@@ -170,7 +216,9 @@ export async function pull(remote, { quiet = false, onLog = () => {} } = {}) {
       { persist: true, tag: 'sync-conflict' },
     );
   } else if (!quiet) {
-    notify('Conversations restored', `Up to date (${secs}s). If a chat is not listed yet, restart Claude.`, { persist: true, tag: 'sync' });
+    // Routine success, and NOT a "please wait" warning — persist: true here
+    // just meant it sat in the Action Center forever after every single pull.
+    notifyRoutine(notifyMode, 'Conversations restored', `Up to date (${secs}s). If a chat is not listed yet, restart Claude.`, { tag: 'sync' }, { markerFile: firstRunMarker });
   }
   return { ok: true, failed: 0, secs, conflicts };
 }

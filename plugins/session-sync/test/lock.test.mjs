@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { acquireLock } from '../lib/lock.mjs';
 
 const lockPath = () => join(mkdtempSync(join(tmpdir(), 'ss-lock-')), 'sync.lock');
@@ -85,4 +86,38 @@ test('release never steals a lock owned by someone else', () => {
   a.release();
   assert.ok(existsSync(f), 'must not delete a lock we no longer own');
   rmSync(f, { force: true });
+});
+
+/**
+ * Regression test for a real reported symptom: a lock held by a genuinely
+ * DEAD pid (not just an assumed-never-real one like 999999 above) that a
+ * live system did not appear to reclaim. Investigated by actually spawning
+ * and exiting a real child process, then handing its real (now-dead) pid to
+ * acquireLock() — this exercises the real OS-level liveness check
+ * (process.kill(pid, 0)) rather than trusting that pid 999999 behaves the
+ * same way a genuinely-recycled-from-a-real-process pid would.
+ *
+ * Result of the investigation: no defect found here. pidAlive()'s liveness
+ * check correctly reports a truly-exited pid as dead, and acquireLock()
+ * correctly takes the lock over — confirmed live on the machine this was
+ * diagnosed on too (a lock pid that had already exited was reclaimed within
+ * about a minute by the next hook firing). The remaining theoretical gap is
+ * PID REUSE — the OS handing that exact pid to a new, unrelated, still-running
+ * process before the next acquire attempt — which no pid-only liveness check
+ * can distinguish from the original process. That is a real but low-probability
+ * race inherent to any pid-based lock, not something this test can force, and
+ * not what actually produced the reported stuck lock.
+ */
+test('a lock held by a pid that has genuinely exited is reclaimed', () => {
+  const f = lockPath();
+  // A real process that starts and exits immediately.
+  const result = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+  assert.equal(result.status, 0, 'the helper process must have actually run and exited');
+  const deadPid = result.pid;
+  assert.ok(deadPid, 'spawnSync must report the pid it used');
+
+  writeFileSync(f, JSON.stringify({ pid: deadPid, at: Date.now(), host: 'test' }));
+  const a = acquireLock(f);
+  assert.ok(a.acquired, `a lock naming a real, exited pid (${deadPid}) must be reclaimed, not honoured forever`);
+  a.release();
 });

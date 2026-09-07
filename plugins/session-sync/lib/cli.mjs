@@ -13,23 +13,46 @@
  *
  * Hooks call this. Exit code 0 always for hook-invoked paths unless --strict:
  * a sync problem should surface as a notification, never as a blocked session.
+ *
+ * Flags:
+ *   --from-hook   Set by hooks.json, never by a human or the skills. Applies
+ *                 the debounce window (config.debounceMinutes) and hands the
+ *                 real work off to a detached background process instead of
+ *                 running it synchronously — see spawnDetachedSelf() below.
+ *                 A manual `push`/`pull`/`auto-pull` always runs synchronously
+ *                 and immediately, with no debounce, so the sync skill's
+ *                 "push before switching machines" promise still holds.
+ *   --strict      Non-zero exit on a real sync failure (still exit 0 for
+ *                 "paused"/"not configured", which are not failures).
+ *   --quiet       Suppress ALL notifications for this run, hook or not.
  */
 
 import { push, pull, preflight, remoteNewer } from './sync.mjs';
-import { notify } from './notify.mjs';
+import { notify, registerWindowsSender } from './notify.mjs';
 import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE } from './config.mjs';
 import { acquireLock } from './lock.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join, dirname } from 'node:path';
+import { spawn } from 'node:child_process';
 
 const CFG = loadConfig();
 const REMOTE = CFG.remote;
 const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 const LOG = join(STATE_DIR, 'sync.log');
 const LAST_PULL = join(STATE_DIR, 'last-pull.txt');
+const LAST_PUSH = join(STATE_DIR, 'last-push.txt');
 const SETUP_NAGGED = join(STATE_DIR, 'setup-reminded.txt');
+const SENDER_REGISTERED = join(STATE_DIR, 'sender-registered.txt');
 const LOCK_FILE = join(STATE_DIR, 'sync.lock');
+const DEBOUNCE_MS = Math.max(0, Number(CFG.debounceMinutes) || 0) * 60000;
+
+// A hook invocation carries this; a manual run (the sync/status skills, or a
+// user typing the command themselves) never does. It gates two things that
+// must NEVER apply to an explicit "push now, I'm switching machines" request:
+// the debounce window, and running detached in the background (see
+// spawnDetachedSelf below) instead of returning a real result synchronously.
+const fromHook = process.argv.includes('--from-hook');
 
 function ensureState() { try { mkdirSync(STATE_DIR, { recursive: true }); } catch {} }
 function log(line) {
@@ -37,6 +60,69 @@ function log(line) {
   const s = `${new Date().toISOString()}  ${line}\n`;
   try { appendFileSync(LOG, s); } catch {}
   if (process.env.CLAUDE_SESSION_SYNC_VERBOSE) process.stderr.write(s);
+}
+
+/**
+ * Has less than `debounceMs` elapsed since the timestamp in `markerFile`?
+ * The sync LOCK only stops two syncs running AT ONCE — a hook firing a few
+ * seconds after the last one finished gets a fresh lock instantly and syncs
+ * again. This is the actual throttle for "N conversations in an hour = N
+ * syncs," and it only ever applies to hook-triggered runs (see `fromHook`).
+ */
+function tooSoonSince(markerFile, debounceMs) {
+  if (debounceMs <= 0) return false;
+  try {
+    const last = new Date(readFileSync(markerFile, 'utf8').trim());
+    if (Number.isNaN(last.getTime())) return false;
+    return Date.now() - last.getTime() < debounceMs;
+  } catch { return false; }
+}
+
+/**
+ * Re-invoke this same CLI as a fully background process and return
+ * immediately, so a long push/pull cannot be killed by the hook's own
+ * timeout (SessionEnd's 600s) or by the hook's process tree tearing down
+ * when the conversation that spawned it exits — a real push was measured
+ * at 262 minutes. `detached: true` + `.unref()` is Node's own documented
+ * mechanism for exactly this; `windowsHide` keeps it from flashing a console
+ * the way a detached powershell.exe does (see notify.mjs's `detach()` — that
+ * finding was specifically about powershell.exe, not a plain node.exe child,
+ * which does not allocate its own console the same way).
+ *
+ * CAVEAT, stated rather than hidden: if Claude Code's hook runner wraps the
+ * hook process in a Windows Job Object with kill-on-close and no breakaway
+ * allowed, the OS can still tear this child down with the job — that would
+ * be a Claude Code platform behaviour outside this plugin's control, and it
+ * is not something that can be verified from inside the plugin's own source.
+ * `detached` is the correct, standard fix on session-sync's side regardless.
+ */
+function spawnDetachedSelf(args) {
+  const child = spawn(process.execPath, [process.argv[1], ...args], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.on('error', () => {});
+  child.unref();
+  return child.pid;
+}
+
+/**
+ * "Claude Session Sync" toasts instead of "Windows PowerShell" — HKCU only,
+ * no admin, idempotent (checked-and-skipped after the first successful run).
+ * Best-effort: a failure here must never block or fail a sync.
+ */
+function ensureWindowsSenderRegistered() {
+  if (platform() !== 'win32' || existsSync(SENDER_REGISTERED)) return;
+  try {
+    const icon = join(dirname(process.argv[1]), '..', 'assets', 'icon.ico');
+    const ok = registerWindowsSender('Claude Session Sync', existsSync(icon) ? icon : null);
+    // Only remember "done" when it actually succeeded (registerWindowsSender
+    // is synchronous now specifically so this is trustworthy) — otherwise a
+    // one-time failure (locked-down HKCU, no powershell on PATH, whatever)
+    // would silently disable branding forever instead of retrying next time.
+    if (ok) { ensureState(); writeFileSync(SENDER_REGISTERED, new Date().toISOString()); }
+  } catch { /* toasts still work, just unbranded — never worth failing a sync over */ }
 }
 
 const cmd = process.argv[2] || 'status';
@@ -150,7 +236,28 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications`);
+  if (key === 'notifyMode') {
+    if (!['all', 'first-run', 'failures'].includes(value)) {
+      console.error(`"${value}" is not a valid notifyMode. Use: all, first-run, failures.`);
+      process.exit(2);
+    }
+    saveConfig({ notifyMode: value });
+    log(`config: notifyMode -> ${value}`);
+    console.log(JSON.stringify({ ok: true, notifyMode: value, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  if (key === 'debounceMinutes') {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) {
+      console.error(`"${value}" is not a valid debounceMinutes — use a number of minutes >= 0 (0 disables it).`);
+      process.exit(2);
+    }
+    saveConfig({ debounceMinutes: n });
+    log(`config: debounceMinutes -> ${n}`);
+    console.log(JSON.stringify({ ok: true, debounceMinutes: n, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications, notifyMode, debounceMinutes`);
   process.exit(2);
 }
 
@@ -169,6 +276,7 @@ if (cmd === 'push' || cmd === 'pull' || cmd === 'auto-pull') {
   if (!p.remoteConfigured) { remindSetupOnce(`No rclone remote matching "${REMOTE}".`, 'remote'); process.exit(0); }
   // Configured again after a lapse — allow a future reminder.
   try { if (existsSync(SETUP_NAGGED)) unlinkSync(SETUP_NAGGED); } catch {}
+  ensureWindowsSenderRegistered();
 }
 
 try {
@@ -179,6 +287,22 @@ try {
   }
 
   if (cmd === 'push') {
+    // Debounce is a hook-only concern: an explicit "push now" (the sync
+    // skill, or a user running this by hand) must always run immediately.
+    if (fromHook && tooSoonSince(LAST_PUSH, DEBOUNCE_MS)) {
+      log(`push skipped — synced within the last ${CFG.debounceMinutes} min (debounce)`);
+      process.exit(0);
+    }
+    // A hook-triggered push hands off to a fully detached background process
+    // and returns immediately, so it survives the hook's own timeout and the
+    // conversation process tree tearing down (see spawnDetachedSelf's doc
+    // comment). A manual run keeps running synchronously so its caller gets
+    // a real result — the sync skill and `--strict` both depend on that.
+    if (fromHook) {
+      const pid = spawnDetachedSelf(['push', ...(strict ? ['--strict'] : [])]);
+      log(`push -> ${REMOTE} (handed off to background pid ${pid})`);
+      process.exit(0);
+    }
     // Hooks fire per conversation; several ending together would otherwise race.
     const lock = acquireLock(LOCK_FILE);
     if (!lock.acquired) { log(`push skipped — ${lock.reason}`); process.exit(0); }
@@ -186,7 +310,8 @@ try {
     // the lock file on every run. 'exit' fires on explicit exit too.
     process.on('exit', () => lock.release());
     log(`push -> ${REMOTE}`);
-    const r = await push(REMOTE, { quiet, onLog: log });
+    const r = await push(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
+    if (r.ok) { ensureState(); writeFileSync(LAST_PUSH, new Date().toISOString()); }
     log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
     process.exit(r.ok || !strict ? 0 : 1);
   }
@@ -196,22 +321,40 @@ try {
     if (!lock.acquired) { log(`pull skipped — ${lock.reason}`); process.exit(0); }
     process.on('exit', () => lock.release());
     log(`pull <- ${REMOTE}`);
-    const r = await pull(REMOTE, { quiet, onLog: log });
+    const r = await pull(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
     if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); }
     log(`pull ${r.ok ? 'ok' : 'FAILED'} (${r.secs}s)`);
     process.exit(r.ok || !strict ? 0 : 1);
   }
 
   if (cmd === 'auto-pull') {
+    if (fromHook) {
+      // The cheap check (one tiny remote marker file) never needs the lock
+      // and never gets debounced — it's the actual pull that's expensive and
+      // worth throttling. No lock is held between here and the hand-off, so
+      // this never blocks a concurrent push from proceeding.
+      const since = existsSync(LAST_PULL) ? readFileSync(LAST_PULL, 'utf8').trim() : null;
+      const hit = await remoteNewer(REMOTE, since);
+      if (!hit) { log('auto-pull: nothing newer'); process.exit(0); }
+      if (tooSoonSince(LAST_PULL, DEBOUNCE_MS)) {
+        log(`auto-pull: ${hit.machine} pushed at ${hit.ts} — deferred, pulled within the last ${CFG.debounceMinutes} min (debounce)`);
+        process.exit(0);
+      }
+      const pid = spawnDetachedSelf(['auto-pull']);
+      log(`auto-pull: ${hit.machine} pushed at ${hit.ts} — handed off to background pid ${pid}`);
+      process.exit(0);
+    }
     const lock = acquireLock(LOCK_FILE);
     if (!lock.acquired) { log(`auto-pull skipped — ${lock.reason}`); process.exit(0); }
     process.on('exit', () => lock.release());
-    // Cheap: reads one tiny marker file. Safe to call often.
+    // Cheap: reads one tiny marker file. Safe to call often. Re-checked here
+    // (already checked once by the hook-invoked parent, if any) because a
+    // manual run of `auto-pull` never went through that parent at all.
     const since = existsSync(LAST_PULL) ? readFileSync(LAST_PULL, 'utf8').trim() : null;
     const hit = await remoteNewer(REMOTE, since);
     if (!hit) { log('auto-pull: nothing newer'); process.exit(0); }
     log(`auto-pull: ${hit.machine} pushed at ${hit.ts} — pulling`);
-    const r = await pull(REMOTE, { quiet, onLog: log });
+    const r = await pull(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
     if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); }
     process.exit(0);
   }

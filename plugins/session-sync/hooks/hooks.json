@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs\" auto-pull",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs\" auto-pull --from-hook",
             "timeout": 120
           }
         ]
@@ -15,12 +15,12 @@
     ],
     "SessionEnd": [
       {
-        "_comment": "Hooks fire PER CONVERSATION, not per client. Several conversations ending together means several concurrent pushes at one remote, so cli.mjs takes a lock and later arrivals no-op rather than race. 'clear' is excluded: clearing context is not finishing work, and it would push on every /clear.",
-        "matcher": "logout|prompt_input_exit|resume|other",
+        "_comment": "Hooks fire PER CONVERSATION, not per client. Several conversations ending together means several concurrent pushes at one remote, so cli.mjs takes a lock and later arrivals no-op rather than race. 'clear' is excluded: clearing context is not finishing work, and it would push on every /clear. 'resume' is ALSO excluded here (confirmed against Claude Code's hooks docs: SessionEnd 'resume' = 'session paused for resume', a real value, not a typo) -- resuming a conversation fires SessionEnd(resume) on the OLD session and SessionStart(resume) on the NEW one within the same fraction of a second, and the old session is not actually finishing: the SAME transcript is immediately picked back up by the resumed session, which will fire its own genuine SessionEnd later. Pushing here bought nothing but a guaranteed lock collision with the concurrent auto-pull -- live log showed a pull/push/pull triplet inside 0.7s, and 91 'skipped' log lines against only 18 'push ok' across the whole history. Dropped 2026-09-07.",
+        "matcher": "logout|prompt_input_exit|other",
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs\" push",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs\" push --from-hook",
             "timeout": 600
           }
         ]
