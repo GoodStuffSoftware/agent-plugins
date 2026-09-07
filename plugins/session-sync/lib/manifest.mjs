@@ -19,22 +19,41 @@
 import { readdirSync, statSync, existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, relative, sep, dirname } from 'node:path';
 
-/** Walk a directory into { relativePath: "size:mtimeMs" }. */
-export function scanTree(root, { excludeDirs = [], excludeFiles = [] } = {}) {
+/**
+ * Walk a directory into { relativePath: "size:mtimeMs" }.
+ *
+ * TWO KINDS OF DIRECTORY EXCLUSION, and the difference is data loss:
+ *
+ *   excludeDirs      matched by bare name at ANY depth. Correct only for names
+ *                    that are junk wherever they appear (node_modules).
+ *   excludeRootDirs  matched ONLY as a direct child of `root`. This is what a
+ *                    "this specific directory" exclusion must use.
+ *
+ * WHY THE SPLIT EXISTS: `session-sync` (this plugin's own state dir, which
+ * only ever lives at `<root>/session-sync`) was in the any-depth list. On a
+ * live machine that silently dropped 21 real files under
+ * `~/.claude/plugins/marketplaces/goodstuff/plugins/session-sync/` from every
+ * incremental backup, with nothing logged. A same-named directory elsewhere in
+ * the tree — a marketplace checkout, a user's own skill or project folder — is
+ * REAL USER DATA and must be backed up. Anchored 2026-09-07.
+ */
+export function scanTree(root, { excludeDirs = [], excludeFiles = [], excludeRootDirs = [] } = {}) {
   const out = {};
   if (!existsSync(root)) return out;
 
   const skipDir = new Set(excludeDirs);
+  const skipRootDir = new Set(excludeRootDirs);
   const skipFile = new Set(excludeFiles);
 
-  const walk = (dir) => {
+  const walk = (dir, atRoot) => {
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       const full = join(dir, e.name);
       if (e.isDirectory()) {
         if (skipDir.has(e.name)) continue;
-        walk(full);
+        if (atRoot && skipRootDir.has(e.name)) continue;
+        walk(full, false);
       } else if (e.isFile()) {
         if (skipFile.has(e.name)) continue;
         try {
@@ -47,7 +66,7 @@ export function scanTree(root, { excludeDirs = [], excludeFiles = [] } = {}) {
       }
     }
   };
-  walk(root);
+  walk(root, true);
   return out;
 }
 
@@ -89,14 +108,14 @@ export function saveManifest(file, data) {
  *           that deletes on your behalf is not a backup; a stale remote file
  *           costs storage, a wrongly-deleted one costs the data.
  */
-export function planIncremental(map, manifestFile, remote, { excludeDirs, excludeFiles } = {}) {
+export function planIncremental(map, manifestFile, remote, { excludeDirs, excludeFiles, excludeRootDirs } = {}) {
   const all = loadManifest(manifestFile);
   const prevForRemote = all[remote] || {};
   const plan = [];
   const nextForRemote = {};
 
   for (const m of map) {
-    const curr = scanTree(m.local, { excludeDirs, excludeFiles });
+    const curr = scanTree(m.local, { excludeDirs, excludeFiles, excludeRootDirs });
     nextForRemote[m.label] = curr;
 
     const prev = prevForRemote[m.label];

@@ -57,6 +57,32 @@ export function notifyRoutine(mode, title, body, opts = {}, { markerFile = FIRST
   return true;
 }
 
+/**
+ * The exclusion set the INCREMENTAL diff (planIncremental -> scanTree) runs
+ * with. Exported so a test can exercise the exact list production uses rather
+ * than a hand-copied approximation of it — a hand-rolled duplicate is how the
+ * previous round of tests missed that this list drops real user files.
+ *
+ * `session-sync` lives in excludeRootDirs, NOT excludeDirs: it is this
+ * plugin's own state dir at `<root>/session-sync` and nothing else. Matching
+ * the name at any depth (which is what shipped) silently dropped 21 real files
+ * under `~/.claude/plugins/marketplaces/goodstuff/plugins/session-sync/` from
+ * every incremental backup on a live machine. See scanTree()'s doc comment and
+ * test/exclusions.test.mjs.
+ *
+ * The other names keep their historical any-depth matching: widening them
+ * would quietly change what gets uploaded, which is a separate decision from
+ * fixing a data-loss bug. (Noted for later: `cache`/`statsig`/`shell-snapshots`
+ * ARE anchored globs in paths.mjs's rclone-level excludes, so the two
+ * mechanisms still disagree for those three names.)
+ */
+export const SCAN_EXCLUDES = Object.freeze({
+  excludeDirs: ['cache', 'shell-snapshots', 'statsig', 'node_modules'],
+  excludeRootDirs: ['session-sync'],
+  excludeFiles: ['.credentials.json', '.claude.json', 'mcp.json',
+                 '.deckhand-bus-token', '.deckhand-machine-oauth.json'],
+});
+
 /** Write an rclone --files-from list (one relative path per line). */
 function writeFileList(files) {
   const dir = mkdtempSync(join(tmpdir(), 'session-sync-list-'));
@@ -104,11 +130,7 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
   }
 
   // Work out what actually changed BEFORE touching the network.
-  const { plan, nextForRemote } = planIncremental(map, manifestFile, remote, {
-    excludeDirs: ['cache', 'shell-snapshots', 'statsig', 'node_modules', 'session-sync'],
-    excludeFiles: ['.credentials.json', '.claude.json', 'mcp.json',
-                   '.deckhand-bus-token', '.deckhand-machine-oauth.json'],
-  });
+  const { plan, nextForRemote } = planIncremental(map, manifestFile, remote, SCAN_EXCLUDES);
 
   const todo = plan.filter((p) => force || p.full || p.files.length);
   if (!todo.length) {
