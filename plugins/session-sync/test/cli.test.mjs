@@ -86,7 +86,7 @@ test('a hook-triggered push (--from-hook) hands off in the background and still 
     const r = run(['push', '--from-hook'], home, remote);
     assert.equal(r.status, 0, r.stderr);
     const log = readFileSync(join(stateDir, 'sync.log'), 'utf8');
-    assert.match(log, /handed off to background pid \d+/, 'a hook-triggered push must delegate to a background process, not run inline');
+    assert.match(log, /deferred worker pid \d+/, 'a hook-triggered push must delegate to a background worker, not run inline');
 
     // The parent already returned; the detached child keeps going on its own.
     const landed = waitFor(() => existsSync(join(remote, 'dot-claude', 'CLAUDE.md')));
@@ -96,21 +96,7 @@ test('a hook-triggered push (--from-hook) hands off in the background and still 
   } finally { cleanup(home, remote); }
 });
 
-test('a hook-triggered push within the debounce window is skipped and never spawns anything', { skip: skipReason }, () => {
-  const { home, remote, stateDir } = sandbox();
-  try {
-    // Pretend a push JUST succeeded.
-    writeFileSync(join(stateDir, 'last-push.txt'), new Date().toISOString());
-    const r = run(['push', '--from-hook'], home, remote);
-    assert.equal(r.status, 0, r.stderr);
-    const log = readFileSync(join(stateDir, 'sync.log'), 'utf8');
-    assert.match(log, /push skipped.*debounce/, 'a push inside the debounce window must be skipped, not retried');
-    assert.ok(!log.includes('handed off to background'), 'debounce must be checked BEFORE spawning anything — no wasted background process');
-    assert.equal(existsSync(join(remote, 'dot-claude')), false, 'nothing should have been copied at all');
-  } finally { cleanup(home, remote); }
-});
-
-test('a manual push ignores the debounce window entirely', { skip: skipReason }, () => {
+test('a manual push ignores the debounce window entirely, and records no deferred request', { skip: skipReason }, () => {
   const { home, remote, stateDir } = sandbox();
   try {
     writeFileSync(join(stateDir, 'last-push.txt'), new Date().toISOString());   // "just synced"
@@ -118,6 +104,122 @@ test('a manual push ignores the debounce window entirely', { skip: skipReason },
     assert.equal(r.status, 0, r.stderr);
     assert.ok(existsSync(join(remote, 'dot-claude', 'CLAUDE.md')),
       'an explicit manual push (the sync skill, or a user typing the command) must always run now, regardless of the last automatic sync');
+    assert.equal(existsSync(join(stateDir, 'deferred-push.json')), false,
+      'a manual push runs immediately and therefore owes nothing — it must not leave a deferral record behind');
+  } finally { cleanup(home, remote); }
+});
+
+test('a manual pull is never debounced either — it runs immediately no matter how recent the last pull', { skip: skipReason }, () => {
+  const { home, remote, stateDir } = sandbox();
+  try {
+    // Something waiting on the remote, and a pull that "just happened".
+    mkdirSync(join(remote, 'dot-claude'), { recursive: true });
+    writeFileSync(join(remote, 'dot-claude', 'FROM-REMOTE.md'), 'restored');
+    writeFileSync(join(stateDir, 'last-pull.txt'), new Date().toISOString());
+
+    const r = run(['pull'], home, remote);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(existsSync(join(home, '.claude', 'FROM-REMOTE.md')),
+      'a manual pull must fetch synchronously and immediately — the sync skill promises exactly that');
+  } finally { cleanup(home, remote); }
+});
+
+// ---- the coalescing deferral, driven through the REAL cli.mjs -------------
+// These are the end-to-end counterpart to test/defer.test.mjs: they prove the
+// wiring, not just the bookkeeping. A short debounce (0.05 min = 3s) and a
+// short retry (env-only, never set in production) keep them quick.
+
+const DEFERRED = 'deferred-push.json';
+const countOf = (log, re) => (log.match(re) || []).length;
+
+test('a debounced hook push is DEFERRED, not dropped: it still actually runs once the window lapses', { skip: skipReason }, () => {
+  const { home, remote, stateDir } = sandbox();
+  try {
+    assert.equal(run(['config', 'debounceMinutes', '0.05'], home, remote).status, 0);   // 3s
+    writeFileSync(join(stateDir, 'last-push.txt'), new Date().toISOString());           // "just synced"
+
+    const r = run(['push', '--from-hook'], home, remote);
+    assert.equal(r.status, 0, r.stderr);
+
+    const log = readFileSync(join(stateDir, 'sync.log'), 'utf8');
+    assert.match(log, /scheduled: deferred worker pid \d+ runs in ~[1-9]\d*s/,
+      'a push inside the debounce window must be scheduled for later, not skipped');
+    assert.ok(existsSync(join(stateDir, DEFERRED)), 'the request must be recorded on disk while it waits');
+
+    // The whole point: it eventually happens on its own, with no further trigger.
+    assert.ok(waitFor(() => existsSync(join(remote, 'dot-claude', 'CLAUDE.md')), { timeoutMs: 30000 }),
+      'the deferred push MUST eventually run — a debounce that permanently discards the last push of a conversation loses that conversation');
+    assert.ok(waitFor(() => !existsSync(join(stateDir, DEFERRED)), { timeoutMs: 15000 }),
+      'once the push has actually succeeded, nothing is owed and the record must be cleared');
+  } finally { cleanup(home, remote); }
+});
+
+test('rapid repeated hook pushes COLLAPSE into one background run, and none of them is lost', { skip: skipReason }, () => {
+  const { home, remote, stateDir } = sandbox();
+  try {
+    assert.equal(run(['config', 'debounceMinutes', '0.05'], home, remote).status, 0);
+    writeFileSync(join(stateDir, 'last-push.txt'), new Date().toISOString());
+
+    for (let i = 0; i < 3; i++) {
+      assert.equal(run(['push', '--from-hook'], home, remote).status, 0, `request ${i} should return cleanly`);
+    }
+
+    const scheduling = readFileSync(join(stateDir, 'sync.log'), 'utf8');
+    assert.equal(countOf(scheduling, /\(scheduled: deferred worker/g), 1,
+      'three conversations ending together must spawn exactly ONE worker');
+    assert.equal(countOf(scheduling, /\(coalesced: deferred worker/g), 2,
+      'the other two must coalesce onto it — recorded, not discarded');
+
+    assert.ok(waitFor(() => existsSync(join(remote, 'dot-claude', 'CLAUDE.md')), { timeoutMs: 30000 }));
+    assert.ok(waitFor(() => !existsSync(join(stateDir, DEFERRED)), { timeoutMs: 15000 }));
+
+    const done = readFileSync(join(stateDir, 'sync.log'), 'utf8');
+    assert.equal(countOf(done, /deferred push ok/g), 1,
+      'three requests must produce ONE push — that is the throttling the debounce is for');
+  } finally { cleanup(home, remote); }
+});
+
+test('a hook push blocked by the sync lock keeps its request and retries — it is never silently lost', { skip: skipReason }, () => {
+  const { home, remote, stateDir } = sandbox();
+  try {
+    // Hold the lock with a pid that is genuinely alive (this test process).
+    const lockFile = join(stateDir, 'sync.lock');
+    writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now(), host: 'test' }));
+
+    // No debounce, so the worker starts at once and goes straight at the lock.
+    const env = { CLAUDE_SESSION_SYNC_DEFER_RETRY_MS: '400', CLAUDE_SESSION_SYNC_DEFER_MAX_ATTEMPTS: '60' };
+    assert.equal(run(['config', 'debounceMinutes', '0'], home, remote).status, 0);
+    assert.equal(run(['push', '--from-hook'], home, remote, env).status, 0);
+
+    assert.ok(waitFor(() => /deferred push: another sync is running/.test(readFileSync(join(stateDir, 'sync.log'), 'utf8')), { timeoutMs: 15000 }),
+      'the worker must report waiting on the lock rather than exiting');
+    assert.ok(existsSync(join(stateDir, DEFERRED)),
+      'the request must still be recorded while the lock is held — the old behaviour discarded it here');
+    assert.equal(existsSync(join(remote, 'dot-claude')), false, 'sanity: nothing has been pushed yet');
+
+    // Release it. Nothing else fires a hook — the retry alone must finish the job.
+    rmSync(lockFile, { force: true });
+    assert.ok(waitFor(() => existsSync(join(remote, 'dot-claude', 'CLAUDE.md')), { timeoutMs: 30000 }),
+      'once the lock frees, the DEFERRED request must complete on its own with no new trigger');
+    assert.ok(waitFor(() => !existsSync(join(stateDir, DEFERRED)), { timeoutMs: 15000 }));
+  } finally { cleanup(home, remote); }
+});
+
+test('a request left behind by a dead worker (machine shut down mid-window) is picked up by the next session', { skip: skipReason }, () => {
+  const { home, remote, stateDir } = sandbox();
+  try {
+    // Exactly what a hard shutdown leaves: a push still owed, its worker gone,
+    // and its runAt already in the past.
+    writeFileSync(join(stateDir, DEFERRED), JSON.stringify({
+      requestedAt: Date.now() - 600000, runAt: Date.now() - 300000, pid: 999999,
+    }));
+    assert.equal(run(['config', 'debounceMinutes', '0'], home, remote).status, 0);
+    assert.equal(run(['push', '--from-hook'], home, remote).status, 0);
+
+    const log = readFileSync(join(stateDir, 'sync.log'), 'utf8');
+    assert.match(log, /\(scheduled: deferred worker/, 'a dead worker must be replaced, not trusted');
+    assert.ok(waitFor(() => existsSync(join(remote, 'dot-claude', 'CLAUDE.md')), { timeoutMs: 30000 }),
+      'the push owed from the previous session must actually happen');
   } finally { cleanup(home, remote); }
 });
 

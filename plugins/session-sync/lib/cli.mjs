@@ -31,6 +31,7 @@ import { push, pull, preflight, remoteNewer } from './sync.mjs';
 import { notify, registerWindowsSender } from './notify.mjs';
 import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE } from './config.mjs';
 import { acquireLock } from './lock.mjs';
+import { requestDeferred, refreshDeferred, settleDeferred, readDeferred } from './defer.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -45,7 +46,14 @@ const LAST_PUSH = join(STATE_DIR, 'last-push.txt');
 const SETUP_NAGGED = join(STATE_DIR, 'setup-reminded.txt');
 const SENDER_REGISTERED = join(STATE_DIR, 'sender-registered.txt');
 const LOCK_FILE = join(STATE_DIR, 'sync.lock');
+const DEFER_FILE = join(STATE_DIR, 'deferred-push.json');
 const DEBOUNCE_MS = Math.max(0, Number(CFG.debounceMinutes) || 0) * 60000;
+
+// How long a deferred worker waits before re-attempting a push that could not
+// take the sync lock, or that failed. Env-overridable so tests can exercise
+// the retry path in seconds instead of minutes; never set in production.
+const DEFER_RETRY_MS = Math.max(50, Number(process.env.CLAUDE_SESSION_SYNC_DEFER_RETRY_MS) || 30000);
+const DEFER_MAX_ATTEMPTS = Math.max(1, Number(process.env.CLAUDE_SESSION_SYNC_DEFER_MAX_ATTEMPTS) || 40);
 
 // A hook invocation carries this; a manual run (the sync/status skills, or a
 // user typing the command themselves) never does. It gates two things that
@@ -53,6 +61,11 @@ const DEBOUNCE_MS = Math.max(0, Number(CFG.debounceMinutes) || 0) * 60000;
 // the debounce window, and running detached in the background (see
 // spawnDetachedSelf below) instead of returning a real result synchronously.
 const fromHook = process.argv.includes('--from-hook');
+
+// Set ONLY by spawnDetachedSelf() when cli.mjs re-invokes itself as the
+// background worker that owns a deferred push. Never by a hook, never by a
+// human. See deferredPushWorker().
+const isDeferredWorker = process.argv.includes('--deferred');
 
 function ensureState() { try { mkdirSync(STATE_DIR, { recursive: true }); } catch {} }
 function log(line) {
@@ -68,14 +81,87 @@ function log(line) {
  * seconds after the last one finished gets a fresh lock instantly and syncs
  * again. This is the actual throttle for "N conversations in an hour = N
  * syncs," and it only ever applies to hook-triggered runs (see `fromHook`).
+ *
+ * NOTE: only `auto-pull` still uses this as a plain skip, and deliberately —
+ * a skipped pull costs freshness, never data (the remote keeps everything, and
+ * the next SessionStart pulls it). A skipped PUSH costs the conversation, so
+ * push goes through the coalescing deferral in defer.mjs instead.
  */
 function tooSoonSince(markerFile, debounceMs) {
   if (debounceMs <= 0) return false;
+  const last = readStamp(markerFile);
+  if (last === null) return false;
+  return Date.now() - last < debounceMs;
+}
+
+/** An ISO timestamp file as epoch ms, or null when absent/unparseable. */
+function readStamp(file) {
   try {
-    const last = new Date(readFileSync(markerFile, 'utf8').trim());
-    if (Number.isNaN(last.getTime())) return false;
-    return Date.now() - last.getTime() < debounceMs;
-  } catch { return false; }
+    const t = new Date(readFileSync(file, 'utf8').trim()).getTime();
+    return Number.isNaN(t) ? null : t;
+  } catch { return null; }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
+
+/**
+ * THE DEFERRED PUSH WORKER — a detached background process that owns one
+ * outstanding "a push is owed" record and does not exit until it has either
+ * pushed successfully or exhausted its attempts (leaving the record behind for
+ * the next session to pick up). It is the reason a debounced or lock-blocked
+ * push is DEFERRED rather than DROPPED. See defer.mjs for the record's rules.
+ */
+async function deferredPushWorker() {
+  const start = readDeferred(DEFER_FILE);
+  const runAt = Number.isFinite(start?.runAt) ? start.runAt : Date.now();
+  const waitMs = runAt - Date.now();
+  if (waitMs > 0) log(`deferred push: waiting ${Math.round(waitMs / 1000)}s for the debounce window to lapse`);
+  await sleep(waitMs);
+
+  for (let attempt = 1; attempt <= DEFER_MAX_ATTEMPTS; attempt++) {
+    if (!readDeferred(DEFER_FILE)) {
+      log('deferred push: nothing owed any more (another push already covered it)');
+      return;
+    }
+
+    // Captured BEFORE push() scans the tree, so a request arriving mid-push is
+    // correctly judged NOT covered by this run. See settleDeferred().
+    const claimedAt = Date.now();
+    const lock = acquireLock(LOCK_FILE);
+    if (!lock.acquired) {
+      // The old behaviour here was to exit — which silently discarded the
+      // request. Keep it, re-stamp so later requests coalesce onto us, retry.
+      log(`deferred push: ${lock.reason} — retrying in ${Math.round(DEFER_RETRY_MS / 1000)}s (request kept)`);
+      refreshDeferred(DEFER_FILE, { runAt: Date.now() + DEFER_RETRY_MS, pid: process.pid });
+      await sleep(DEFER_RETRY_MS);
+      continue;
+    }
+
+    log(`deferred push -> ${REMOTE} (attempt ${attempt})`);
+    let r;
+    try {
+      r = await push(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
+    } finally {
+      lock.release();
+    }
+
+    if (r.ok) {
+      ensureState();
+      writeFileSync(LAST_PUSH, new Date().toISOString());
+      const settled = settleDeferred(DEFER_FILE, claimedAt);
+      log(`deferred push ok (${r.mins} min)${settled ? '' : ' — a newer request arrived mid-push, running again for it'}`);
+      if (settled) return;
+      continue;
+    }
+
+    log(`deferred push FAILED (${r.mins} min) — retrying in ${Math.round(DEFER_RETRY_MS / 1000)}s (request kept)`);
+    refreshDeferred(DEFER_FILE, { runAt: Date.now() + DEFER_RETRY_MS, pid: process.pid });
+    await sleep(DEFER_RETRY_MS);
+  }
+
+  // Deliberately leaves the record on disk: still owed, just not by us. The
+  // next hook-triggered push sees a dead worker pid and schedules a fresh one.
+  log(`deferred push: gave up after ${DEFER_MAX_ATTEMPTS} attempts — the request is still recorded and will be retried by the next session`);
 }
 
 /**
@@ -287,20 +373,33 @@ try {
   }
 
   if (cmd === 'push') {
-    // Debounce is a hook-only concern: an explicit "push now" (the sync
-    // skill, or a user running this by hand) must always run immediately.
-    if (fromHook && tooSoonSince(LAST_PUSH, DEBOUNCE_MS)) {
-      log(`push skipped — synced within the last ${CFG.debounceMinutes} min (debounce)`);
+    // The background worker for an already-recorded request. Runs the real
+    // push after the debounce window lapses, retrying on lock contention.
+    if (isDeferredWorker) {
+      await deferredPushWorker();
       process.exit(0);
     }
-    // A hook-triggered push hands off to a fully detached background process
-    // and returns immediately, so it survives the hook's own timeout and the
+
+    // A hook-triggered push RECORDS a request and hands off to a detached
+    // background worker, so it survives the hook's own timeout and the
     // conversation process tree tearing down (see spawnDetachedSelf's doc
-    // comment). A manual run keeps running synchronously so its caller gets
-    // a real result — the sync skill and `--strict` both depend on that.
+    // comment). The debounce shifts WHEN that worker runs; it never cancels
+    // the request. Rapid repeat requests coalesce onto the one live worker,
+    // so N conversations ending together still cost exactly one push — and
+    // the last of them is still the one that gets pushed. See defer.mjs.
+    //
+    // A manual run keeps running synchronously so its caller gets a real
+    // result — the sync skill and `--strict` both depend on that.
     if (fromHook) {
-      const pid = spawnDetachedSelf(['push', ...(strict ? ['--strict'] : [])]);
-      log(`push -> ${REMOTE} (handed off to background pid ${pid})`);
+      const last = readStamp(LAST_PUSH);
+      const runAt = Math.max(Date.now(), (last ?? 0) + DEBOUNCE_MS);
+      const r = requestDeferred(DEFER_FILE, {
+        runAt,
+        spawnWorker: () => spawnDetachedSelf(['push', '--deferred']),
+      });
+      const inS = Math.max(0, Math.round((r.runAt - Date.now()) / 1000));
+      log(`push -> ${REMOTE} (${r.action}: deferred worker pid ${r.pid} runs in ~${inS}s${
+        inS > 0 ? ` — debounce ${CFG.debounceMinutes} min` : ''})`);
       process.exit(0);
     }
     // Hooks fire per conversation; several ending together would otherwise race.

@@ -4,17 +4,22 @@
  * 'resume' is a REAL value on both events (confirmed against Claude Code's
  * hooks docs: SessionStart 'resume' = a new session starting to pick up a
  * paused one; SessionEnd 'resume' = "session paused for resume" on the OLD
- * one) — not a typo. But matching it on BOTH meant resuming a conversation
- * fired an auto-pull AND a push within the same fraction of a second, every
- * time: live sync.log showed a pull/push/pull triplet inside 0.7s, and 91
- * "skipped" (lock-contention) log lines against only 18 "push ok" across the
- * whole history. The old session isn't actually finishing when it pauses for
- * resume — the same transcript is immediately picked back up by the resumed
- * session, which fires its own genuine SessionEnd later — so pushing on
- * SessionEnd(resume) bought nothing but a guaranteed collision.
+ * one) — not a typo.
  *
- * This test pins the fix (resume removed from SessionEnd only) so it can't
- * silently regress back to double-firing.
+ * IT WAS BRIEFLY REMOVED FROM SessionEnd, AND THAT WAS WRONG. The removal
+ * rested on an assumption Claude Code does not actually guarantee: that a
+ * resumed conversation always fires a later SessionEnd with a different
+ * reason. Nothing documents that. If a conversation's ONLY SessionEnd ever
+ * fires with reason='resume' — the app force-closed or crashed after a resume
+ * — then excluding it means that conversation's final state never reaches the
+ * remote. Losing a whole conversation is the exact failure this plugin exists
+ * to prevent, and it is not a fair trade for avoiding redundant hook fires.
+ *
+ * So 'resume' is BACK, and the redundant fires are absorbed rather than
+ * avoided: a hook-triggered push records a request and coalesces onto one
+ * background worker (lib/defer.mjs), so the pull/push/pull triplet inside 0.7s
+ * that motivated the removal now costs one recorded request instead of a lost
+ * push. These tests pin the restored matcher so it cannot regress again.
  */
 
 import { test } from 'node:test';
@@ -36,10 +41,10 @@ test('SessionStart still pulls on resume (a new session picking up a paused one)
   assert.ok(values.includes('startup'), 'a fresh app launch must still auto-pull');
 });
 
-test('SessionEnd no longer pushes on resume — that session is pausing, not finishing', () => {
+test('SessionEnd DOES push on resume — a conversation whose only SessionEnd is resume must still be backed up', () => {
   const values = matcherValues(hooks.hooks.SessionEnd);
-  assert.ok(!values.includes('resume'),
-    'resume on SessionEnd fires in the same instant as SessionStart(resume) on the new session — a guaranteed lock collision for a session that has not actually ended');
+  assert.ok(values.includes('resume'),
+    'Claude Code does not guarantee a later non-resume SessionEnd for the same conversation. Excluding resume risks a conversation NEVER having its final state pushed — the redundant fires are absorbed by the coalescing deferral in lib/defer.mjs instead.');
 });
 
 test('SessionEnd still covers the reasons that ARE a real end of work', () => {

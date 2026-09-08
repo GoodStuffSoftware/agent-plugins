@@ -27,7 +27,8 @@ function readLock(file) {
   try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
 }
 
-function pidAlive(pid) {
+/** Exported so defer.mjs can reuse the same liveness rule for its worker pid. */
+export function pidAlive(pid) {
   if (!pid) return false;
   if (pid === process.pid) return true;   // it is us, and we are demonstrably running
   try { process.kill(pid, 0); return true; }        // signal 0 = existence check
