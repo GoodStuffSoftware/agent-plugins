@@ -70,11 +70,29 @@ export function notifyRoutine(mode, title, body, opts = {}, { markerFile = FIRST
  * every incremental backup on a live machine. See scanTree()'s doc comment and
  * test/exclusions.test.mjs.
  *
- * The other names keep their historical any-depth matching: widening them
- * would quietly change what gets uploaded, which is a separate decision from
- * fixing a data-loss bug. (Noted for later: `cache`/`statsig`/`shell-snapshots`
- * ARE anchored globs in paths.mjs's rclone-level excludes, so the two
- * mechanisms still disagree for those three names.)
+ * `cache`/`statsig`/`shell-snapshots`/`node_modules` keep any-depth matching,
+ * and that is CORRECT rather than merely historical: each is a regenerable
+ * cache wherever it appears. The only nested one that exists on a live machine
+ * is `~/.claude/plugins/cache` — 892 files / 9.1 MB of downloaded plugin
+ * payloads that Claude Code re-fetches from `plugins/marketplaces/**` (which IS
+ * synced). Nothing under any of them is authored by the user, so excluding them
+ * at depth costs nothing and skips ~10 MB of churn per sync.
+ *
+ * PARITY WITH paths.mjs — resolved 2026-09-08, and the earlier note here that
+ * claimed these three disagreed with the rclone filter had it exactly backwards.
+ * rclone matches a pattern WITHOUT a leading `/` at ANY depth (verified against
+ * rclone v1.74.0), so `cache/**` & co. were never anchored and already agreed
+ * with excludeDirs. The name that actually disagreed was `session-sync`: the
+ * rclone side still read `session-sync/**`, which is any-depth, so the v0.2.1
+ * fix only covered the incremental path — full pushes and every pull still
+ * dropped the 21 marketplace files. paths.mjs now anchors it as
+ * `/session-sync/**`, the exact mirror of excludeRootDirs.
+ *
+ *   excludeDirs     <-> unanchored rclone glob  ('cache/**')
+ *   excludeRootDirs <-> anchored rclone glob    ('/session-sync/**')
+ *
+ * Keep those two columns in step; test/exclusions.test.mjs asserts the mapping
+ * against real rclone, so a name added to one list without the other fails.
  */
 export const SCAN_EXCLUDES = Object.freeze({
   excludeDirs: ['cache', 'shell-snapshots', 'statsig', 'node_modules'],

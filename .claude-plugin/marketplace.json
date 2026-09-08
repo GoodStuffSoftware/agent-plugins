@@ -10,7 +10,7 @@
       "name": "session-sync",
       "source": "./plugins/session-sync",
       "description": "Roam Claude Code conversations between machines - restored in the desktop sidebar, not just resumable from the terminal.",
-      "version": "0.2.1"
+      "version": "0.2.2"
     }
   ]
 }

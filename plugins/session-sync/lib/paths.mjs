@@ -125,14 +125,35 @@ export function resolveAll() {
     // auth token fails on the far side rather than helping, and putting live
     // tokens in cloud storage is a needless exposure.
     //
-    // session-sync/** is this PLUGIN'S OWN bookkeeping (sync.log, manifest.json,
+    // /session-sync/** is this PLUGIN'S OWN bookkeeping (sync.log, manifest.json,
     // sync.lock, config.json) living inside the tree it watches. sync.log is
     // appended to on every single run, so leaving it in-scope guaranteed every
     // run saw "something changed" and re-synced — a self-sustaining loop that
     // defeated the "nothing to push" skip entirely. Excluded 2026-09-07.
+    //
+    // ANCHORING — the leading slash is load-bearing, and it is the ONLY name
+    // here that carries one. rclone's rule: a pattern WITHOUT a leading `/` is
+    // matched from the end of the path and matches a complete path element at
+    // ANY depth; a pattern WITH one matches only at the root of the transfer.
+    // (Verified against rclone v1.74.0, not inferred from the docs.) So:
+    //
+    //   'session-sync/**'   ALSO excluded
+    //                       plugins/marketplaces/goodstuff/plugins/session-sync/**
+    //                       — the marketplace's own checkout of this plugin, 21
+    //                       real files. v0.2.1 anchored the manifest-scan half of
+    //                       that bug (SCAN_EXCLUDES.excludeRootDirs) but left this
+    //                       half unfixed, so full pushes and EVERY pull still
+    //                       dropped them. Anchored 2026-09-08.
+    //   '/session-sync/**'  excludes only <root>/session-sync — this plugin's
+    //                       state dir, which is the only thing that ever meant.
+    //
+    // The other three directory names stay UNANCHORED on purpose: they are
+    // regenerable caches wherever they appear, and any-depth is exactly what
+    // SCAN_EXCLUDES.excludeDirs does for them. The two mechanisms agree by
+    // construction — see the note above SCAN_EXCLUDES in sync.mjs.
     excludes: [
       'cache/**',
-      'session-sync/**',
+      '/session-sync/**',
       '.credentials.json',
       '.claude.json',
       'mcp.json',
@@ -140,6 +161,11 @@ export function resolveAll() {
       '.deckhand-machine-oauth.json',
       'statsig/**',
       'shell-snapshots/**',
+      // Installed dependencies, regenerable from a lockfile. Already dropped
+      // at any depth by SCAN_EXCLUDES.excludeDirs, so without this a full push
+      // uploaded them once and every incremental push then ignored them
+      // forever — the same half-applied-exclusion shape as session-sync above.
+      'node_modules/**',
     ],
   };
 }
