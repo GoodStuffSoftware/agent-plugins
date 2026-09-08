@@ -5,10 +5,13 @@
  * cli.mjs runs top-level code the moment it's imported (it calls
  * process.exit()), so it cannot be unit-tested via `import` the way the lib/
  * modules are — it has to be exercised as a real child process, the way a
- * hook actually invokes it. `USERPROFILE` is what Node's os.homedir() reads
- * on Windows, so overriding it per-child-process fully sandboxes STATE_DIR,
- * CONFIG_FILE, and claudeHome() away from the real ~/.claude — confirmed
- * directly before relying on it here.
+ * hook actually invokes it.
+ *
+ * SANDBOXING: the whole run is already redirected by test/sandbox-env.mjs
+ * (see its header — overriding USERPROFILE alone was NOT enough; paths.mjs
+ * probes APPDATA directly and that hole reached real conversation data).
+ * `run()` narrows it further to a per-test home so cases cannot see each
+ * other's state, and re-points APPDATA inside that home for the same reason.
  *
  * A plain local directory is a valid rclone destination (see rclone.mjs's
  * isLocalRemote), so these drive the real cli.mjs against a real rclone with
@@ -41,6 +44,9 @@ function sandbox() {
   // "already done" marker inside the SANDBOXED state dir skips that branch
   // entirely while leaving everything this test actually cares about intact.
   writeFileSync(join(stateDir, 'sender-registered.txt'), new Date().toISOString());
+  // Real desktop toasts are a side effect on the developer's actual machine,
+  // not something a test should produce. This is the master kill switch.
+  writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ notifications: false }, null, 2));
   return { home, remote, stateDir };
 }
 
@@ -49,6 +55,12 @@ function run(args, home, remote, extraEnv = {}) {
     env: {
       ...process.env,
       USERPROFILE: home,
+      HOME: home,
+      // paths.mjs probes APPDATA directly, so it has to move with the home or
+      // the child re-discovers the real desktop session stores. See
+      // test/sandbox-env.mjs.
+      APPDATA: join(home, 'AppData', 'Roaming'),
+      XDG_CONFIG_HOME: join(home, '.config'),
       CLAUDE_SESSION_SYNC_REMOTE: remote,
       ...extraEnv,
     },
