@@ -99,9 +99,28 @@ function detach(cmd, args) {
  * the identical call with even a few seconds' delay before the caller exited
  * worked every time. Returns whether the registry write actually succeeded,
  * so the caller only remembers "done" when it is actually done.
+ *
+ * BOUNDED, because synchronous and unbounded is a session-start hazard. This
+ * runs inside the hook-invoked process, BEFORE the detach/hand-off, so a
+ * powershell.exe that hangs — AV intercepting a fresh launch, an environment
+ * where -ExecutionPolicy Bypass does not suppress every prompt — would block
+ * the hook until its own timeout with zero backup happening. And because the
+ * caller only writes its "already done" marker on SUCCESS, a hang would
+ * repeat on every subsequent push/pull. `timeout` caps that at REGISTER_TIMEOUT_MS;
+ * on timeout spawnSync kills the child and returns an `error`, which is
+ * treated exactly like any other failure: return false, no marker, retry next
+ * time, toasts merely unbranded. Cosmetic branding must never cost a backup.
+ *
+ * `spawnFn`/`platformFn` are test-only injection points (same escape-hatch
+ * pattern as push()'s `map`/`manifestFile` and notifyRoutine()'s `notifyFn`):
+ * they let a test assert the timeout is actually passed, and simulate a hung
+ * or throwing PowerShell, without touching the real machine's registry.
  */
-export function registerWindowsSender(displayName = 'Claude Session Sync', iconPath = null) {
-  if (platform() !== 'win32') return false;
+export const REGISTER_TIMEOUT_MS = 5000;
+
+export function registerWindowsSender(displayName = 'Claude Session Sync', iconPath = null,
+                                      { spawnFn = spawnSync, platformFn = platform } = {}) {
+  if (platformFn() !== 'win32') return false;
   const icon = iconPath
     ? `New-ItemProperty -Path $k -Name IconUri -Value '${iconPath}' -PropertyType String -Force | Out-Null`
     : '';
@@ -113,7 +132,14 @@ New-ItemProperty -Path $k -Name DisplayName -Value '${displayName}' -PropertyTyp
 ${icon}
 `;
   try {
-    const r = spawnSync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], { windowsHide: true });
+    const r = spawnFn('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps], {
+      windowsHide: true,
+      timeout: REGISTER_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    // A timeout surfaces as r.error (ETIMEDOUT) with a null status, so check
+    // it explicitly rather than relying on `status === 0` alone.
+    if (!r || r.error) return false;
     return r.status === 0;
   } catch { return false; }
 }

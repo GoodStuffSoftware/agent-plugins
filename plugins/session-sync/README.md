@@ -78,7 +78,7 @@ everything else.
 | `enabled false` | pause syncing on this machine without uninstalling |
 | `notifications false` | silence EVERYTHING, including failures — a full opt-out |
 | `notifyMode` | how chatty routine (non-failure) toasts are: `first-run` (default — one toast ever, to confirm it's alive, then quiet), `all` (a toast every time), `failures` (never, only failures/conflicts show) |
-| `debounceMinutes` | hook-triggered syncs only: skip if the last one succeeded within this many minutes (default `5`; `0` disables it). Never applies to a manual `push`/`pull` — the sync skill's "push before switching machines" always runs immediately. |
+| `debounceMinutes` | hook-triggered pushes only: **defer** (never discard) if the last one succeeded within this many minutes (default `5`; `0` disables the wait). Several conversations ending together coalesce into one background push that runs when the window lapses — the request is recorded on disk, so even a machine shut down mid-wait retries it next session. Never applies to a manual `push`/`pull` — the sync skill's "push before switching machines" always runs immediately. |
 
 `CLAUDE_SESSION_SYNC_REMOTE` overrides the file when set — handy for CI, and `config` reports
 `source: "env"` so an edit that appears to do nothing is explainable.
