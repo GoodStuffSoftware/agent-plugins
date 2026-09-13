@@ -78,6 +78,14 @@ for (const p of plugins) {
     changes.push(`marketplace.json: ${p.name} source -> ./${p.dir}`);
     entry.source = `./${p.dir}`;
   }
+  // The description is the plugin's own too. Syncing it only on CREATE meant an
+  // edited plugin.json description silently never reached the marketplace, and
+  // --check reported "in sync" while the two disagreed - the exact drift this
+  // script exists to prevent, in the field users actually read.
+  if (p.description && entry.description !== p.description) {
+    changes.push(`marketplace.json: ${p.name} description updated`);
+    entry.description = p.description;
+  }
 }
 market.plugins.sort((a, b) => a.name.localeCompare(b.name));
 
