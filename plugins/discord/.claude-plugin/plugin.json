@@ -1,0 +1,20 @@
+{
+  "name": "discord",
+  "description": "Operate your own Discord server from Claude — guided bot setup, building out a category/channel structure, and posting release notes safely. Packages the Apache-2.0 cappyeo/discord-mcp server rather than reimplementing it.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Good Stuff Software",
+    "url": "https://github.com/GoodStuffSoftware"
+  },
+  "homepage": "https://github.com/GoodStuffSoftware/agent-plugins/tree/main/plugins/discord",
+  "repository": "https://github.com/GoodStuffSoftware/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "discord",
+    "mcp",
+    "community",
+    "server-setup",
+    "webhooks",
+    "release-notes"
+  ]
+}

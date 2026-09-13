@@ -15,6 +15,20 @@
           "jsonpath": "$.version"
         }
       ]
+    },
+    "plugins/discord": {
+      "release-type": "simple",
+      "package-name": "discord",
+      "tag-separator": "@",
+      "component": "discord",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": ".claude-plugin/plugin.json",
+          "jsonpath": "$.version"
+        }
+      ]
     }
   }
 }

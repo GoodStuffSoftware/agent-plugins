@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "discord": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["--yes", "--loglevel=error", "@discord-mcp/cli@0.26.1", "serve", "--profile", "devbot"],
+      "env": { "MCP_TOOL_SURFACE": "progressive" }
+    }
+  }
+}
