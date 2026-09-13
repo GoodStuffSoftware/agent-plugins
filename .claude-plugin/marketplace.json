@@ -7,9 +7,15 @@
   },
   "plugins": [
     {
+      "name": "discord",
+      "source": "./plugins/discord",
+      "description": "Operate your own Discord server from Claude — guided bot setup, building out a category/channel structure, and posting release notes safely. Packages the Apache-2.0 cappyeo/discord-mcp server rather than reimplementing it.",
+      "version": "0.1.0"
+    },
+    {
       "name": "session-sync",
       "source": "./plugins/session-sync",
-      "description": "Roam Claude Code conversations between machines - restored in the desktop sidebar, not just resumable from the terminal.",
+      "description": "Roam Claude Code conversations between machines. Syncs the transcripts AND the desktop app's session index, so chats come back in the sidebar instead of only via `claude --resume`.",
       "version": "0.2.1"
     }
   ]

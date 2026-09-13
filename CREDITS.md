@@ -27,10 +27,41 @@ adopted their `@ai-plugin-marketplace/*` toolkit: it is actively developed
 one target today. Their layout is compatible with ours, so adopting it later
 would not require restructuring.
 
+## The Discord connector's server
+
+**[cappyeo/discord-mcp](https://github.com/cappyeo/discord-mcp)** — Apache-2.0
+The `discord` plugin does **not** implement a Discord MCP server. It packages this
+one and adds skills around it. All credit for the tool surface belongs there; the
+plugin is configuration plus documentation.
+
+We pinned `@discord-mcp/cli@0.26.1` rather than tracking `@latest`, after checking
+the things that matter when a package holds a bot token: it is bot-token-only (no
+user-token or self-bot path exists in the source or the published bundle), the npm
+tarball carries a verified Sigstore/SLSA provenance attestation tying it to a
+GitHub Actions build of that repo, there are no install-time scripts, and the only
+outbound hosts are `discord.com` plus two non-automatic ones — an explicit
+`discord-mcp update` version check against `registry.npmjs.org`, and an
+`emoji.gg` lookup that runs only when that tool is invoked. It is a solo-maintainer
+project, which is the main standing risk; the version pin is the mitigation.
+
 ## Upstream tooling
 
 - **[Release Please](https://github.com/googleapis/release-please)** (Google, Apache-2.0) — release automation.
 - **[rclone](https://rclone.org)** (MIT) — every storage backend session-sync can use.
+
+## Discord MCP servers we surveyed
+
+Checked before writing the `discord` plugin, to avoid shipping a tenth
+implementation of the same thing:
+
+- **[Anthropic's official `discord` plugin](https://github.com/anthropics/claude-plugins-official)** — bot-token, correct auth model, but messaging-only (`reply`, `react`, `edit_message`, `fetch_messages`). No channel, category, or permission tools, so it cannot build a server out.
+- **[barryyip0625/mcp-discord](https://github.com/barryyip0625/mcp-discord)** — MIT, actively maintained, the best of the general-purpose options: channels, categories, permission overwrites, roles, webhooks.
+- **[PaSympa/discord-mcp](https://github.com/PaSympa/discord-mcp)** — MIT, lightweight, multi-guild.
+- **[SaseQ/discord-mcp](https://github.com/SaseQ/discord-mcp)** — the largest community, but JVM/Docker-distributed and the least recently updated.
+- **[olivier-motium/discord-user-mcp](https://github.com/olivier-motium/discord-user-mcp)** — **disqualified.** It drives a real user account via a user token. Its own README concedes this is against Discord's Terms of Service. It also cannot manage channels or permissions, so it would not have served the purpose anyway.
+
+`cappyeo/discord-mcp` won on tool coverage and on supply-chain evidence, not on
+popularity — it has fewer stars than several of the above.
 
 ## Prior art we deliberately did not reuse
 
