@@ -65,6 +65,25 @@ test('every command invoked from a hook passes --from-hook, so the debounce and 
     .filter((h) => h.type === 'command');
   assert.ok(allHooks.length > 0, 'sanity: the fixture must actually contain hook commands');
   for (const h of allHooks) {
-    assert.match(h.command, /--from-hook\b/, `hook command missing --from-hook: ${h.command}`);
+    // Exec form (args present, no shell) splits the invocation across
+    // `command` + `args` instead of one shell string — check the whole
+    // invocation, not just `command`.
+    const invocation = [h.command, ...(h.args ?? [])].join(' ');
+    assert.match(invocation, /--from-hook\b/, `hook invocation missing --from-hook: ${invocation}`);
+  }
+});
+
+test('every command hook runs in exec form (args present), not shell form', () => {
+  // A command hook with no `args` runs through a shell wrapper (Git Bash or
+  // PowerShell on Windows) to tokenize the string — and that shell hop is
+  // what flashed a console window at every session start/end. Exec form
+  // (command + args, no shell) avoids it. Pinned so it cannot regress.
+  const allHooks = [...hooks.hooks.SessionStart, ...hooks.hooks.SessionEnd]
+    .flatMap((e) => e.hooks)
+    .filter((h) => h.type === 'command');
+  assert.ok(allHooks.length > 0, 'sanity: the fixture must actually contain hook commands');
+  for (const h of allHooks) {
+    assert.ok(Array.isArray(h.args) && h.args.length > 0,
+      `hook command must use exec form (args array) to avoid a shell hop: ${h.command}`);
   }
 });
