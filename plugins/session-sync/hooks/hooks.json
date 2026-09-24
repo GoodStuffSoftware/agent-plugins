@@ -7,7 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs\" auto-pull --from-hook",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs", "auto-pull", "--from-hook"],
             "timeout": 120
           }
         ]
@@ -20,7 +21,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs\" push --from-hook",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs", "push", "--from-hook"],
             "timeout": 600
           }
         ]
