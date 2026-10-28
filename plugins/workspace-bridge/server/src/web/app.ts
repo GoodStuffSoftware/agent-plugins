@@ -3,6 +3,7 @@
 
 import { Hono } from "hono";
 import type { Env } from "../env";
+import { accountsRoutes } from "./accounts";
 import { withSecurityHeaders } from "./html";
 import { publicRoutes } from "./public";
 
@@ -14,3 +15,4 @@ app.use("*", async (c, next) => {
 });
 
 app.route("/", publicRoutes);
+app.route("/accounts", accountsRoutes);
