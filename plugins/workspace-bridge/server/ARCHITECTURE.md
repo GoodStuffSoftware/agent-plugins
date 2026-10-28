@@ -334,7 +334,7 @@ export interface ToolContext {
   readonly env: Env;
   readonly now: () => number; // ms; tests inject a clock
   readonly untrusted: Untrusted; // one nonce per tool call
-  accounts: AccountResolver; // resolve(selector, idPrefix?) -> AccountRef[]
+  accounts: AccountResolver; // resolve(selector?, idPrefix?, { allowAll? }) -> AccountRef[]
   use<T>(cap: Capability<T>, account: AccountRef): T; // throws component_disabled or not_supported_by_provider
   ids: IdCodec;
   cursors: CursorCodec;
@@ -381,6 +381,10 @@ Every returned id that belongs to one account is prefixed with the account's sho
 
 A prefixed id selects its account. A bare id needs `account`, else the default account applies. A prefixed id plus a different `account` is `invalid_argument`. Prefixed: thread, message, draft, label, attachment, filter, calendar, event, file, contact. Not prefixed: `pendingActionId` (`pa_` plus random, owner-scoped).
 
+`core/ids.ts`: `encodeId(account | shortId, providerId)`, `decodeId(id)` (null for a bare id) and `parseId(id)`, which also refuses a value shaped like a prefixed id but malformed (`a0:x`, `a1:`, ten digits) with `invalid_argument` instead of taking it for a bare id. `ctx.ids` is the `IdCodec` of these three.
+
+`core/accounts.ts`: `createAccountResolver({ db, ownerId, publicUrl })` gives `AccountResolver.resolve(selector?, idPrefix?, { allowAll? })`. `selector` is tried as an exact label, then a label ignoring case or an address (lowercase), then a short id (`a3` or `3`); two matches at one step is `ambiguous_account` with `candidates` (labels). `"all"` (reserved, any case) returns every account only with `allowAll`, else `invalid_argument`. Omitted selects the owner's `default_account_id`, else the only linked account, else `account_not_found` (none) or `ambiguous_account` (several). `idPrefix` (`a3` or `3`, from `decodeId`) selects its account when `selector` is omitted; a selector that names another account, or `"all"`, is `invalid_argument` (a selector that names no account, or several, keeps `account_not_found` or `ambiguous_account`). Accounts in `needs_relink` resolve (the broker reports the relink). Errors carry `{ accountsUrl: PUBLIC_URL/accounts }`. A resolver reads the owner's accounts once, so make one per tool call.
+
 ### 3.5 Cursors
 
 `nextPageToken` is `base64url(JSON.stringify(cursor))`:
@@ -396,6 +400,8 @@ type Cursor = {
 ```
 
 A single-account call has one entry. With `account: "all"` each account fetches its page (`tok`), results merge by date, and `skip` counts the items of that page already returned, so nothing is lost when the merged page is cut. A cursor whose `t` or `q` does not match the call is `invalid_argument`. Cursors are not signed: they hold only Google page tokens for the caller's own accounts, resolved through the owner's account table.
+
+`core/cursor.ts` is the one implementation. `queryHash(params)` fingerprints the call's result-shaping parameters (canonical JSON, no `pageToken`); `encodeCursor` and `decodeCursor(token, { tool, query })` (any malformed or mismatched token is `invalid_argument`, fixed message) make up `ctx.cursors` with `queryHash`. A list tool does: `decode` when a `pageToken` came in, `startFromCursor(cursor | null, keys)` for the `{ key, tok, skip }` of every account still active (a cursor for a different account set is `invalid_argument`), one provider page fetch per account with `tok`, then `mergePages(pages, { tool, query, limit, keys, compare })` where each `AccountPage` is `{ key, tok, skip, items, next }` in sort order. `mergePages` drops the first `skip` items of each page, merges by `compare` up to `limit`, and returns `{ items, taken, nextPageToken }`. An account whose page is used up but has a next page stops the merge (its next items are unknown), so a page can be short, and empty if a provider returns an empty page with a next token (the cursor still advances). `keys` lists every account of the call, so exhausted ones stay in the cursor as null; `nextPageToken` is undefined when all are exhausted.
 
 ### 3.6 Services and providers (plan s.7)
 
@@ -496,7 +502,7 @@ export interface Untrusted {
 }
 ```
 
-`wrap` strips zero-width and bidi controls (U+200B-U+200F, U+202A-U+202E, U+2060-U+2069, U+FEFF), replaces `/<(\/?)untrusted/gi` with `&lt;$1untrusted`, escapes attribute values, and returns `<untrusted-NONCE source="email" account="a1" from="...">...</untrusted-NONCE>`. Tools with `untrusted: true` get the fixed `UNTRUSTED_NOTE` appended to their description. Required unit test: a body containing `</untrusted>` or a guessed `</untrusted-...>` stays inside one block.
+`wrap` strips zero-width and bidi controls (U+200B-U+200F, U+202A-U+202E, U+2060-U+2069, U+FEFF), replaces `/<(\/?)untrusted/gi` with `&lt;$1untrusted`, escapes attribute values, and returns `<untrusted-NONCE source="email" account="a1" from="...">...</untrusted-NONCE>`. Tools with `untrusted: true` get the fixed `UNTRUSTED_NOTE` appended to their description. Required unit test: a body containing `</untrusted>` or a guessed `</untrusted-...>` stays inside one block (`test/untrusted.test.ts`). `stripHiddenControls` also removes U+00AD, U+034F, U+061C, U+180E and the Unicode Tags block U+E0000-U+E007F, which hide text from a reader. `core/untrusted.ts` exports `createUntrusted()` (one per tool call; becomes `ctx.untrusted`), `Untrusted`, `UntrustedAttrs`, `stripHiddenControls`, `neutralizeTags` and `escapeAttr` (which also folds line breaks to spaces). Stripping runs before neutralising, so a tag split by a zero-width character is still caught. `UNTRUSTED_NOTE` stays in `registry/compile.ts`.
 
 ## 4. D1 schema outline
 
