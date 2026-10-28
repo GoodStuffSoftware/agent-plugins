@@ -73,6 +73,7 @@ describe("update_*_state", () => {
     await call(ownerId, "update_message_state", { messageId: "m1", archived: false });
     expect(a.isError).toBe(false);
     expect(a.json.messageId).toMatch(/^a\d+:m1$/);
+    expect(a.json.removed).toEqual([expect.stringMatching(/^a\d+:INBOX$/)]);
     expect(bodies(calls)).toEqual([{ removeLabelIds: ["INBOX"] }, { addLabelIds: ["INBOX"] }]);
   });
 

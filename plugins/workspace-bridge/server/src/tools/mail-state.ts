@@ -96,7 +96,11 @@ function stateTool(kind: Kind) {
       }
       const r = await target(ctx, kind, a[key] ?? "", a.account);
       await ctx.use(STATE, r.a).modify(r.a, r.t, { add, remove });
-      return { ...r.out, added: add, removed: remove };
+      return {
+        ...r.out,
+        added: add.map((l) => ctx.ids.encode(r.a, l)),
+        removed: remove.map((l) => ctx.ids.encode(r.a, l)),
+      };
     },
   });
 }
