@@ -152,7 +152,16 @@ export function internalErrorLine(tool: string, e: unknown, args?: unknown): str
   });
 }
 
+/**
+ * A handler result made of explicit content blocks, for a tool that returns a file: a text block
+ * of compact JSON for the details, then an embedded resource block with the base64 `blob`.
+ */
+export class ContentResult {
+  constructor(readonly content: CallToolResult["content"]) {}
+}
+
 /** A successful call: one text block of compact JSON, no `structuredContent` in v1. */
 export function okResult(value: unknown): CallToolResult {
+  if (value instanceof ContentResult) return { content: [...value.content] };
   return { content: [{ type: "text", text: JSON.stringify(value ?? null) ?? "null" }] };
 }
