@@ -1,0 +1,403 @@
+[
+  {
+    "name": "copy_file",
+    "description": "Call this tool to copy an existing File in Google Drive. The tool allows specifying a new title and a parent folder for the copy. If the title is not specified, the copy title will be 'Copy of {original title}'. If the parent folder is not specified, the copy will be created in the same folder as the original file, unless the requesting user does not have write access to that folder, in which case the copy will be created in the user's root folder. Pregenerated file IDs (`pregeneratedId`, obtained from `generate_ids`) are supported when copying non-Google Workspace files. Returns the newly created File object upon successful copying.",
+    "inputSchema": {
+      "description": "Request to copy a file.",
+      "properties": {
+        "fileId": {
+          "description": "Required. The ID of the file to copy.",
+          "type": "string"
+        },
+        "parentId": {
+          "description": "The parent id of the newly created file. If empty, the file will be created with the same parent as the original file.",
+          "type": "string"
+        },
+        "pregeneratedId": {
+          "description": "Optional. The pregenerated id of the newly created file, obtained from the `generate_ids` tool. Supported for binary/blob files; not supported for native Google Workspace document types.",
+          "type": "string"
+        },
+        "title": {
+          "description": "The title of the newly created file. If empty, the title will be 'Copy of {original file title}'.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "create_file",
+    "description": "Call this tool to create or upload a File to Google Drive. If uploading content, prefer `textContent` for text content. For non-UTF8 contents, use the `base64Content` field and base64 encode the data to set on that field. Returns a single File object upon successful creation. The following Google first-party mime types can be created without providing content: - `application/vnd.google-apps.document` - `application/vnd.google-apps.spreadsheet` - `application/vnd.google-apps.presentation` Folders can be created by setting the mime type to `application/vnd.google-apps.folder`. When uploading content, the `contentMimeType` field is required and should match the type of the content being uploaded. By default, supported content will be converted to Google first-party mime types. To disable conversions for first-party mime types, set `disableConversionToGoogleType` to true. Pregenerated file IDs (`pregeneratedId`) are supported for non-Google Workspace files and folders (`application/vnd.google-apps.folder`). When uploading content with `pregeneratedId`, `disableConversionToGoogleType` must be set to true.",
+    "inputSchema": {
+      "description": "Request to upload a file.",
+      "properties": {
+        "base64Content": {
+          "description": "Optional. The base64 encoded content to upload. It's an error to set this and `textContent`.",
+          "type": "string"
+        },
+        "content": {
+          "deprecated": true,
+          "description": "Deprecated: Use `base64Content` or `textContent` instead. The content of the file encoded as base64. The content field should always be base64 encoded regardless of the mime type of the file.",
+          "type": "string"
+        },
+        "contentMimeType": {
+          "description": "The mime type of the content being uploaded. Required when any type of content is provided.",
+          "type": "string"
+        },
+        "disableConversionToGoogleType": {
+          "description": "Set to true to retain the passed in content mime type and not convert to a Google type. For example, without this a `text/plain` content mime type will be converted to to `application/vnd.google-apps.document`. Has no effect for types that do not have a Google equivalent.",
+          "type": "boolean"
+        },
+        "inheritedPermissionsDisabled": {
+          "description": "Set to true to disable inherited permissions on the created folder, restricting access to only users with direct permissions on the folder.",
+          "type": "boolean"
+        },
+        "mimeType": {
+          "deprecated": true,
+          "description": "Deprecated: DO NOT USE!! Set `contentMimeType` instead.",
+          "type": "string"
+        },
+        "parentId": {
+          "description": "The parent id of the file.",
+          "type": "string"
+        },
+        "pregeneratedId": {
+          "description": "Optional. The pregenerated id of the file to create. Supported for binary/blob files and folders (`application/vnd.google-apps.folder`); not supported for native Google Workspace document types. When uploading content with a pregenerated id, `disable_conversion_to_google_type` must be set to true.",
+          "type": "string"
+        },
+        "textContent": {
+          "description": "Optional. The (UTF-8) text content to upload. It's an error to set this and `base64Content`.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Required. The title of the file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "download_file_content",
+    "description": "Call this tool to download the content of a Drive file as a base64 encoded string. If the file is a Google Drive first-party mime type, the `exportMimeType` field specifies the desired export mime type. When the field is unset, defaults to plain text types (e.g. `text/plain`, `text/csv`). If the file is not found, try using other tools like `search_files` to find the file the user is requesting. If the user wants a natural language representation of their Drive content, use the `read_file_content` tool (`read_file_content` should be smaller and easier to parse).",
+    "inputSchema": {
+      "description": "Defines a request to download a file's content.",
+      "properties": {
+        "exportMimeType": {
+          "description": "Optional. For Google native files, the MIME type to export the file to, ignored otherwise. Defaults to text if not specified.",
+          "type": "string"
+        },
+        "fileId": {
+          "description": "Required. The ID of the file to retrieve.",
+          "type": "string"
+        },
+        "revisionId": {
+          "description": "Optional. The revision id for the version of the file to download. If not specified, the latest revision will be downloaded.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_file_metadata",
+    "description": "Call this tool to find general metadata about a user's Drive file. Context window token management can be tuned via `snippetVerbosity` (default is `SnippetVerbosity.DETAILED`) or if only metadata is needed, use `excludeContentSnippets`. If the file is not found, try using other tools like `search_files` to find the file the user is requesting.",
+    "inputSchema": {
+      "description": "Request to get the file.",
+      "properties": {
+        "excludeContentSnippets": {
+          "description": "If `true`, the content snippet will be excluded from the response. Must not be set to `true` if `snippet_verbosity` is specified.",
+          "type": "boolean"
+        },
+        "fileId": {
+          "description": "Required. The ID of the file to retrieve.",
+          "type": "string"
+        },
+        "snippetVerbosity": {
+          "description": "Optional. Set to specify how verbose the snippets should be. Defaults to `DETAILED` if not set. Must not be set if `exclude_content_snippets` is `true`.",
+          "enum": [
+            "UNSPECIFIED",
+            "BRIEF",
+            "MEDIUM",
+            "DETAILED",
+            "MAX_ALLOWED"
+          ],
+          "type": "string",
+          "x-google-enum-descriptions": [
+            "",
+            "Limits the returned snippet to about 1000 characters.",
+            "Limits the returned snippet to about 2500 characters.",
+            "Limits the returned snippet to about 5000 characters.",
+            "The verbosity is greatly increased, limited by the overall response size."
+          ]
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "get_file_permissions",
+    "description": "Call this tool to list the permissions of a Drive File.",
+    "inputSchema": {
+      "description": "Request to get file permissions.",
+      "properties": {
+        "fileId": {
+          "description": "Required. The ID of the file to get permissions for.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "list_recent_files",
+    "description": "Call this tool to find recent files for a user specified a sort order. Default sort order is `recency` if orderBy is not set or set to an unsupported value. Context window token management can be tuned via `snippetVerbosity` (default is `SnippetVerbosity.DETAILED`) or if only metadata is needed, use `excludeContentSnippets`. Supported sort orders are: - `recency`: The most recent timestamp from the file's date-time fields. - `lastModified`: The last time the file was modified by anyone. - `lastModifiedByMe`: The last time the file was modified by the user. The default page size is 10. Utilize `next_page_token` to paginate through the results.",
+    "inputSchema": {
+      "description": "Request to list files.",
+      "properties": {
+        "excludeContentSnippets": {
+          "description": "If `true`, the content snippet will be excluded from the response. Must not be set to `true` if `snippet_verbosity` is specified.",
+          "type": "boolean"
+        },
+        "orderBy": {
+          "description": "The sort order for the files.",
+          "type": "string"
+        },
+        "pageSize": {
+          "description": "The maximum number of files to return.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "pageToken": {
+          "description": "The page token to use for pagination.",
+          "type": "string"
+        },
+        "snippetVerbosity": {
+          "description": "Optional. Set to specify how verbose the snippets should be. Defaults to `DETAILED` if not set. Must not be set if `exclude_content_snippets` is `true`.",
+          "enum": [
+            "UNSPECIFIED",
+            "BRIEF",
+            "MEDIUM",
+            "DETAILED",
+            "MAX_ALLOWED"
+          ],
+          "type": "string",
+          "x-google-enum-descriptions": [
+            "",
+            "Limits the returned snippet to about 1000 characters.",
+            "Limits the returned snippet to about 2500 characters.",
+            "Limits the returned snippet to about 5000 characters.",
+            "The verbosity is greatly increased, limited by the overall response size."
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "read_file_content",
+    "description": "Call this tool to fetch a natural language representation of a known Drive file, and if specified, its comments. REQUIREMENTS & WORKFLOW: - `fileId` is required. You MUST pass an exact Drive file ID returned by a previous discovery tool (`search_files` or `list_recent_files`) or provided explicitly in the user prompt. - NEVER guess, invent, or hallucinate a `fileId` string from a file title or name. - If given a file title, name, or topic without an explicit `fileId`, you MUST FIRST call `search_files` to find the file and retrieve its `fileId` before invoking this tool. The file content may be incomplete for very large files. The text representation will change over time, so don't make assumptions about the particular format of the text returned by this tool. If supported and specified, comment tags will be included in the content. Supported Mime Types: - `application/vnd.google-apps.document` (supports comments) - `application/vnd.google-apps.presentation` (supports comments) - `application/vnd.google-apps.spreadsheet` (supports comments) - `application/pdf` - `application/msword` - `application/vnd.openxmlformats-officedocument.wordprocessingml.document` - `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` - `application/vnd.openxmlformats-officedocument.presentationml.presentation` - `application/vnd.oasis.opendocument.spreadsheet` - `application/vnd.oasis.opendocument.presentation` - `application/x-vnd.oasis.opendocument.text` - `image/png` - `image/jpeg` - `image/jpg` If the file is not found, try using other tools like `search_files` to find the file the user is requesting using keywords.",
+    "inputSchema": {
+      "description": "Request to read file content with support for fetching comments.",
+      "properties": {
+        "fileId": {
+          "description": "Required. The ID of the file to retrieve.",
+          "type": "string"
+        },
+        "includeComments": {
+          "description": "Whether to include comments in the response. Comments will be inlined in the text content of the file with a mapping to the comment threads. Note: Comments are only supported for Google Docs, Slides, and Sheets.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "search_files",
+    "description": "Search for Drive files using a structured query (syntax: `query_term operator values`). Only terms in this list are supported. Combine clauses with `and`, `or`, `not`, and parentheses. String values must be single-quoted; escape embedded quotes as `\\'`. Context window token management can be tuned via `snippetVerbosity` (default is `SnippetVerbosity.DETAILED`) or if only metadata is needed, use `excludeContentSnippets`. Prefer `title contains` over `title =` unless an explicit title is provided. Do NOT include document type terms (e.g., 'presentation', 'slides', 'deck', 'document', 'doc', 'spreadsheet', 'sheet', 'pdf', 'folder') inside `title contains '...'` or `fullText contains '...'` clauses. Separate title keywords from file type terms and map them to `mimeType` clauses in the query. Query terms & operators: - `title` (ops: contains, =, !=) — file title - `fullText` (ops: contains) — title or body text - `mimeType` (ops: contains, =, !=) — MIME type - `modifiedTime`, `viewedByMeTime`, `createdTime` (ops: `<=`, `<`, `=`, `!=`, `>`, `>=`). Use RFC 3339 UTC, e.g., `2012-06-04T12:00:00-08:00`. Date types not comparable. - `parentId` (ops: `=`, `!=`). Use `'root'` for the user's \"My Drive\". - `owner` (ops: `=`, `!=`). Use `'me'` for the requesting user. - `sharedWithMe` (ops: `=`, `!=`). Values: `true` or `false`. - `starred` (ops: `=`, `!=`). Values: `true` or `false`. - `folderProperties` (ops: `in`): `'syncedComputer'` (synced computer), `'syncFolder'` (synced folder). Other operators: `and`, `or`, `not`, `in`. Examples: - `title contains 'hello' and title contains 'goodbye'` - `modifiedTime > '2024-01-01T00:00:00Z' and (mimeType contains 'image/' or mimeType contains 'video/')` - `parentId = '1234567'` - `fullText contains 'hello'` - `owner = 'test@example.org'` - `sharedWithMe = true` - `starred = true` - `owner = 'me'` (for files owned by the user) Use `next_page_token` to paginate. Duplicate results can occur across page boundaries. An empty response means no more results.",
+    "inputSchema": {
+      "description": "Request to search files.",
+      "properties": {
+        "excludeContentSnippets": {
+          "description": "If `true`, the content snippet will be excluded from the response. Must not be set to `true` if `snippet_verbosity` is specified.",
+          "type": "boolean"
+        },
+        "pageSize": {
+          "description": "The maximum number of files to return in each page.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "pageToken": {
+          "description": "The page token to use for pagination.",
+          "type": "string"
+        },
+        "query": {
+          "description": "The search query.",
+          "type": "string"
+        },
+        "snippetVerbosity": {
+          "description": "Optional. Set to specify how verbose the snippets should be. Defaults to `DETAILED` if not set. Must not be set if `exclude_content_snippets` is `true`.",
+          "enum": [
+            "UNSPECIFIED",
+            "BRIEF",
+            "MEDIUM",
+            "DETAILED",
+            "MAX_ALLOWED"
+          ],
+          "type": "string",
+          "x-google-enum-descriptions": [
+            "",
+            "Limits the returned snippet to about 1000 characters.",
+            "Limits the returned snippet to about 2500 characters.",
+            "Limits the returned snippet to about 5000 characters.",
+            "The verbosity is greatly increased, limited by the overall response size."
+          ]
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
+    "name": "share_file",
+    "description": "Call this tool to share a Google Drive file with a user, group, or Google Chat space. If the user or group already has permission to the file, this tool will update their permission level to match the role in this request, if the new role is higher than their current role, or update the expiration time if `expiration_time` is provided.",
+    "inputSchema": {
+      "description": "Request to share a file.",
+      "properties": {
+        "chatSpaceId": {
+          "description": "Optional. The ID of the Chat space to share with, in the format `spaces/{space}`. Optional if `email_address` is provided.",
+          "type": "string"
+        },
+        "emailAddress": {
+          "description": "Optional. The email address of the user or group to share with. Optional if `chat_space_id` is provided.",
+          "type": "string"
+        },
+        "expirationTime": {
+          "description": "Optional. The time at which this permission will expire. If not set, the permission does not expire. Expiration times have the following restrictions: * They can only be set on `user` and `group` permissions (including Chat spaces). * The time must be in the future. * The time cannot be more than a year in the future. * For folders, expiration time can only be set when `role` is `reader`. * Expiration time cannot be set on Shared Drive root folders.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "fileId": {
+          "description": "Required. The ID of the file to share.",
+          "type": "string"
+        },
+        "role": {
+          "description": "Required. The role to grant. Supported roles (in descending order of access level): * `writer` * `commenter` * `reader`",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fileId",
+        "role"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "trash_file",
+    "description": "Moves a Google Drive file to the user's trash. It does not permanently delete the file.Returns an empty response upon successful completion.",
+    "inputSchema": {
+      "description": "Request to trash a file.",
+      "properties": {
+        "fileId": {
+          "description": "Required. The ID of the file to trash.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "update_file",
+    "description": "Call this tool to update the metadata of, or lock/unlock, a Google Drive file. If the file is not found, try using other tools like `search_files` to find the file the user is attempting to update. For moving files, use `search_files` to identify the destination parent id. For folders, `folderColorRgb` changes the folder color. It must be an RGB hex string in the format `#RRGGBB` and is snapped to the nearest color in Drive's folder color palette.",
+    "inputSchema": {
+      "$defs": {
+        "DownloadRestriction": {
+          "description": "Restrictions applied to downloading, printing, and copying the file.",
+          "properties": {
+            "restrictedReader": {
+              "description": "Optional. Whether download, print, and copy are restricted for readers (viewers) and commenters.",
+              "type": "boolean"
+            },
+            "restrictedWriter": {
+              "description": "Optional. Whether download, print, and copy are restricted for writers (editors). If true, download, print, and copy are also restricted for readers and commenters.",
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "description": "Request to update a file.",
+      "properties": {
+        "description": {
+          "description": "Optional. The updated description of the file. If provided as an empty string, clears the existing description.",
+          "type": "string"
+        },
+        "downloadRestriction": {
+          "$ref": "#/$defs/DownloadRestriction",
+          "description": "Optional. Restrictions applied to downloading, printing, and copying the file. Only the file's owner (or an organizer in a shared drive) can modify download restrictions. Cannot be set on folders, Google Sites, or Google Forms."
+        },
+        "fileId": {
+          "description": "Required. The ID of the file to update.",
+          "type": "string"
+        },
+        "folderColorRgb": {
+          "description": "The updated color of the folder, as an RGB hex string in the format `#RRGGBB` (e.g. `#4986e7`). Only applies to folders. The color is snapped to the nearest color in Drive's folder color palette.",
+          "type": "string"
+        },
+        "inheritedPermissionsDisabled": {
+          "description": "Optional. Whether inherited permissions are disabled on the folder. Set to true to disable inherited permissions (restricting access to only users with direct permissions on the folder), or false to re-enable inherited permissions. Only supported for folders.",
+          "type": "boolean"
+        },
+        "parentId": {
+          "description": "The updated parent id of the file. If the file has an existing parent, it will be replaced, resulting in a folder move. If provided, must not be empty.",
+          "type": "string"
+        },
+        "readOnly": {
+          "description": "Optional. Whether the content of the file is read-only. Setting this to true locks the file to prevent edits, comments, suggestions, and title changes. Setting this to false unlocks a previously locked file.",
+          "type": "boolean"
+        },
+        "readOnlyReason": {
+          "description": "Optional. Optional reason for why the file was put into a read-only (locked) state. Can only be set when `read_only` is set to true.",
+          "type": "string"
+        },
+        "starred": {
+          "description": "Updates the starred state of the file.",
+          "type": "boolean"
+        },
+        "title": {
+          "description": "The updated title of the file. If provided, must not be empty.",
+          "type": "string"
+        },
+        "writersCanShare": {
+          "description": "Optional. Whether users with only writer permission can modify the file's permissions and share the file.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "fileId"
+      ],
+      "type": "object"
+    }
+  }
+]

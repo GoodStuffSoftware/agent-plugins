@@ -1,0 +1,8 @@
+# Copy to .dev.vars for local development. Never commit .dev.vars.
+# In production set each with: wrangler secret put <NAME>
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+TOKEN_KEK=
+COOKIE_SECRET=
+OWNER_EMAILS=
+LINKABLE_EMAILS=
