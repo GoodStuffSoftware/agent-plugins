@@ -757,6 +757,30 @@ describe("component toggles", () => {
     expect(await componentsOf()).not.toContain("mail.send");
   });
 
+  it("keeps a component off that was switched off while the owner was at Google", async () => {
+    const browser = await signIn();
+    const account = await linked(browser, "race", ["mail", "calendar"]);
+    const url = new URL(
+      (await toggle(browser, account, "files", true)).headers.get("Location") ?? "",
+    );
+    expect((await toggle(browser, account, "calendar", false)).status).toBe(303);
+
+    google.grant = `openid email ${API}gmail.modify ${API}gmail.settings.basic ${API}calendar ${API}drive`;
+    expect((await browser.fetch(google.approve(url, OWNER))).status).toBe(302);
+    expect(await componentsOf()).toEqual(["mail", "files"]);
+  });
+
+  it("asks for every component that is on when the account needs a relink", async () => {
+    const browser = await signIn();
+    const account = await linked(browser, "dead", ["calendar"]);
+    await env.DB.prepare("UPDATE accounts SET status = 'needs_relink' WHERE id = ?")
+      .bind(account.id)
+      .run();
+    const res = await toggle(browser, account, "files", true);
+    const url = new URL(res.headers.get("Location") ?? "");
+    expect(url.searchParams.get("scope")).toBe(`openid email ${API}calendar ${API}drive`);
+  });
+
   it("refuses an unknown component, a missing choice and another owner's account", async () => {
     const browser = await signIn();
     const account = await linked(browser, "odd");

@@ -318,7 +318,11 @@ accountsRoutes.post("/component", async (c) => {
       label: account.label,
       components: wanted,
       accountId: account.id,
-      scopes: scopesFor([component]).filter((s) => !granted.includes(s)),
+      added: [component],
+      // A needs_relink account has no live grant to add to: ask for everything that is on.
+      ...(account.status === "ok"
+        ? { scopes: scopesFor([component]).filter((s) => !granted.includes(s)) }
+        : {}),
       loginHint: account.address,
     });
   }

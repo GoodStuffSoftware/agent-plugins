@@ -46,6 +46,12 @@ export interface LinkPayload {
    * Google to return that account's address.
    */
   accountId?: string;
+  /**
+   * With `accountId`: the components this flow turns on. The callback keeps the account's
+   * components that are on when Google answers, plus these, so a component switched off while
+   * the owner is at Google stays off.
+   */
+  added?: AccountComponent[];
   /** PKCE verifier for the Google code exchange. */
   verifier: string;
   /** Must come back as the ID token's `nonce`. */
@@ -121,6 +127,7 @@ export async function startLink(
     label: string;
     components: AccountComponent[];
     accountId?: string;
+    added?: AccountComponent[];
     scopes?: string[];
     loginHint?: string;
   },
@@ -133,6 +140,7 @@ export async function startLink(
     label: o.label,
     components: o.components,
     ...(o.accountId ? { accountId: o.accountId } : {}),
+    ...(o.added && o.added.length > 0 ? { added: o.added } : {}),
     verifier,
     nonce,
   };
@@ -166,6 +174,7 @@ export function linkPayload(payload: unknown): LinkPayload | undefined {
     !Array.isArray(p.components) ||
     !p.components.every(isAccountComponent) ||
     (p.accountId !== undefined && (typeof p.accountId !== "string" || p.accountId === "")) ||
+    (p.added !== undefined && (!Array.isArray(p.added) || !p.added.every(isAccountComponent))) ||
     typeof p.verifier !== "string" ||
     typeof p.nonce !== "string"
   ) {
@@ -176,6 +185,7 @@ export function linkPayload(payload: unknown): LinkPayload | undefined {
     label: p.label,
     components: p.components,
     ...(typeof p.accountId === "string" ? { accountId: p.accountId } : {}),
+    ...(Array.isArray(p.added) ? { added: p.added as AccountComponent[] } : {}),
     verifier: p.verifier,
     nonce: p.nonce,
   };
@@ -306,7 +316,11 @@ export async function finishLink(
   }
 
   const granted = parseScopes(tokens.scope);
-  const components = grantedComponents(payload.components, granted);
+  // A pinned flow wants what is on in the account now plus what this flow adds, not the click-time
+  // snapshot: a component switched off while the owner was at Google stays off.
+  const wanted =
+    existing && payload.accountId ? stillWanted(payload, existing) : payload.components;
+  const components = grantedComponents(wanted, granted);
   if (components.length === 0) {
     // Google's granular consent lets the owner untick every box; an account with no component
     // would only look linked.
@@ -424,10 +438,22 @@ export async function finishLink(
   });
   const headers = new Headers({ "Set-Cookie": clearCookie(FLOW_COOKIE) });
   // Components Google did not grant are named on the page, so a partial grant is not silent.
-  const missing = payload.components.filter((c) => !components.includes(c));
+  const missing = wanted.filter((c) => !components.includes(c));
   const back = new URL("/accounts", issuer);
   if (missing.length > 0) back.searchParams.set("partial", missing.join(","));
   return redirect(back.toString(), headers);
+}
+
+/** The flow's components that are still on in the account, plus the ones the flow adds. */
+function stillWanted(payload: LinkPayload, account: AccountRow): AccountComponent[] {
+  let on: unknown;
+  try {
+    on = JSON.parse(account.components);
+  } catch {
+    on = [];
+  }
+  const current = Array.isArray(on) ? on : [];
+  return payload.components.filter((c) => current.includes(c) || (payload.added ?? []).includes(c));
 }
 
 /**
