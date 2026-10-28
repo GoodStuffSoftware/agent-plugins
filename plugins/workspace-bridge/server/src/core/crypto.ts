@@ -119,7 +119,7 @@ export function keyName(version: number): string {
   return version === 1 ? "TOKEN_KEK" : `TOKEN_KEK_v${version}`;
 }
 
-/** The version new seals use: `CURRENT_KEY_VERSION`, default 1. */
+/** The version new seals use: `CURRENT_KEY_VERSION`, default 1. `config()` uses this parser too. */
 export function currentKeyVersion(env: KeyEnv): number {
   const value = env.CURRENT_KEY_VERSION;
   if (value === undefined || value === "") return 1;
@@ -184,6 +184,9 @@ export async function seal(plaintext: string, aad: SealAad, env: KeyEnv): Promis
  */
 export async function open(row: Sealed, aad: SealAad, env: KeyEnv): Promise<string> {
   const additionalData = aadBytes(aad);
+  if (!(row.ciphertext instanceof Uint8Array) || !(row.iv instanceof Uint8Array)) {
+    throw new Error("sealed token columns must be bytes; read the row with getToken");
+  }
   if (!Number.isInteger(row.key_version) || row.key_version < 1) {
     throw new Error("sealed token has an invalid key version");
   }

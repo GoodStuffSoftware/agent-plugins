@@ -20,6 +20,7 @@ import {
   listAccounts,
   upsertToken,
 } from "../src/core/db";
+import { config, type Env } from "../src/env";
 
 const randomKey = (): string => btoa(String.fromCharCode(...randomBytes(32)));
 
@@ -95,6 +96,14 @@ describe("token sealing", () => {
     await expect(open({ ...sealed, iv: sealed.iv.slice(0, 11) }, aad, env)).rejects.toThrow(
       /invalid IV/,
     );
+    for (const key_version of [0, 1.5]) {
+      await expect(open({ ...sealed, key_version }, aad, env)).rejects.toThrow(
+        /invalid key version/,
+      );
+    }
+    // A raw D1 row holds its BLOBs as number arrays; getToken converts them.
+    const raw = { ...sealed, iv: [...sealed.iv] } as unknown as Sealed;
+    await expect(open(raw, aad, env)).rejects.toThrow(/read the row with getToken/);
   });
 
   it("uses a fresh IV for every seal", async () => {
@@ -143,12 +152,16 @@ describe("token sealing", () => {
       expect(error.message).toMatch(/^TOKEN_KEK is malformed; it must be 32 random bytes/);
       expect(error.message).not.toContain(value);
     }
-    for (const value of ["0", "-1", "1.5", "v2", "01"]) {
-      expect(() => currentKeyVersion(withKeys({ CURRENT_KEY_VERSION: value }))).toThrow(
+    for (const value of ["0", "-1", "1.5", "v2", "01", "007"]) {
+      const bad = withKeys({ CURRENT_KEY_VERSION: value });
+      expect(() => currentKeyVersion(bad)).toThrow(
         /CURRENT_KEY_VERSION must be a positive integer/,
       );
+      // config() uses the same parser, so it cannot disagree with seal().
+      expect(() => config(bad as Env)).toThrow(/CURRENT_KEY_VERSION must be a positive integer/);
     }
     expect(currentKeyVersion(withKeys({ CURRENT_KEY_VERSION: undefined }))).toBe(1);
+    expect(config(withKeys({ CURRENT_KEY_VERSION: "7" }) as Env).currentKeyVersion).toBe(7);
   });
 
   it("accepts a key with surrounding whitespace or without padding", async () => {

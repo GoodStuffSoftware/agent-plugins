@@ -4,6 +4,8 @@
 -- One row per linked mailbox. No token columns: tokens live sealed in account_tokens.
 -- `id` is `ac_` plus 16 base32 characters, so it never contains the AAD separator `|`.
 -- `short_id` comes from owners.next_short_id and is never reused after unlink (s.3.4).
+-- `provider` and `status` are checked in TypeScript, not here: a CHECK can change only by
+-- rebuilding the table, and DROP TABLE accounts would cascade-delete every sealed token.
 CREATE TABLE accounts (
   id TEXT PRIMARY KEY CHECK (
     length(id) = 19 AND id GLOB 'ac_*' AND substr(id, 4) NOT GLOB '*[^a-z2-7]*'
@@ -12,11 +14,11 @@ CREATE TABLE accounts (
   short_id INTEGER NOT NULL CHECK (short_id BETWEEN 1 AND 999999999),
   label TEXT NOT NULL CHECK (label <> ''),
   address TEXT NOT NULL CHECK (address = lower(address) AND instr(address, '@') > 1),
-  provider TEXT NOT NULL CHECK (provider IN ('google', 'msgraph', 'imap')),
+  provider TEXT NOT NULL CHECK (provider <> ''),
   provider_sub TEXT,
   components TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(components)),
   granted_scopes TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok', 'needs_relink')),
+  status TEXT NOT NULL DEFAULT 'ok',
   send_as_fetched_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
