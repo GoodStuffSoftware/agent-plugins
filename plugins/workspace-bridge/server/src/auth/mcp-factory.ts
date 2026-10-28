@@ -19,5 +19,7 @@ export type McpFetch = (
 ) => Response | Promise<Response>;
 
 export function mcpHandler(kind: Kind, _issuer: string): McpFetch {
-  return (_req, _env, ctx) => Response.json({ kind, ownerId: ctx.props.ownerId });
+  // `scope` lets M4a tests see the RS narrowing; M5 drops this body.
+  return (_req, _env, ctx) =>
+    Response.json({ kind, ownerId: ctx.props.ownerId, scope: ctx.auth.scope });
 }

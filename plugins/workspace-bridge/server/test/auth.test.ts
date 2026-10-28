@@ -89,7 +89,7 @@ describe("resource servers", () => {
       const res = await call(PATH[at], token);
       if (tokenKind === at) {
         expect(res.status).toBe(200);
-        expect(await res.json()).toEqual({ kind: at, ownerId });
+        expect(await res.json()).toEqual({ kind: at, ownerId, scope: [...SCOPES[at]] });
       } else {
         expect(res.status).toBe(401);
         expect(res.headers.get("WWW-Authenticate")).toContain(`resource_metadata="${prm(at)}"`);
@@ -115,6 +115,14 @@ describe("resource servers", () => {
     const roRes = await call(PATH.ro, ro);
     expect(roRes.status).toBe(403);
     expect(roRes.headers.get("WWW-Authenticate")).toContain(`scope="${SCOPES.ro.join(" ")}"`);
+  });
+
+  it("passes only the endpoint's scopes to the MCP layer", async () => {
+    const ownerId = randomId("o_");
+    const token = await mintToken({ kind: "ro", scopes: [...ALL_SCOPES], ownerId });
+    const res = await call(PATH.ro, token);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ kind: "ro", ownerId, scope: [...SCOPES.ro] });
   });
 
   it("keeps only the endpoint's own scopes", () => {
