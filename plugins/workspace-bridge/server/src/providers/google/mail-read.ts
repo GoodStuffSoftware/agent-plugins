@@ -3,6 +3,7 @@
 // decoded only as far as the caller will show them (plan s.3.4): the text/plain part when there is
 // one, else the HTML converted with the linear stripper in `core/html-text.ts`.
 
+import { ToolError } from "../../core/errors";
 import { htmlToText, truncateBody } from "../../core/html-text";
 import type {
   AttachmentInfo,
@@ -17,7 +18,7 @@ import { gjson } from "./http";
 
 const BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 /** Raw HTML bytes decoded for a conversion to text. */
-const HTML_DECODE_BYTES = 768 * 1024;
+const HTML_DECODE_BYTES = 256 * 1024;
 const SUMMARY_HEADERS = ["From", "Subject"];
 const MESSAGE_HEADERS = ["From", "To", "Cc", "Bcc", "Subject", "Date"];
 
@@ -259,7 +260,9 @@ export const googleMailRead: MailReader = {
     for (let i = 0; i < ids.length; i++) {
       const part = byId.get(`t${i}`);
       // A thread deleted between the list and the batch answers 404: it is simply gone.
-      if (!part || part.status === 404) continue;
+      if (part?.status === 404) continue;
+      // No readable answer is not a deletion: fail so a retry gets the thread instead of losing it.
+      if (!part) throw new ToolError("upstream_error", "Google's batch reply was incomplete.");
       const summary = summarize(batchJson<GThread>(a, part));
       if (summary) items.push(summary);
     }

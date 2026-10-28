@@ -130,8 +130,22 @@ const HIDDEN_STYLE =
   /(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![0-9.]*[1-9])|opacity\s*:\s*0(?![.0-9])|max-height\s*:\s*0(?![.0-9])|mso-hide\s*:\s*all)/i;
 
 function asciiLower(s: string): string {
-  // `toLowerCase` can change the length of non-ASCII text, which would shift every index.
+  // `toLowerCase` can change the length of non-ASCII text, which would shift every index, so
+  // only pure ASCII takes the fast path.
+  if (!/[\u0080-￿]/.test(s)) return s.toLowerCase();
   return s.replace(/[A-Z]+/g, (m) => m.toLowerCase());
+}
+
+/** The index of the end tag `</name` (not `</name2`) at or after `from`, or -1. */
+function findClose(lower: string, name: string, from: number): number {
+  const needle = `</${name}`;
+  let at = lower.indexOf(needle, from);
+  while (at >= 0) {
+    const d = lower.charCodeAt(at + needle.length);
+    if (!((d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d === 45 || d === 58)) return at;
+    at = lower.indexOf(needle, at + needle.length);
+  }
+  return -1;
 }
 
 interface Tag {
@@ -230,10 +244,13 @@ export function shortenUrls(text: string): string {
   return text.replace(LONG_URL, (u) => shortenUrl(u));
 }
 
+/** Zero-width and soft-hyphen characters: invisible, so dropped from the text. */
+const INVISIBLE = /(?:\u034F|[\u00AD\u061C\u180E\u200B-\u200F\u2060-\u2064\uFEFF])+/g;
+
 /** Collapses whitespace runs and blank lines, trims. Every pattern here consumes its whole run. */
 export function tidyText(text: string): string {
   return text
-    .replace(/(?:͏|[­؜᠎​-‏⁠-⁤﻿])+/g, "")
+    .replace(INVISIBLE, "")
     .replace(/[ \t\f\r  -   　]+/g, " ")
     .replace(/ ?\n ?/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -291,7 +308,10 @@ export function htmlToText(input: string, opts: HtmlTextOptions = {}): string {
     const textEnd = lt < 0 ? n : lt;
     if (textEnd > i) {
       if (hideDepth === 0) {
-        const seg = decodeEntities(html.slice(i, textEnd)).replace(/[ \t\r\n\f]+/g, " ");
+        // Invisible characters are dropped here so a flood of them cannot use up `maxChars`.
+        const seg = decodeEntities(html.slice(i, textEnd))
+          .replace(INVISIBLE, "")
+          .replace(/[ \t\r\n\f]+/g, " ");
         if (seg !== "") emit(seg);
       }
       i = textEnd;
@@ -327,8 +347,13 @@ export function htmlToText(input: string, opts: HtmlTextOptions = {}): string {
     }
     if (!tag.closing && RAW_SKIP.has(tag.name)) {
       if (tag.selfClosing) continue;
-      const close = lower.indexOf(`</${tag.name}`, i);
-      if (close < 0) break;
+      const close = findClose(lower, tag.name, i);
+      if (close < 0) {
+        // Only style, script and title swallow the rest of a document; for the others a missing
+        // end tag is just a stray start tag.
+        if (tag.name === "style" || tag.name === "script" || tag.name === "title") break;
+        continue;
+      }
       const gt = html.indexOf(">", close);
       if (gt < 0) break;
       i = gt + 1;

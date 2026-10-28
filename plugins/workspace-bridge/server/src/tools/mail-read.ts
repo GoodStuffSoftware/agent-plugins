@@ -6,6 +6,7 @@ import { z } from "zod";
 import { mergePages, startFromCursor } from "../core/cursor";
 import { ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
+import { MAX_BATCH_ITEMS } from "../providers/google/batch";
 import { googleMailRead } from "../providers/google/mail-read";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
 import { provide } from "../services/capability";
@@ -33,7 +34,7 @@ const MESSAGE_FORMAT = z
   .enum(["MESSAGE_FORMAT_UNSPECIFIED", ...MESSAGE_FORMATS])
   .optional()
   .describe(
-    "FULL_CONTENT (default) and PLAIN_TEXT return the text body (the text/plain part, else the HTML converted to text) and attachment details. MINIMAL returns subject and snippet only. METADATA_ONLY returns sender, recipients, date and labels only.",
+    "FULL_CONTENT (default) and PLAIN_TEXT return the text body (the text/plain part, else the HTML converted to text) and attachment details. MINIMAL returns the headers, subject and snippet without the body. METADATA_ONLY returns sender, recipients, date and labels only.",
   );
 const MAX_BODY = z
   .number()
@@ -87,7 +88,8 @@ function messageOut(m: MailMessage, a: AccountRef, ctx: ToolContext, format: str
           attachments: m.attachments.map((x) => ({
             attachmentId: x.attachmentId,
             filename: wrap(x.filename),
-            mimeType: x.mimeType,
+            // The sender wrote the Content-Type too.
+            mimeType: wrap(x.mimeType),
             size: x.size,
           })),
         }
@@ -215,7 +217,8 @@ const searchThreads = defineTool({
           ...(args.query === undefined ? {} : { query: args.query }),
           ...(args.labelIds === undefined ? {} : { labelIds: args.labelIds }),
           includeSpamTrash: args.includeTrash ?? false,
-          pageSize: limit + s.skip,
+          // One batch carries at most MAX_BATCH_ITEMS threads; a short page is fine for a cursor.
+          pageSize: Math.min(limit + s.skip, MAX_BATCH_ITEMS),
           pageToken: s.tok,
         });
         return {
