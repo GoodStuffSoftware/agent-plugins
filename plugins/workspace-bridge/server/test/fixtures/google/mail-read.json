@@ -1,0 +1,187 @@
+{
+  "list": {
+    "threads": [
+      {
+        "id": "t1"
+      },
+      {
+        "id": "t2"
+      }
+    ],
+    "nextPageToken": "LISTTOKEN"
+  },
+  "threadMetadata": {
+    "id": "t1",
+    "messages": [
+      {
+        "labelIds": [
+          "INBOX",
+          "UNREAD"
+        ],
+        "snippet": "First snippet",
+        "internalDate": "1760000000000",
+        "payload": {
+          "headers": [
+            {
+              "name": "From",
+              "value": "Ann Example <ann@example.com>"
+            },
+            {
+              "name": "Subject",
+              "value": "Quarterly plan"
+            }
+          ]
+        }
+      },
+      {
+        "labelIds": [
+          "INBOX"
+        ],
+        "snippet": "Newest snippet",
+        "internalDate": "1760003600000",
+        "payload": {
+          "headers": [
+            {
+              "name": "From",
+              "value": "Bob Example <bob@example.com>"
+            },
+            {
+              "name": "Subject",
+              "value": "Re: Quarterly plan"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "messageAlternative": {
+    "id": "m1",
+    "threadId": "t1",
+    "labelIds": [
+      "INBOX"
+    ],
+    "snippet": "Hello",
+    "internalDate": "1760000000000",
+    "sizeEstimate": 2048,
+    "payload": {
+      "mimeType": "multipart/mixed",
+      "headers": [
+        {
+          "name": "From",
+          "value": "Ann Example <ann@example.com>"
+        },
+        {
+          "name": "To",
+          "value": "me@example.com"
+        },
+        {
+          "name": "Cc",
+          "value": "cc@example.com"
+        },
+        {
+          "name": "Subject",
+          "value": "Quarterly plan"
+        },
+        {
+          "name": "Date",
+          "value": "Tue, 9 Oct 2025 10:00:00 +0000"
+        }
+      ],
+      "parts": [
+        {
+          "mimeType": "multipart/alternative",
+          "parts": [
+            {
+              "mimeType": "text/plain",
+              "headers": [
+                {
+                  "name": "Content-Type",
+                  "value": "text/plain; charset=UTF-8"
+                }
+              ],
+              "body": {
+                "size": 11,
+                "data": "SGVsbG8gd29ybGQ"
+              }
+            },
+            {
+              "mimeType": "text/html",
+              "headers": [
+                {
+                  "name": "Content-Type",
+                  "value": "text/html; charset=UTF-8"
+                }
+              ],
+              "body": {
+                "size": 30,
+                "data": "PHA-SGVsbG8gPGI-d29ybGQ8L2I-PC9wPg"
+              }
+            }
+          ]
+        },
+        {
+          "mimeType": "application/pdf",
+          "filename": "plan.pdf",
+          "body": {
+            "size": 5000,
+            "attachmentId": "ATT1"
+          }
+        }
+      ]
+    }
+  },
+  "messageHtmlOnly": {
+    "id": "m2",
+    "threadId": "t1",
+    "labelIds": [
+      "INBOX"
+    ],
+    "snippet": "News",
+    "internalDate": "1760003600000",
+    "sizeEstimate": 900,
+    "payload": {
+      "mimeType": "text/html",
+      "headers": [
+        {
+          "name": "From",
+          "value": "News <news@example.com>"
+        },
+        {
+          "name": "Subject",
+          "value": "Weekly news"
+        }
+      ],
+      "body": {
+        "size": 120,
+        "data": "PGh0bWw-PGhlYWQ-PHN0eWxlPnB7Y29sb3I6cmVkfTwvc3R5bGU-PC9oZWFkPjxib2R5PjxkaXYgc3R5bGU9ImRpc3BsYXk6bm9uZSI-aGlkZGVuIHByZWhlYWRlcjwvZGl2PjxwPlJlYWQgPGEgaHJlZj0iaHR0cHM6Ly9leGFtcGxlLmNvbS9hP3V0bT0xIj50aGlzPC9hPiZuYnNwO25vdyAmYW1wOyBlbmpveTwvcD48L2JvZHk-PC9odG1sPg"
+      }
+    }
+  },
+  "messageDraft": {
+    "id": "m3",
+    "threadId": "t1",
+    "labelIds": [
+      "DRAFT"
+    ],
+    "snippet": "draft",
+    "internalDate": "1760007200000",
+    "sizeEstimate": 100,
+    "payload": {
+      "mimeType": "text/plain",
+      "headers": [
+        {
+          "name": "From",
+          "value": "me@example.com"
+        },
+        {
+          "name": "Subject",
+          "value": "draft"
+        }
+      ],
+      "body": {
+        "size": 5,
+        "data": "ZHJhZnQ"
+      }
+    }
+  }
+}
