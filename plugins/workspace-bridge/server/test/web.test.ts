@@ -69,12 +69,23 @@ describe("pages", () => {
   });
 });
 
-describe("sign-in seams (M4b)", () => {
-  it.each(["/authorize", "/oauth/google/callback"])("%s answers 503 for now", async (path) => {
-    const res = await exports.default.fetch(ISSUER + path);
-    expect(res.status).toBe(503);
-    expect(await res.text()).toBe("sign-in not configured");
-    expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+describe("sign-in not configured", () => {
+  it.each<[string, Partial<Cloudflare.Env>]>([
+    ["no GOOGLE_CLIENT_ID", { GOOGLE_CLIENT_ID: "" }],
+    ["no GOOGLE_CLIENT_SECRET", { GOOGLE_CLIENT_SECRET: "" }],
+    ["a short COOKIE_SECRET", { COOKIE_SECRET: "short" }],
+  ])("answers 503 with %s while the rest keeps working", async (_name, overrides) => {
+    for (const path of ["/authorize", "/oauth/google/callback"]) {
+      const res = await withEnv(path, overrides);
+      expect(res.status).toBe(503);
+      expect(res.headers.get("Set-Cookie")).toBeNull();
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+      expect(await res.text()).toContain("Sign-in not configured");
+    }
+    expect((await withEnv("/health", overrides)).status).toBe(200);
+    expect((await withEnv("/.well-known/oauth-authorization-server", overrides)).status).toBe(200);
+    expect((await withEnv("/mcp", overrides)).status).toBe(401);
   });
 });
 

@@ -15,6 +15,7 @@ export default defineConfig({
           TOKEN_KEK: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
           COOKIE_SECRET: "test-cookie-secret-test-cookie-secret",
           GOOGLE_CLIENT_ID: "test-client",
+          GOOGLE_CLIENT_SECRET: "test-secret",
         },
       },
     })),
