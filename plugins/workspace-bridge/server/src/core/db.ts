@@ -271,6 +271,17 @@ export async function getToken(
   return row ? { ...row, ciphertext: blobBytes(row.ciphertext), iv: blobBytes(row.iv) } : null;
 }
 
+/** Every sealed token of the owner's accounts, with BLOB columns as bytes. */
+export async function listOwnerTokens(db: D1Database, ownerId: string): Promise<AccountTokenRow[]> {
+  const rows = await all<StoredTokenRow>(
+    db,
+    `SELECT t.* FROM account_tokens t JOIN accounts a ON a.id = t.account_id
+     WHERE a.owner_id = ? ORDER BY a.short_id, t.kind`,
+    ownerId,
+  );
+  return rows.map((r) => ({ ...r, ciphertext: blobBytes(r.ciphertext), iv: blobBytes(r.iv) }));
+}
+
 /** D1 can return a BLOB as an ArrayBuffer or as an array of numbers. */
 function blobBytes(value: unknown): Uint8Array {
   if (value instanceof Uint8Array) return value;

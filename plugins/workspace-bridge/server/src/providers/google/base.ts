@@ -65,6 +65,23 @@ export function grantedComponents(
   );
 }
 
+/**
+ * The API scopes in `granted` that `components` do not need: what "re-link minimal" would drop.
+ * The identity scopes of a link are not counted.
+ */
+export function excessScopes(
+  components: readonly AccountComponent[],
+  granted: readonly string[],
+): string[] {
+  const keep = new Set<string>([
+    ...scopesFor(components),
+    ...LINK_IDENTITY_SCOPES,
+    `${API}userinfo.email`,
+    `${API}userinfo.profile`,
+  ]);
+  return granted.filter((s) => !keep.has(s));
+}
+
 /** Splits Google's space-separated `scope` answer into unique scopes, in its order. */
 export function parseScopes(scope: string | undefined): string[] {
   return [...new Set((scope ?? "").split(/\s+/).filter((s) => s !== ""))];

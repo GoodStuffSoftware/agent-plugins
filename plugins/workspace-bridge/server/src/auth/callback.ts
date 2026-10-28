@@ -38,8 +38,8 @@ export async function handleCallback(
     log("signin_flow_refused", { reason: flow.reason });
     return notice(
       400,
-      "Sign-in link not valid",
-      "This sign-in link has expired, was already used or belongs to another browser. Start again from your client.",
+      "Link not valid",
+      "This sign-in or link request has expired, was already used or belongs to another browser. Start again from your client, or from the accounts page.",
     );
   }
   switch (flow.kind) {
