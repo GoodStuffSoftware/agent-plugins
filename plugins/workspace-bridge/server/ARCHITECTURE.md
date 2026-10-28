@@ -228,7 +228,7 @@ Paths are under `plugins/workspace-bridge/server/`. M is the milestone that crea
 | `src/core/ids.ts`               | M9      | `a<shortId>:<id>` prefixing (s.3.4).                                                                                                                                                              |
 | `src/core/cursor.ts`            | M9      | Multi-account cursor codec (s.3.5).                                                                                                                                                               |
 | `src/core/untrusted.ts`         | M9      | Per-response nonce wrapper, escaping, control-character stripping (s.3.7).                                                                                                                        |
-| `src/core/token-broker.ts`      | M8      | `TokenBroker`: memory, then D1, then refresh; `invalid_grant` sets `needs_relink`.                                                                                                                |
+| `src/core/token-broker.ts`      | M8      | `createTokenBroker(env)`: memory, then D1, then one shared refresh per account; `invalid_grant` sets `needs_relink` (s.3.6).                                                                      |
 | `src/core/send-as.ts`           | M9, M14 | sendAs cache (24 h) and `assertFrom()`. M9 stub allows the primary address only.                                                                                                                  |
 | `src/core/audit.ts`             | M9, M14 | Audit writes and reads. M9 stub is a no-op.                                                                                                                                                       |
 | `src/core/ratelimit.ts`         | M9, M14 | Fixed-window counters and the per-grant call limit. M9 stub never trips.                                                                                                                          |
@@ -345,7 +345,7 @@ Handlers throw `ToolError(code, message, details?)`. The wrapper returns `{ isEr
 | `insufficient_scope`                                     | RS (no scope for this endpoint); `scopeChallenge` (registered tool, scope missing)        | `WWW-Authenticate: Bearer error="insufficient_scope", scope=` | 403  |
 | (tool not on this endpoint)                              | SDK                                                                                       | JSON-RPC error `InvalidParams`                                | 200  |
 | `invalid_argument`                                       | our checks: cursor mismatch, id and account disagree, bad combination                     | tool error                                                    | 200  |
-| `account_not_found`, `ambiguous_account`                 | `AccountResolver`                                                                         | tool error, `{ accountsUrl }`                                 | 200  |
+| `account_not_found`, `ambiguous_account`                 | `AccountResolver`; broker (account unlinked meanwhile)                                    | tool error, `{ accountsUrl }`                                 | 200  |
 | `component_disabled`                                     | `ctx.use`: component off for the account                                                  | tool error, `{ component, accountsUrl }`                      | 200  |
 | `not_supported_by_provider`                              | `ctx.use`: no binding                                                                     | tool error, `{ capability, provider }`                        | 200  |
 | `needs_relink`                                           | broker `invalid_grant`; Google 401 after one refresh; Google 403 insufficient permissions | tool error, `{ linkUrl }`                                     | 200  |
@@ -353,8 +353,8 @@ Handlers throw `ToolError(code, message, details?)`. The wrapper returns `{ isEr
 | `send_disabled`                                          | kill switch or `SEND_ENABLED=false`                                                       | tool error                                                    | 200  |
 | `sender_not_allowed`, `too_many_recipients`, `too_large` | sendAs, `MAX_RECIPIENTS`, `MAX_*_BYTES`                                                   | tool error                                                    | 200  |
 | `not_found`                                              | Google 404                                                                                | tool error                                                    | 200  |
-| `upstream_error`                                         | Google 5xx after one retry                                                                | tool error, `{ status }`                                      | 200  |
-| `internal`                                               | anything else                                                                             | tool error, generic message                                   | 200  |
+| `upstream_error`                                         | Google 5xx after one retry; broker: token endpoint 5xx, network failure or bad reply      | tool error, `{ status }` (none on network failure)            | 200  |
+| `internal`                                               | broker: Google OAuth client missing or refused; anything else                             | tool error, generic message or the secret to check            | 200  |
 
 An approval is not an error: the tool returns `{ status: 'pending_approval', pendingActionId, approvalUrl, preview, expiresAt }` without `isError`. HTTP 429 appears only on `/oauth/register` (DCR limit per `CF-Connecting-IP`, plan s.4.1), with `Retry-After: 60` and body `{ "error": "temporarily_unavailable", ... }`. The SDK rejects zod failures before the handler runs; M5 pins the exact result shape with a test.
 
@@ -446,17 +446,21 @@ export const mailLabels: Family = {
 | `admin.directory`  | `DirectoryAdminService`: users, aliases, groups, members, domains                                                                                | A1  |
 
 ```ts
-// Design. src/providers/registry.ts and src/core/token-broker.ts
+// Design. src/providers/registry.ts
 export interface Provider {
   id: ProviderId;
   scopesFor(c: readonly Component[]): string[];
   get<T>(cap: Capability<T>): T | undefined;
 }
+// src/core/token-broker.ts (M8). AccountRef satisfies BrokerAccount { ownerId, accountId }.
+export function createTokenBroker(env: Env): TokenBroker; // cheap; state is per isolate
 export interface TokenBroker {
-  accessToken(a: AccountRef): Promise<string>; // refresh tokens never leave it
-  invalidate(a: AccountRef): void;
+  accessToken(a: BrokerAccount): Promise<string>; // refresh tokens never leave it
+  invalidate(a: BrokerAccount): void; // Google refused the token: the next call refreshes
 }
 ```
+
+**Token broker (M8).** `accessToken(a)` returns the isolate's cached token, else the sealed D1 access token while more than 5 minutes remain (`EXPIRY_MARGIN_SECONDS`), else a refresh at Google's token endpoint with the sealed refresh token. Concurrent calls for one account share one refresh. A refresh writes one D1 batch: the access token, plus the refresh token when Google rotated it or its row is under an older key version, all sealed under `CURRENT_KEY_VERSION` (lazy key rotation). A 400 `invalid_grant` marks the account `needs_relink` and deletes its access row, only if the refresh row is still the one Google refused; later calls throw `needs_relink` (`{ linkUrl: PUBLIC_URL/accounts }`) without calling Google, until a relink stores a new refresh token and sets `status` back to `ok`. Network failures, 5xx and malformed replies throw `upstream_error` and change nothing; a missing or refused Google client is `internal`. Google 401 contract: the Google HTTP client calls `invalidate(a)`, then `accessToken(a)`, and retries once; a second 401 is `needs_relink`.
 
 `ctx.use(cap, a)` checks, in order: the capability's component is on for the account (`component_disabled`), the account's provider has a binding (`not_supported_by_provider`); then it returns the implementation.
 
@@ -531,7 +535,7 @@ for (const o of official) {
 
 - **Runner.** `vitest` with `cloudflareTest()` from `@cloudflare/vitest-plugin` and the committed `wrangler.example.jsonc` (the scaffold's `vitest.config.ts`). M4 switches to the function form to add test bindings through `miniflare.bindings` (VP:33-37, 87; s.1.6): `PUBLIC_URL=https://mcp.example.com`, `OWNER_CONTACT=privacy@example.com`, `OWNER_EMAILS=owner@example.com,owner2@example.com`, fixed test `TOKEN_KEK` and `COOKIE_SECRET`, `GOOGLE_CLIENT_ID=test-client`, `GOOGLE_CLIENT_SECRET=test-secret`.
 - **D1.** `vitest.config.ts` calls `readD1Migrations('./migrations')` (VP:113) and passes the result as a `TEST_MIGRATIONS` binding; a `setupFiles` entry calls `applyD1Migrations(env.DB, env.TEST_MIGRATIONS)` (VT:211-215). Tests create their own owner and account ids: storage is not rolled back between tests. `reset()` (VT:94) drops the applied tables and `d1_migrations` too (s.1.6), so a test that uses it re-applies migrations afterwards.
-- **Fake Google** (`test/helpers/google.ts`). `vi.spyOn(globalThis, 'fetch')` with a route table keyed by method and URL prefix: `oauth2.googleapis.com/token`, `gmail.googleapis.com`, `www.googleapis.com/batch/gmail/v1`, `www.googleapis.com/calendar/v3`, `www.googleapis.com/drive/v3`, `people.googleapis.com`. An unmatched request throws, so no test reaches the network. Each family adds `test/fixtures/google/<family>.json`. Error cases per tool: 401 then refresh and one retry, 403 insufficient permissions, 404, 429, 500.
+- **Fake Google** (`test/helpers/google.ts`). `vi.spyOn(globalThis, 'fetch')` with a route table keyed by method and URL prefix: `oauth2.googleapis.com/token`, `gmail.googleapis.com`, `www.googleapis.com/batch/gmail/v1`, `www.googleapis.com/calendar/v3`, `www.googleapis.com/drive/v3`, `people.googleapis.com`. An unmatched request throws, so no test reaches the network. The broker tests (`test/token-broker.test.ts`) keep their own small token-endpoint fake. Each family adds `test/fixtures/google/<family>.json`. Error cases per tool: 401 then refresh and one retry, 403 insufficient permissions, 404, 429, 500.
 - **Google sign-in.** The fake token endpoint returns an ID token with test claims. The ID token comes straight from Google's token endpoint over TLS, so `google-oidc.ts` checks `iss`, `aud`, `exp`, `nonce` and `email_verified` and skips the signature (OpenID Connect Core 1.0, s.3.1.3.7, item 6). That also avoids a JWKS fetch and RSA work inside the CPU budget.
 - **MCP tokens** (`test/helpers/tokens.ts`). `mintToken({ kind, scopes, ownerId })`: `getOAuthApi(env).createClient()` with a public client and a redirect URI on `client.example.com` (OP:1286); an `/authorize` request with PKCE S256 and `resource=resourceUrl(kind, issuer)`; `parseAuthRequest` (OP:1209); `completeAuthorization` with the scopes and `props: { ownerId }` (OP:1224); then the code exchange at `/oauth/token` through `exports.default.fetch`. The real token and audience code runs; nothing in the OAuth library is stubbed. `authorizeCode(options)` and `exchangeCode(code, { verifier })` expose the two halves for PKCE tests (`verifier: null` omits `code_verifier`).
 - **MCP calls** (`test/helpers/mcp.ts`). `mcpCall(token, kind, method, params)` posts JSON-RPC to `PATH[kind]` through `exports.default.fetch`. M5's first test pins the request headers the stateless handler requires.

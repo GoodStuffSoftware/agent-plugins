@@ -3,17 +3,18 @@
 
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+import { GOOGLE_TOKEN_URL } from "../src/auth/google-oidc";
 import { open, randomBytes, randomId, type SealAad, type Sealed, seal } from "../src/core/crypto";
 import { getToken, insertAccount, nowSeconds, upsertToken } from "../src/core/db";
-import { type BrokerAccount, createTokenBroker, GOOGLE_TOKEN_URL } from "../src/core/token-broker";
+import { type BrokerAccount, createTokenBroker } from "../src/core/token-broker";
 import type { Env } from "../src/env";
+import { GOOGLE_CLIENT_SECRET as CLIENT_SECRET, GOOGLE_CLIENT_ID } from "./helpers/google";
 
-const CLIENT_SECRET = "test-client-secret";
 const LINK_URL = "https://mcp.example.com/accounts";
 
-/** The test env plus a Google client secret, with some values replaced (undefined removes one). */
+/** The test env with some values replaced (undefined removes one). */
 const envWith = (overrides: Record<string, string | undefined> = {}): Env =>
-  ({ ...env, GOOGLE_CLIENT_SECRET: CLIENT_SECRET, ...overrides }) as Env;
+  ({ ...env, ...overrides }) as Env;
 const ENV = envWith();
 
 const randomKey = (): string => btoa(String.fromCharCode(...randomBytes(32)));
@@ -203,7 +204,7 @@ describe("token broker: cache layers", () => {
     expect(Object.fromEntries(forms[0] ?? [])).toEqual({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
-      client_id: "test-client",
+      client_id: GOOGLE_CLIENT_ID,
       client_secret: CLIENT_SECRET,
     });
     // One write: a single batch holding only the access token.

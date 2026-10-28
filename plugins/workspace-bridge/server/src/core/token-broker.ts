@@ -2,6 +2,7 @@
 // sealed refresh token or calls Google's token endpoint. Refresh and access tokens never appear in
 // a log, an error or any return value other than accessToken()'s own result.
 
+import { GOOGLE_TOKEN_URL } from "../auth/google-oidc";
 import { config, type Env } from "../env";
 import { currentKeyVersion, open, type SealAad, seal, type TokenKind } from "./crypto";
 import { getAccount, getToken, nowSeconds } from "./db";
@@ -18,8 +19,6 @@ class ToolError extends Error {
     this.details = details;
   }
 }
-
-export const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 
 /** An access token this close to its expiry (seconds) counts as expired. */
 export const EXPIRY_MARGIN_SECONDS = 300;
