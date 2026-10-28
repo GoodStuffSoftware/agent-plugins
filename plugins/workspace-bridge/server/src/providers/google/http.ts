@@ -76,6 +76,17 @@ export async function gfetch(
   if (!state) throw new Error("gfetch: the account was not resolved through ctx.accounts");
   if (state.row.provider !== "google") throw new Error("gfetch: not a Google account");
   const target = googleUrl(url, opts);
+  // The component is checked here too, so an implementation handed one account cannot reach
+  // another account's API past a switched-off component.
+  const component = opts.component ?? componentOf(target);
+  if (component && !state.components.includes(component)) {
+    const accountsUrl = `${config(state.env).issuer}/accounts`;
+    throw new ToolError(
+      "component_disabled",
+      `The ${component} component is off for account ${accountKey(account.shortId)}. Switch it on at ${accountsUrl}.`,
+      { component, accountsUrl },
+    );
+  }
   const method = (init.method ?? "GET").toUpperCase();
   const retry5xx = opts.retry ?? method !== "POST";
   const broker = createTokenBroker(state.env);
@@ -223,6 +234,7 @@ export function componentOf(url: URL): AccountComponent | undefined {
 const RATE_REASONS: ReadonlySet<string> = new Set([
   "rateLimitExceeded",
   "userRateLimitExceeded",
+  "sharingRateLimitExceeded",
   "quotaExceeded",
   "dailyLimitExceeded",
   "RATE_LIMIT_EXCEEDED",

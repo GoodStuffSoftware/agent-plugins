@@ -26,7 +26,13 @@ export function registerAll(server: McpServer, registry: Registry, scope: Reques
           if (pending !== undefined) return okResult(pending);
           return okResult(await def.handler(args as never, ctx));
         } catch (e) {
-          if (!(e instanceof ToolError)) console.error(internalErrorLine(def.name, e, args));
+          if (!(e instanceof ToolError)) {
+            try {
+              console.error(internalErrorLine(def.name, e, args));
+            } catch {
+              // Logging must never change the answer.
+            }
+          }
           return toToolResult(e);
         }
       },

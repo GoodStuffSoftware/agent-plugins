@@ -82,16 +82,35 @@ function argValues(args: unknown): string[] {
   return [...out].sort((a, b) => b.length - a.length);
 }
 
-const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/** Longest message read for redaction: bounds the work on a huge message. */
+const REDACT_INPUT_MAX = 2000;
+
+/** Replaces every case-insensitive occurrence of `value` (no RegExp, so any length is safe). */
+function cutValue(m: string, value: string): string {
+  const lower = m.toLowerCase();
+  const needle = value.toLowerCase();
+  // Lowercasing can change lengths outside ASCII; then fall back to an exact match.
+  if (lower.length !== m.length || needle.length !== value.length)
+    return m.split(value).join("[arg]");
+  let out = "";
+  let from = 0;
+  for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, from)) {
+    out += `${m.slice(from, at)}[arg]`;
+    from = at + needle.length;
+  }
+  return out + m.slice(from);
+}
 
 /**
  * An error message with nothing of the caller's or Google's left in it: every argument value,
  * then braces and brackets (JSON bodies), quoted text, email addresses and long token-like runs
- * are cut out, whitespace is collapsed and the result is cut at 200 characters.
+ * are cut out, whitespace is collapsed and the result is cut at 200 characters. Only the first
+ * 2000 characters are read; an argument value longer than that cannot occur whole, and its
+ * pieces are long runs or quoted text.
  */
 export function redactMessage(message: string, args?: unknown): string {
-  let m = message;
-  for (const v of argValues(args)) m = m.replace(new RegExp(escapeRegExp(v), "gi"), "[arg]");
+  let m = message.slice(0, REDACT_INPUT_MAX);
+  for (const v of argValues(args)) if (v.length <= m.length) m = cutValue(m, v);
   m = m
     .replace(/\{[\s\S]*\}/g, "{...}")
     .replace(/\[(?!arg\])[\s\S]*\]/g, "[...]")

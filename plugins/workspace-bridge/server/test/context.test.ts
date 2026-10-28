@@ -475,3 +475,39 @@ describe("internal error log", () => {
     expect(parsed.message.length).toBeLessThanOrEqual(203);
   });
 });
+
+describe("review fixes", () => {
+  it("gfetch refuses an account whose component is off, before calling Google", async () => {
+    const { a } = await setup({ components: ["calendar"] });
+    const calls = installGoogleRoutes([]);
+    const { error } = await failure(() => gfetch(a, LABELS_URL));
+    expect(error).toMatchObject({
+      code: "component_disabled",
+      component: "mail",
+      accountsUrl: ACCOUNTS_URL,
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("a huge argument neither breaks the answer nor reaches the log", async () => {
+    const ownerId = await newOwner();
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await callTool(ownerId, "full", "test_boom", { secret: "q".repeat(1_000_000) });
+    expect(res.json).toEqual({ error: { code: "internal", message: INTERNAL_MESSAGE } });
+    expect(log).toHaveBeenCalledTimes(1);
+    const line = String(log.mock.calls[0]?.[0]);
+    expect(line.length).toBeLessThan(500);
+    expect(line).not.toContain("qqqqqqqqqqqqqqqq");
+  });
+
+  it("refuses a duplicate or empty provider binding at load", () => {
+    const fam = (id: string, impl: unknown): Family => ({
+      id,
+      tools: [],
+      bindings: { google: [{ cap: LABELS, impl }] },
+      parityPending: [],
+    });
+    expect(() => compileRegistry([fam("x", {}), fam("y", {})])).toThrow(/already binds/);
+    expect(() => compileRegistry([fam("x", undefined)])).toThrow(/to nothing/);
+  });
+});
