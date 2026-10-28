@@ -447,6 +447,7 @@ describe("link leg", () => {
     anonymous.setCookie(FLOW_COOKIE, browser.cookie(FLOW_COOKIE) ?? "");
     const res = await anonymous.fetch(google.approve(url, OWNER));
     expect(res.status).toBe(403);
+    expect(await res.text()).toContain("Sign-in expired");
     expect(google.linkExchanges).toHaveLength(0);
     expect(await count("accounts")).toBe(0);
   });
@@ -510,6 +511,25 @@ describe("link leg", () => {
       .bind(after.owner_id)
       .first<{ next_short_id: number }>();
     expect(nextAfter?.next_short_id).toBe(next?.next_short_id);
+    expect(await count("send_as")).toBe(2);
+
+    // A relink without mail drops the sendAs cache.
+    expect((await link(browser, { label: "job", components: ["calendar"] }, WORK)).status).toBe(
+      302,
+    );
+    const [noMail] = await accounts();
+    expect(noMail?.send_as_fetched_at).toBeNull();
+    expect(await count("send_as")).toBe(0);
+  });
+
+  it("answers 503 and starts nothing when the token key is missing", async () => {
+    const browser = await signIn({ TOKEN_KEK: undefined });
+    const flows = await linkFlows();
+    const res = await postLink(browser, { label: "nokey", components: ["mail"] });
+    expect(res.status).toBe(503);
+    expect(res.headers.get("Location")).toBeNull();
+    expect(await linkFlows()).toBe(flows);
+    expect(google.linkExchanges).toHaveLength(0);
   });
 
   it("refuses a label another mailbox already has", async () => {

@@ -86,6 +86,18 @@ export async function startLink(
   client: GoogleClient,
   o: { ownerId: string; label: string; components: AccountComponent[]; loginHint?: string },
 ): Promise<Response> {
+  // The callback seals the tokens after the code exchange. Check the sealing key first, so a
+  // missing or malformed key never leaves a grant at Google whose tokens were thrown away.
+  try {
+    await seal("probe", { ownerId: o.ownerId, accountId: "probe", kind: "access" }, env);
+  } catch {
+    log("link_failed", { reason: "token_key", owner_id: o.ownerId });
+    return linkNotice(
+      503,
+      "Not configured",
+      "Token encryption is not configured on this server. Nothing was started.",
+    );
+  }
   const verifier = base64url(randomBytes(32));
   const nonce = base64url(randomBytes(32));
   const payload: LinkPayload = {
@@ -154,8 +166,16 @@ export async function finishLink(
   // The flow cookie proves this browser started the flow; the session proves it is still the
   // owner who started it. Checked before the code is exchanged.
   const session = await readSession(req, env);
-  if (!session || session.ownerId !== payload.ownerId) {
-    log("link_refused", { reason: session ? "owner_mismatch" : "no_session" });
+  if (!session) {
+    log("link_refused", { reason: "no_session" });
+    return linkNotice(
+      403,
+      "Sign-in expired",
+      "Your sign-in expired before Google answered. Nothing was stored. Open accounts and start again.",
+    );
+  }
+  if (session.ownerId !== payload.ownerId) {
+    log("link_refused", { reason: "owner_mismatch" });
     return linkNotice(
       403,
       "Link refused",
@@ -234,6 +254,8 @@ export async function finishLink(
     components.includes("mail") && granted.includes(GOOGLE_SCOPES.gmailSettingsBasic)
       ? await fetchSendAs(tokens.access_token)
       : undefined;
+  // A relink that turns mail off drops the old sendAs cache with it.
+  const dropSendAs = Boolean(existing) && !components.includes("mail");
 
   const accountId = existing?.id ?? randomId("ac_");
   const aad = (kind: TokenKind) => ({ ownerId: session.ownerId, accountId, kind });
@@ -247,7 +269,8 @@ export async function finishLink(
         db
           .prepare(
             `UPDATE accounts SET label = ?, provider_sub = ?, components = ?, granted_scopes = ?,
-               status = 'ok', send_as_fetched_at = COALESCE(?, send_as_fetched_at), updated_at = ?
+               status = 'ok', send_as_fetched_at = IIF(? = 1, NULL, COALESCE(?, send_as_fetched_at)),
+               updated_at = ?
              WHERE id = ? AND owner_id = ?`,
           )
           .bind(
@@ -255,6 +278,7 @@ export async function finishLink(
             identity.sub,
             JSON.stringify(components),
             granted.join(" "),
+            dropSendAs ? 1 : 0,
             sendAs ? now : null,
             now,
             accountId,
@@ -290,8 +314,10 @@ export async function finishLink(
     tokenStatement(db, accountId, "refresh", refresh, null, now),
     tokenStatement(db, accountId, "access", access, accessExpiry, now),
   );
-  if (sendAs) {
+  if (sendAs || dropSendAs) {
     statements.push(db.prepare("DELETE FROM send_as WHERE account_id = ?").bind(accountId));
+  }
+  if (sendAs) {
     for (const s of sendAs) {
       statements.push(
         db
