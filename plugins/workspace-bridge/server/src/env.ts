@@ -7,6 +7,8 @@ export interface Env {
   OAUTH_KV: KVNamespace;
   /** `ratelimits` binding for `/oauth/register`; registration is not limited when unbound. */
   DCR_LIMIT?: RateLimit;
+  /** `ratelimits` binding for tool calls per grant; D1 counts them when unbound. */
+  CALL_LIMIT?: RateLimit;
 
   // Vars (wrangler.example.jsonc).
   PUBLIC_URL: string;
@@ -20,6 +22,7 @@ export interface Env {
   MAX_ATTACHMENT_BYTES?: string;
   MAX_SEND_ATTACHMENT_BYTES?: string;
   CURRENT_KEY_VERSION?: string;
+  AUDIT_RETENTION_DAYS?: string;
 
   // Secrets (`wrangler secret put`).
   GOOGLE_CLIENT_ID?: string;
@@ -56,6 +59,8 @@ export interface Config {
   maxAttachmentBytes: number;
   maxSendAttachmentBytes: number;
   currentKeyVersion: number;
+  /** Days an audit row is kept; at least 1. */
+  auditRetentionDays: number;
   /** Lowercased sign-in allowlist; empty means nobody can sign in. */
   ownerEmails: readonly string[];
   /** Lowercased link allowlist; defaults to `ownerEmails`. */
@@ -93,6 +98,7 @@ function parse(env: Env): Config {
       524288,
     ),
     currentKeyVersion: currentKeyVersion(env),
+    auditRetentionDays: Math.max(1, count("AUDIT_RETENTION_DAYS", env.AUDIT_RETENTION_DAYS, 365)),
     ownerEmails: Object.freeze(ownerEmails),
     linkableEmails: Object.freeze(linkable.length > 0 ? linkable : [...ownerEmails]),
   });

@@ -19,11 +19,16 @@
   ],
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" }],
   "observability": { "enabled": true },
-  // Limits Dynamic Client Registration (/oauth/register) per client IP. namespace_id is any
-  // integer unique within your account.
+  // DCR_LIMIT limits Dynamic Client Registration (/oauth/register) per client IP; CALL_LIMIT
+  // limits tool calls per MCP connection (grant). namespace_id is any integer unique within your
+  // account.
   "ratelimits": [
-    { "name": "DCR_LIMIT", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+    { "name": "DCR_LIMIT", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
+    { "name": "CALL_LIMIT", "namespace_id": "1002", "simple": { "limit": 120, "period": 60 } }
   ],
+  // Daily cleanup: expired pending actions, flow states and rate counters, old audit rows and
+  // expired OAuth data.
+  "triggers": { "crons": ["17 3 * * *"] },
   "vars": {
     "PUBLIC_URL": "https://mcp.example.com",
     "OWNER_CONTACT": "",
@@ -35,6 +40,7 @@
     "MAX_RECIPIENTS": "20",
     "MAX_ATTACHMENT_BYTES": "524288",
     "MAX_SEND_ATTACHMENT_BYTES": "524288",
-    "CURRENT_KEY_VERSION": "1"
+    "CURRENT_KEY_VERSION": "1",
+    "AUDIT_RETENTION_DAYS": "365"
   }
 }

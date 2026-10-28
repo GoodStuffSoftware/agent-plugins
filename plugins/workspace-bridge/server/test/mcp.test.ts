@@ -58,6 +58,7 @@ describe.each(KINDS)("%s endpoint", (kind) => {
       "list_accounts",
       "link_account_url",
     ]);
+    expect(tools.map((t) => t.name)).toContain("get_pending_action");
     expect(tools[0]).toMatchObject({
       name: "whoami",
       inputSchema: { type: "object", properties: {} },
@@ -263,7 +264,7 @@ describe("tool results", () => {
     });
   });
 
-  it("fails closed on a call that needs approval until approvals exist", async () => {
+  it("fails closed on a call held for approval that addresses no account", async () => {
     const res = await directRpc("full", ["mail.read"], "tools/call", {
       name: "test_approval",
       arguments: {},

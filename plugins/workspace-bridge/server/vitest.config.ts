@@ -6,6 +6,10 @@ export default defineConfig({
     cloudflareTest(async () => ({
       wrangler: { configPath: "./wrangler.example.jsonc" },
       miniflare: {
+        // Every test uses the same grant, so the per-grant call limit is raised out of the way.
+        ratelimits: {
+          CALL_LIMIT: { namespace_id: "1002", simple: { limit: 1_000_000, period: 60 } },
+        },
         // Test-only values; secrets are never in the example config (ARCHITECTURE s.6).
         bindings: {
           TEST_MIGRATIONS: await readD1Migrations("./migrations"),

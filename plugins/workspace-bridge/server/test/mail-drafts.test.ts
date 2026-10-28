@@ -37,6 +37,11 @@ type Json = any;
 async function setup(opts: { components?: readonly string[]; label?: string } = {}) {
   const ownerId = await newOwner();
   const linked = await linkGoogleAccount(ownerId, { components: ["mail"], ...opts });
+  // A fresh, empty sendAs cache (M14): the account may send as its own address only, and no test
+  // here sees a sendAs list fetch among its Google calls.
+  await env.DB.prepare("UPDATE accounts SET send_as_fetched_at = ? WHERE id = ?")
+    .bind(Math.floor(Date.now() / 1000), linked.row.id)
+    .run();
   return { ownerId, key: `a${linked.row.short_id}` };
 }
 
