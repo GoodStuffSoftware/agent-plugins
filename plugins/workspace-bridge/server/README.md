@@ -1,7 +1,7 @@
 # workspace-bridge server
 
 Cloudflare Worker for the workspace-bridge plugin. Source is TypeScript (Hono); tests run in the
-Workers runtime through `@cloudflare/vitest-pool-workers`.
+Workers runtime through `@cloudflare/vitest-plugin`.
 
 Run everything from this directory with Node (current LTS):
 
