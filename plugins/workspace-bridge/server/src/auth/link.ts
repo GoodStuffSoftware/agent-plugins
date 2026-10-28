@@ -9,7 +9,7 @@
 // cookie and writes no row.
 
 import { base64url, randomBytes, randomId, seal, sha256, type TokenKind } from "../core/crypto";
-import { type AccountRow, first, nowSeconds } from "../core/db";
+import { type AccountRow, first, getAccount, nowSeconds } from "../core/db";
 import { config, type Env } from "../env";
 import {
   type AccountComponent,
@@ -18,6 +18,7 @@ import {
   isAccountComponent,
   LINK_IDENTITY_SCOPES,
   parseScopes,
+  revokeToken,
   scopesFor,
 } from "../providers/google/base";
 import { html, htmlResponse, page } from "../web/html";
@@ -38,7 +39,19 @@ export interface LinkPayload {
   /** The owner whose session started the link; the callback requires the same owner. */
   ownerId: string;
   label: string;
+  /** The components the account should have afterwards (only those Google grants are kept). */
   components: AccountComponent[];
+  /**
+   * Set when the flow is for an existing account (toggle, relink): the callback then requires
+   * Google to return that account's address.
+   */
+  accountId?: string;
+  /**
+   * With `accountId`: the components this flow turns on. The callback keeps the account's
+   * components that are on when Google answers, plus these, so a component switched off while
+   * the owner is at Google stays off.
+   */
+  added?: AccountComponent[];
   /** PKCE verifier for the Google code exchange. */
   verifier: string;
   /** Must come back as the ID token's `nonce`. */
@@ -78,32 +91,56 @@ function linkNotice(status: number, title: string, message: string): Response {
 }
 
 /**
+ * Whether tokens can be sealed now. The callback seals after the code exchange, so check this
+ * before anything starts: a missing or malformed key must never leave a grant at Google whose
+ * tokens were thrown away.
+ */
+export async function sealingReady(env: Env, ownerId: string): Promise<boolean> {
+  try {
+    await seal("probe", { ownerId, accountId: "probe", kind: "access" }, env);
+    return true;
+  } catch {
+    log("link_failed", { reason: "token_key", owner_id: ownerId });
+    return false;
+  }
+}
+
+/** The page for `sealingReady` false. */
+export const sealingNotReady = (): Response =>
+  linkNotice(
+    503,
+    "Not configured",
+    "Token encryption is not configured on this server. Nothing was started.",
+  );
+
+/**
  * Starts the link leg: stores a single-use `link` flow bound to this browser, then redirects to
- * Google for offline access to the scopes of `components` only.
+ * Google for offline access. It asks for the scopes of `components`, or only for `scopes` when
+ * given (incremental consent: with `include_granted_scopes` Google adds what it already granted).
+ * `accountId` pins the flow to an existing account.
  */
 export async function startLink(
   env: Env,
   client: GoogleClient,
-  o: { ownerId: string; label: string; components: AccountComponent[]; loginHint?: string },
+  o: {
+    ownerId: string;
+    label: string;
+    components: AccountComponent[];
+    accountId?: string;
+    added?: AccountComponent[];
+    scopes?: string[];
+    loginHint?: string;
+  },
 ): Promise<Response> {
-  // The callback seals the tokens after the code exchange. Check the sealing key first, so a
-  // missing or malformed key never leaves a grant at Google whose tokens were thrown away.
-  try {
-    await seal("probe", { ownerId: o.ownerId, accountId: "probe", kind: "access" }, env);
-  } catch {
-    log("link_failed", { reason: "token_key", owner_id: o.ownerId });
-    return linkNotice(
-      503,
-      "Not configured",
-      "Token encryption is not configured on this server. Nothing was started.",
-    );
-  }
+  if (!(await sealingReady(env, o.ownerId))) return sealingNotReady();
   const verifier = base64url(randomBytes(32));
   const nonce = base64url(randomBytes(32));
   const payload: LinkPayload = {
     ownerId: o.ownerId,
     label: o.label,
     components: o.components,
+    ...(o.accountId ? { accountId: o.accountId } : {}),
+    ...(o.added && o.added.length > 0 ? { added: o.added } : {}),
     verifier,
     nonce,
   };
@@ -112,7 +149,7 @@ export async function startLink(
     client_id: client.clientId,
     redirect_uri: callbackUrl(config(env).issuer),
     response_type: "code",
-    scope: [...LINK_IDENTITY_SCOPES, ...scopesFor(o.components)].join(" "),
+    scope: [...LINK_IDENTITY_SCOPES, ...(o.scopes ?? scopesFor(o.components))].join(" "),
     state,
     nonce,
     code_challenge: base64url(await sha256(verifier)),
@@ -136,6 +173,8 @@ export function linkPayload(payload: unknown): LinkPayload | undefined {
     normalizeLabel(p.label) !== p.label ||
     !Array.isArray(p.components) ||
     !p.components.every(isAccountComponent) ||
+    (p.accountId !== undefined && (typeof p.accountId !== "string" || p.accountId === "")) ||
+    (p.added !== undefined && (!Array.isArray(p.added) || !p.added.every(isAccountComponent))) ||
     typeof p.verifier !== "string" ||
     typeof p.nonce !== "string"
   ) {
@@ -145,6 +184,8 @@ export function linkPayload(payload: unknown): LinkPayload | undefined {
     ownerId: p.ownerId,
     label: p.label,
     components: p.components,
+    ...(typeof p.accountId === "string" ? { accountId: p.accountId } : {}),
+    ...(Array.isArray(p.added) ? { added: p.added as AccountComponent[] } : {}),
     verifier: p.verifier,
     nonce: p.nonce,
   };
@@ -212,9 +253,16 @@ export async function finishLink(
     return linkNotice(400, "Link failed", "Google's answer could not be verified. Try again.");
   }
   const hash = await emailHash(env, identity.email);
+  // A refusal below drops the new grant at Google, unless an account already holds that address:
+  // a revoke ends the whole grant, which a linked mailbox may be using.
+  const refused = async (reason: string, status: number, title: string, message: string) => {
+    log("link_refused", { reason, email_hash: hash, owner_id: session.ownerId });
+    await discardGrant(env, tokens.refresh_token ?? tokens.access_token, identity.email, hash);
+    return linkNotice(status, title, message);
+  };
   if (!linkableEmails.includes(identity.email)) {
-    log("link_refused", { reason: "not_linkable", email_hash: hash, owner_id: session.ownerId });
-    return linkNotice(
+    return refused(
+      "not_linkable",
       403,
       "Not allowed",
       "This Google account is not on the list of mailboxes that can be linked. Nothing was stored.",
@@ -231,6 +279,21 @@ export async function finishLink(
     session.ownerId,
     identity.email,
   );
+  if (payload.accountId) {
+    // A toggle or relink of one account: Google must have returned that account's address.
+    const target = await getAccount(env.DB, session.ownerId, payload.accountId);
+    if (!target) {
+      return refused("account_gone", 404, "Not found", "That mailbox is no longer linked.");
+    }
+    if (target.id !== existing?.id) {
+      return refused(
+        "address_mismatch",
+        409,
+        "Wrong Google account",
+        `Google signed in a different account than ${target.address}. Nothing was changed. Start again and pick ${target.address}.`,
+      );
+    }
+  }
   const clash = await first<{ id: string }>(
     env.DB,
     "SELECT id FROM accounts WHERE owner_id = ? AND label = ? AND address <> ?",
@@ -239,16 +302,35 @@ export async function finishLink(
     identity.email,
   );
   if (clash) {
-    log("link_refused", { reason: "label_in_use", email_hash: hash });
-    return linkNotice(
+    return refused(
+      "label_in_use",
       409,
       "Label in use",
       `Another mailbox already has the label "${payload.label}". Pick another label.`,
     );
   }
+  if (existing?.provider_sub && existing.provider_sub !== identity.sub) {
+    // Same address, new Google user id: a deleted and recreated Workspace user. Verified by
+    // the address check above and started by the owner, so it proceeds, on the record.
+    log("sub_changed", { account_id: existing.id, owner_id: session.ownerId, email_hash: hash });
+  }
 
   const granted = parseScopes(tokens.scope);
-  const components = grantedComponents(payload.components, granted);
+  // A pinned flow wants what is on in the account now plus what this flow adds, not the click-time
+  // snapshot: a component switched off while the owner was at Google stays off.
+  const wanted =
+    existing && payload.accountId ? stillWanted(payload, existing) : payload.components;
+  const components = grantedComponents(wanted, granted);
+  if (components.length === 0) {
+    // Google's granular consent lets the owner untick every box; an account with no component
+    // would only look linked.
+    return refused(
+      "nothing_granted",
+      400,
+      "Nothing granted",
+      "Google granted none of the requested access, so nothing was stored. Start again and leave the boxes ticked.",
+    );
+  }
   const now = nowSeconds();
   const sendAs =
     components.includes("mail") && granted.includes(GOOGLE_SCOPES.gmailSettingsBasic)
@@ -355,7 +437,43 @@ export async function finishLink(
     components,
   });
   const headers = new Headers({ "Set-Cookie": clearCookie(FLOW_COOKIE) });
-  return redirect(new URL("/accounts", issuer).toString(), headers);
+  // Components Google did not grant are named on the page, so a partial grant is not silent.
+  const missing = wanted.filter((c) => !components.includes(c));
+  const back = new URL("/accounts", issuer);
+  if (missing.length > 0) back.searchParams.set("partial", missing.join(","));
+  return redirect(back.toString(), headers);
+}
+
+/** The flow's components that are still on in the account, plus the ones the flow adds. */
+function stillWanted(payload: LinkPayload, account: AccountRow): AccountComponent[] {
+  let on: unknown;
+  try {
+    on = JSON.parse(account.components);
+  } catch {
+    on = [];
+  }
+  const current = Array.isArray(on) ? on : [];
+  return payload.components.filter((c) => current.includes(c) || (payload.added ?? []).includes(c));
+}
+
+/**
+ * Best-effort revoke of a grant the link flow refused to keep, only when no account holds the
+ * address (any owner): a revoke drops the whole grant, which a linked mailbox may be using.
+ */
+async function discardGrant(
+  env: Env,
+  token: string | undefined,
+  address: string,
+  hash: string,
+): Promise<void> {
+  if (!token) return;
+  const held = await first<{ id: string }>(
+    env.DB,
+    "SELECT id FROM accounts WHERE address = ?",
+    address,
+  );
+  if (held) return;
+  log("link_grant_discarded", { email_hash: hash, revoked: await revokeToken(token) });
 }
 
 function tokenStatement(
