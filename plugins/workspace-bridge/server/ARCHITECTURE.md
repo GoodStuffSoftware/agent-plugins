@@ -257,7 +257,7 @@ Paths are under `plugins/workspace-bridge/server/`. M is the milestone that crea
 | `src/services/<cap>.ts`         | family  | One capability interface and its key per file.                                                                                                                                                                                          |
 | `src/providers/registry.ts`     | M9      | Builds providers from the families' bindings; backs `ctx.use()`.                                                                                                                                                                        |
 | `src/providers/google/base.ts`  | M7      | `ACCOUNT_COMPONENTS`, Google scopes, `scopesFor(components)`, `grantedComponents`, revoke. Authorize and token URLs are in `auth/google-oidc.ts`.                                                                                       |
-| `src/providers/google/http.ts`  | M9      | `gfetch`, `gjson`: component check, bearer, `fields=`, 401 retry, error mapping (s.3.3).                                                                                                                                                               |
+| `src/providers/google/http.ts`  | M9      | `gfetch`, `gjson`: component check, bearer, `fields=`, 401 retry, error mapping (s.3.3).                                                                                                                                                |
 | `src/providers/google/batch.ts` | M10     | Gmail batch requests (`multipart/mixed`) for metadata.                                                                                                                                                                                  |
 | `src/providers/google/<cap>.ts` | family  | One file per capability (`gmail-*`, `calendar`, `drive-*`, `people`).                                                                                                                                                                   |
 | `src/registry/types.ts`         | M5      | `ToolDef`, `ToolContext`, `Family`, `Component`; re-exports `Kind` and `Scope` from `auth/endpoints.ts`.                                                                                                                                |
@@ -486,11 +486,23 @@ export interface Provider {
   scopesFor(c: readonly AccountComponent[]): string[]; // google only; others throw until built
   get<T>(cap: Capability<T>): T | undefined;
 }
-export interface ProviderRegistry { get(id: ProviderId): Provider } // every id present
+export interface ProviderRegistry {
+  get(id: ProviderId): Provider;
+} // every id present
 export function createProviderRegistry(families: readonly Family[]): ProviderRegistry; // duplicate binding throws at load
 // src/providers/google/http.ts (M9). `a` must come from ctx.accounts; only https://*.googleapis.com.
-export function gfetch(a: AccountRef, url: string | URL, init?: GoogleInit, opts?: { fields?; query?; component?; retry? }): Promise<Response>;
-export function gjson<T>(a: AccountRef, url: string | URL, init?: GoogleInit, opts?: GoogleFetchOptions): Promise<T>;
+export function gfetch(
+  a: AccountRef,
+  url: string | URL,
+  init?: GoogleInit,
+  opts?: { fields?; query?; component?; retry? },
+): Promise<Response>;
+export function gjson<T>(
+  a: AccountRef,
+  url: string | URL,
+  init?: GoogleInit,
+  opts?: GoogleFetchOptions,
+): Promise<T>;
 // src/core/token-broker.ts (M8). AccountRef satisfies BrokerAccount { ownerId, accountId }.
 export function createTokenBroker(env: Env): TokenBroker; // cheap; state is per isolate
 export interface TokenBroker {

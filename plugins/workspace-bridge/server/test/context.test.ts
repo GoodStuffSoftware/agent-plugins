@@ -500,6 +500,19 @@ describe("review fixes", () => {
     expect(line).not.toContain("qqqqqqqqqqqqqqqq");
   });
 
+  it("a spaced-text argument longer than the message cap never reaches the log line", () => {
+    const s = "my private note ".repeat(200);
+    for (const text of [s, s.slice(0, 1994), "private note ".repeat(100)]) {
+      const line = internalErrorLine("t", new Error(`Google said 500 for ${text}: boom`), {
+        secret: text,
+      });
+      expect(line).not.toMatch(/private|note/i);
+      expect(line.length).toBeLessThan(500);
+    }
+    const huge = internalErrorLine("t", new Error("x ".repeat(60_000)), { a: "zzz" });
+    expect(JSON.parse(huge).message).toBe("[message too long]");
+  });
+
   it("refuses a duplicate or empty provider binding at load", () => {
     const fam = (id: string, impl: unknown): Family => ({
       id,

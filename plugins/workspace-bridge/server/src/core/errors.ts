@@ -82,35 +82,49 @@ function argValues(args: unknown): string[] {
   return [...out].sort((a, b) => b.length - a.length);
 }
 
-/** Longest message read for redaction: bounds the work on a huge message. */
+/** Longest message the redaction passes read; the pattern passes are quadratic on huge input. */
 const REDACT_INPUT_MAX = 2000;
+/** A message longer than this is not redacted at all: the line says so instead. */
+const REDACT_SCAN_MAX = 100_000;
 
-/** Replaces every case-insensitive occurrence of `value` (no RegExp, so any length is safe). */
-function cutValue(m: string, value: string): string {
+/** Replaces every case-insensitive occurrence of each value (no RegExp, so any length is safe). */
+function cutValues(m: string, values: string[]): string {
   const lower = m.toLowerCase();
-  const needle = value.toLowerCase();
-  // Lowercasing can change lengths outside ASCII; then fall back to an exact match.
-  if (lower.length !== m.length || needle.length !== value.length)
-    return m.split(value).join("[arg]");
+  // Lowercasing can change lengths outside ASCII; then fall back to exact matches.
+  if (lower.length !== m.length) {
+    let out = m;
+    for (const v of values) out = out.split(v).join("[arg]");
+    return out;
+  }
+  const spans: Array<[number, number]> = [];
+  for (const v of values) {
+    const needle = v.toLowerCase();
+    if (needle.length !== v.length || needle.length > lower.length) continue;
+    for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, at + needle.length))
+      spans.push([at, at + needle.length]);
+  }
+  spans.sort((x, y) => x[0] - y[0]);
   let out = "";
   let from = 0;
-  for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, from)) {
-    out += `${m.slice(from, at)}[arg]`;
-    from = at + needle.length;
+  for (const [start, end] of spans) {
+    if (end <= from) continue;
+    out += `${m.slice(from, Math.max(from, start))}[arg]`;
+    from = end;
   }
   return out + m.slice(from);
 }
 
 /**
- * An error message with nothing of the caller's or Google's left in it: every argument value,
- * then braces and brackets (JSON bodies), quoted text, email addresses and long token-like runs
- * are cut out, whitespace is collapsed and the result is cut at 200 characters. Only the first
- * 2000 characters are read; an argument value longer than that cannot occur whole, and its
- * pieces are long runs or quoted text.
+ * An error message with nothing of the caller's or Google's left in it. Every argument value is
+ * cut out of the whole message first (so a spaced-text value longer than the later cap is still
+ * found), then the message is cut to 2000 characters and braces and brackets (JSON bodies),
+ * quoted text, email addresses and long token-like runs are removed, whitespace is collapsed and
+ * the result is cut at 200 characters. A message over 100000 characters is not scanned: the log
+ * line says `[message too long]` instead.
  */
 export function redactMessage(message: string, args?: unknown): string {
-  let m = message.slice(0, REDACT_INPUT_MAX);
-  for (const v of argValues(args)) if (v.length <= m.length) m = cutValue(m, v);
+  if (message.length > REDACT_SCAN_MAX) return "[message too long]";
+  let m = cutValues(message, argValues(args)).slice(0, REDACT_INPUT_MAX);
   m = m
     .replace(/\{[\s\S]*\}/g, "{...}")
     .replace(/\[(?!arg\])[\s\S]*\]/g, "[...]")
