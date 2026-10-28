@@ -253,14 +253,22 @@ describe("core tables", () => {
         .bind(accountId, new Uint8Array(32), new Uint8Array(8))
         .run(),
     ).rejects.toThrow(/CHECK constraint failed/);
-    await upsertToken(env.DB, { accountId, kind: "refresh", sealed: await seal("r1", refresh, env) });
+    await upsertToken(env.DB, {
+      accountId,
+      kind: "refresh",
+      sealed: await seal("r1", refresh, env),
+    });
     await upsertToken(env.DB, {
       accountId,
       kind: "access",
       sealed: await seal("a1", access, env),
       expiresAt: 1_800_000_000,
     });
-    await upsertToken(env.DB, { accountId, kind: "refresh", sealed: await seal("r2", refresh, env) });
+    await upsertToken(env.DB, {
+      accountId,
+      kind: "refresh",
+      sealed: await seal("r2", refresh, env),
+    });
 
     const storedRefresh = await getToken(env.DB, accountId, "refresh");
     const storedAccess = await getToken(env.DB, accountId, "access");

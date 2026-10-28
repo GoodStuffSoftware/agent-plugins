@@ -221,7 +221,11 @@ export function getAccount(
 
 /** The owner's accounts, by short id. */
 export function listAccounts(db: D1Database, ownerId: string): Promise<AccountRow[]> {
-  return all<AccountRow>(db, "SELECT * FROM accounts WHERE owner_id = ? ORDER BY short_id", ownerId);
+  return all<AccountRow>(
+    db,
+    "SELECT * FROM accounts WHERE owner_id = ? ORDER BY short_id",
+    ownerId,
+  );
 }
 
 /** Stores a sealed token for (account, kind), replacing any earlier one. */
