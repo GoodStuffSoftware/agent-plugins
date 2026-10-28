@@ -1,6 +1,8 @@
 // Example config. Copy to wrangler.jsonc (git-ignored) and replace every placeholder.
 // Secrets (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_KEK, COOKIE_SECRET,
 // OWNER_EMAILS, LINKABLE_EMAILS) are set with `wrangler secret put`, not here.
+// PUBLIC_URL is the OAuth issuer: your https origin, no trailing slash. OWNER_CONTACT is shown
+// on / and /privacy; leave it empty to hide the line.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "workspace-bridge",
@@ -17,7 +19,14 @@
   ],
   "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" }],
   "observability": { "enabled": true },
+  // Limits Dynamic Client Registration (/oauth/register) per client IP. namespace_id is any
+  // integer unique within your account.
+  "ratelimits": [
+    { "name": "DCR_LIMIT", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+  ],
   "vars": {
+    "PUBLIC_URL": "https://mcp.example.com",
+    "OWNER_CONTACT": "",
     "SEND_ENABLED": "false",
     "SETUP_MODE": "true",
     "SEND_REQUIRES_CONFIRM": "false",
