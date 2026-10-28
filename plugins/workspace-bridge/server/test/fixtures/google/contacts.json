@@ -1,0 +1,49 @@
+{
+  "searchContacts": {
+    "results": [
+      {
+        "person": {
+          "resourceName": "people/c1001",
+          "names": [{ "displayName": "Ada Example" }],
+          "emailAddresses": [{ "value": "ada@example.com" }],
+          "phoneNumbers": [{ "value": "+1 555 0100" }],
+          "organizations": [{ "name": "Example Corp", "title": "Engineer" }],
+          "biographies": [{ "value": "Met at the example conference." }]
+        }
+      },
+      {
+        "person": {
+          "resourceName": "people/c1002",
+          "names": [{ "displayName": "Bo Sample" }],
+          "emailAddresses": [{ "value": "bo@example.com" }]
+        }
+      }
+    ]
+  },
+  "otherContactsSearch": {
+    "results": [
+      {
+        "person": {
+          "resourceName": "otherContacts/c2001",
+          "names": [{ "displayName": "Ada E." }],
+          "emailAddresses": [{ "value": "Ada@Example.com" }]
+        }
+      },
+      {
+        "person": {
+          "resourceName": "otherContacts/c2002",
+          "names": [{ "displayName": "Cy Other" }],
+          "emailAddresses": [{ "value": "cy@example.com" }]
+        }
+      }
+    ]
+  },
+  "person": {
+    "resourceName": "people/c1001",
+    "names": [{ "displayName": "Ada Example" }],
+    "emailAddresses": [{ "value": "ada@example.com" }],
+    "phoneNumbers": [{ "value": "+1 555 0100" }],
+    "organizations": [{ "name": "Example Corp", "title": "Engineer" }],
+    "biographies": [{ "value": "Met at the example conference." }]
+  }
+}
