@@ -1,5 +1,7 @@
 // Bindings, vars and secrets, and the parsed configuration (ARCHITECTURE s.2).
 
+import { currentKeyVersion } from "./core/crypto";
+
 export interface Env {
   DB: D1Database;
   OAUTH_KV: KVNamespace;
@@ -90,7 +92,7 @@ function parse(env: Env): Config {
       env.MAX_SEND_ATTACHMENT_BYTES,
       524288,
     ),
-    currentKeyVersion: Math.max(1, count("CURRENT_KEY_VERSION", env.CURRENT_KEY_VERSION, 1)),
+    currentKeyVersion: currentKeyVersion(env),
     ownerEmails: Object.freeze(ownerEmails),
     linkableEmails: Object.freeze(linkable.length > 0 ? linkable : [...ownerEmails]),
   });
