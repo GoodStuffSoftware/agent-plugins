@@ -5,7 +5,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "workspace-bridge",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-22",
+  "compatibility_date": "2026-10-28",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
   "d1_databases": [
