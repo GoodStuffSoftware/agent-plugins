@@ -1,8 +1,9 @@
 // Registers an endpoint's tools on a per-request server (ARCHITECTURE s.1.4, s.3.1).
-// Wrapper order: per-grant rate check, approval gate, handler, error mapping.
+// Wrapper order: per-grant rate check, approval gate, handler, error mapping. An error that is not
+// a `ToolError` is logged as one redacted line (s.3.3) before it becomes `internal`.
 
 import type { McpServer } from "@modelcontextprotocol/server";
-import { okResult, toToolResult } from "../core/errors";
+import { internalErrorLine, okResult, ToolError, toToolResult } from "../core/errors";
 import type { Registry } from "./compile";
 import { checkRate, gateApproval, type RequestScope, toolContext } from "./context";
 
@@ -19,12 +20,13 @@ export function registerAll(server: McpServer, registry: Registry, scope: Reques
       },
       async (args) => {
         try {
-          const ctx = toolContext(scope);
+          const ctx = toolContext(scope, registry.providers);
           await checkRate(def, ctx);
           const pending = await gateApproval(def, args, ctx);
           if (pending !== undefined) return okResult(pending);
           return okResult(await def.handler(args as never, ctx));
         } catch (e) {
+          if (!(e instanceof ToolError)) console.error(internalErrorLine(def.name, e, args));
           return toToolResult(e);
         }
       },

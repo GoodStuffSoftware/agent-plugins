@@ -40,7 +40,7 @@ describe("request headers", () => {
 });
 
 describe.each(KINDS)("%s endpoint", (kind) => {
-  it("initializes, lists whoami and runs it", async () => {
+  it("initializes, lists whoami and the account tools, and runs whoami", async () => {
     const ownerId = randomId("o_");
     const token = await mintToken({ kind, scopes: SCOPES[kind], ownerId });
 
@@ -52,7 +52,7 @@ describe.each(KINDS)("%s endpoint", (kind) => {
 
     const list = await mcpRpc(token, kind, "tools/list", {});
     const tools = list.result?.tools as { name: string }[];
-    expect(tools.map((t) => t.name)).toEqual(["whoami"]);
+    expect(tools.map((t) => t.name)).toEqual(["whoami", "list_accounts", "link_account_url"]);
     expect(tools[0]).toMatchObject({
       name: "whoami",
       inputSchema: { type: "object", properties: {} },
