@@ -88,7 +88,7 @@ export async function mcpRpc(
 /** The parsed JSON of a tool result's single text block. */
 export function toolJson(result: Record<string, unknown> | undefined): unknown {
   const content = result?.content as { type: string; text: string }[] | undefined;
-  if (!content || content.length !== 1 || content[0]?.type !== "text") {
+  if (content?.length !== 1 || content[0]?.type !== "text") {
     throw new Error(`expected one text block, got ${JSON.stringify(result)}`);
   }
   return JSON.parse(content[0].text);

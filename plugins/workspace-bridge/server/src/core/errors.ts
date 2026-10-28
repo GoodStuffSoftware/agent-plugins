@@ -51,7 +51,13 @@ export function toToolResult(e: unknown): CallToolResult {
   // `details` never overrides the code or the message.
   error.code = err.code;
   error.message = err.message;
-  return { isError: true, content: [{ type: "text", text: JSON.stringify({ error }) }] };
+  let text: string;
+  try {
+    text = JSON.stringify({ error });
+  } catch {
+    text = JSON.stringify({ error: { code: "internal", message: INTERNAL_MESSAGE } });
+  }
+  return { isError: true, content: [{ type: "text", text }] };
 }
 
 /** A successful call: one text block of compact JSON, no `structuredContent` in v1. */

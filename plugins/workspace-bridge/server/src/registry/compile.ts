@@ -103,7 +103,8 @@ export function compileRegistry(families: readonly Family[]): Registry {
         inputSchema: { type: "object", ...json } as Tool["inputSchema"],
         annotations: def.annotations,
       };
-      const compiled: CompiledTool = deepFreeze({
+      // Shallow at the top: the definition and its zod schema stay unfrozen (zod caches lazily).
+      const compiled: CompiledTool = Object.freeze({
         def,
         schema: precomputed(def.input, deepFreeze(json)),
         listed: deepFreeze(listed),

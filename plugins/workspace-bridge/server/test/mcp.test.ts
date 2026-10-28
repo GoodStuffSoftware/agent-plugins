@@ -1,5 +1,9 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
+import {
+  CLIENT_CAPABILITIES_META_KEY,
+  PROTOCOL_VERSION_META_KEY,
+} from "@modelcontextprotocol/server";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import { KINDS, type Kind, resourceUrl, SCOPES, SERVER_NAME } from "../src/auth/endpoints";
@@ -130,6 +134,7 @@ async function direct(
   method: string,
   params: Record<string, unknown>,
   audience = resourceUrl(kind, ISSUER),
+  headers: Record<string, string> = {},
 ): Promise<Response> {
   const ownerId = randomId("o_");
   const ctx = Object.assign(createExecutionContext(), {
@@ -143,7 +148,7 @@ async function direct(
     },
   });
   const res = await mcpHandler(kind, ISSUER, testRegistry)(
-    mcpRequest(undefined, kind, method, params),
+    mcpRequest(undefined, kind, method, params, headers),
     env,
     ctx,
   );
@@ -260,6 +265,39 @@ describe("tool results", () => {
     });
     expect(res.result?.isError).toBe(true);
     expect(toolJson(res.result)).toMatchObject({ error: { code: "internal" } });
+  });
+});
+
+describe("2026-07-28 lane", () => {
+  const MODERN = "2026-07-28";
+  const modern = (name: string) => ({
+    params: {
+      name,
+      arguments: {},
+      _meta: {
+        [PROTOCOL_VERSION_META_KEY]: MODERN,
+        [CLIENT_CAPABILITIES_META_KEY]: {},
+      },
+    },
+    headers: { "MCP-Protocol-Version": MODERN, "Mcp-Method": "tools/call", "Mcp-Name": name },
+  });
+
+  it("runs whoami through the Worker", async () => {
+    const ownerId = randomId("o_");
+    const token = await mintToken({ kind: "full", scopes: ["mail.read"], ownerId });
+    const w = modern("whoami");
+    const res = await exports.default.fetch(
+      mcpRequest(token, "full", "tools/call", w.params, w.headers),
+    );
+    expect(res.status).toBe(200);
+    expect(toolJson((await parseMcp(res)).result)).toMatchObject({ ownerId, kind: "full" });
+  });
+
+  it("answers 403 for a tool whose scope the grant lacks", async () => {
+    const s = modern("test_send");
+    const res = await direct("full", ["mail.read"], "tools/call", s.params, undefined, s.headers);
+    expect(res.status).toBe(403);
+    expect(res.headers.get("WWW-Authenticate")).toContain('error="insufficient_scope"');
   });
 });
 

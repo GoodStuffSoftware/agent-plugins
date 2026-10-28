@@ -7,12 +7,12 @@ import type { Registry } from "./compile";
 import { checkRate, gateApproval, type RequestScope, toolContext } from "./context";
 
 export function registerAll(server: McpServer, registry: Registry, scope: RequestScope): void {
-  for (const { def, schema, challenge } of registry.byKind[scope.kind]) {
+  for (const { def, schema, listed, challenge } of registry.byKind[scope.kind]) {
     server.registerTool(
       def.name,
       {
         title: def.title,
-        description: def.description,
+        description: listed.description,
         inputSchema: schema,
         annotations: def.annotations,
         scopeChallenge: challenge,
