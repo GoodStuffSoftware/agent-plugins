@@ -195,10 +195,21 @@ async function approvalBody(env: Env, row: PendingActionRow, csrf: string): Prom
 </dl>
 <h2>Preview</h2>
 <pre>${JSON.stringify(info.preview, null, 2) ?? "null"}</pre>
+<h2>Exact arguments</h2>
+<p>This is what runs if you approve, whatever the preview says.</p>
+<pre>${storedArgs(row.params)}</pre>
 ${decide}
 ${result}
 <p><a href="/accounts">Accounts</a></p>`;
 }
+
+const MAX_ARGS_SHOWN = 20_000;
+/** The stored call's arguments as the handler will get them, clipped for the page. */
+const storedArgs = (params: string): string => {
+  const call = parseStoredCall(params);
+  const text = call ? (JSON.stringify(call.args, null, 2) ?? "null") : "(unreadable)";
+  return text.length > MAX_ARGS_SHOWN ? `${text.slice(0, MAX_ARGS_SHOWN)}\n(clipped)` : text;
+};
 
 const addresses = (json: string | null): string => {
   if (json === null) return "";
@@ -248,25 +259,40 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
         `This action is ${pendingInfo(existing, now).status} and can no longer be approved or rejected.`,
       );
     }
-    await writeAudit(env.DB, {
-      at: now,
-      ownerId: session.ownerId,
-      accountId: row.account_id,
-      tool: row.tool,
-      clientId: row.client_id,
-      grantId: row.grant_id,
-      result: status,
-      detail: `pending action ${row.id}`,
-    });
+    // The decision is recorded; from here every path settles the row, so an approved action
+    // never stays `approved` without a result.
+    try {
+      await writeAudit(env.DB, {
+        at: now,
+        ownerId: session.ownerId,
+        accountId: row.account_id,
+        tool: row.tool,
+        clientId: row.client_id,
+        grantId: row.grant_id,
+        result: status,
+        detail: `pending action ${row.id}`,
+      });
+    } catch (e) {
+      console.error(internalErrorLine("approval audit", e, {}));
+    }
     if (status === "rejected") {
       return message(200, "Rejected", "The action was rejected and will not run.");
     }
-    const outcome = await runApproved(
-      env,
-      c.executionCtx as unknown as ExecutionContext,
-      registry,
-      row,
-    );
+    let outcome: Outcome;
+    try {
+      outcome = await runApproved(
+        env,
+        c.executionCtx as unknown as ExecutionContext,
+        registry,
+        row,
+      );
+    } catch (e) {
+      console.error(internalErrorLine(row.tool, e, {}));
+      await finishPending(env.DB, row.id, "failed", {
+        error: { code: "internal", message: INTERNAL_MESSAGE },
+      });
+      outcome = { ok: false, message: INTERNAL_MESSAGE };
+    }
     return outcome.ok
       ? message(
           200,
@@ -303,8 +329,8 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     const env = c.env;
     const session = await readSession(c.req.raw, env);
     if (!session) return signIn(env, "/accounts/audit");
-    const raw = c.req.query("before");
-    const before = raw !== undefined && /^\d{1,12}$/.test(raw) ? Number(raw) : undefined;
+    const raw = c.req.query("before")?.match(/^(\d{1,12})-(\d{1,15})$/);
+    const before = raw ? { at: Number(raw[1]), id: Number(raw[2]) } : undefined;
     const rows = await readAudit(env.DB, session.ownerId, { limit: 100, before });
     const labels = new Map(
       (await listAccounts(env.DB, session.ownerId)).map((a) => [a.id, a.label]),
@@ -337,7 +363,7 @@ ${rows.map(
 )}
 </tbody>
 </table>
-${rows.length === 100 && last ? html`<p><a href="/accounts/audit?before=${last.at}">Older entries</a></p>` : ""}
+${rows.length === 100 && last ? html`<p><a href="/accounts/audit?before=${last.at}-${last.id}">Older entries</a></p>` : ""}
 <p><a href="/accounts">Accounts</a></p>`;
     return noStore(htmlResponse(page("Sending and audit log", body)));
   });

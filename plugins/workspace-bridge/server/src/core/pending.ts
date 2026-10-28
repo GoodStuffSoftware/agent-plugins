@@ -150,6 +150,11 @@ export function decidePending(
 }
 
 /** Records how an approved action ended: `executed` with its result or `failed` with the error. */
+/** Actions an owner can have waiting at once, so a looping client cannot fill the database. */
+export const MAX_OPEN_PENDING = 50;
+/** Settled and expired actions (they hold full arguments, send bodies included) are kept this long. */
+export const PENDING_KEEP_SECONDS = 7 * 86400;
+
 export async function finishPending(
   db: D1Database,
   id: string,
@@ -188,6 +193,19 @@ export function createPendingActions(deps: PendingDeps): PendingActions {
       const params = JSON.stringify({ kind: deps.kind, args: input.params ?? {} });
       if (params.length > MAX_PENDING_PARAMS) {
         throw new ToolError("too_large", "This action is too large to hold for approval.");
+      }
+      const open = await first<{ n: number }>(
+        env.DB,
+        "SELECT COUNT(*) AS n FROM pending_actions WHERE owner_id = ? AND status = 'pending' AND expires_at > ?",
+        ownerId,
+        at,
+      );
+      if ((open?.n ?? 0) >= MAX_OPEN_PENDING) {
+        throw new ToolError(
+          "rate_limited",
+          `${MAX_OPEN_PENDING} actions are already waiting for approval. Ask the owner to approve or reject them first.`,
+          { retryAfterSeconds: 3600 },
+        );
       }
       const preview = input.preview ?? null;
       await run(

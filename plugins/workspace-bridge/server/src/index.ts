@@ -7,6 +7,7 @@ import { handleAuthorize } from "./auth/consent";
 import { KINDS, type Kind, PATH } from "./auth/endpoints";
 import { getAuth, REGISTER_PATH } from "./auth/server";
 import { nowSeconds } from "./core/db";
+import { PENDING_KEEP_SECONDS } from "./core/pending";
 import { config, type Env } from "./env";
 import { app } from "./web/app";
 import { withSecurityHeaders } from "./web/html";
@@ -67,7 +68,8 @@ const PURGE_ROUNDS = 5;
 
 /**
  * The daily cleanup (cron in wrangler.example.jsonc): pending actions past their expiry become
- * `expired`, and expired flow states, old rate counters and audit rows older than
+ * `expired`, settled actions a week past expiry are deleted, and expired flow states, old rate
+ * counters and audit rows older than
  * `AUDIT_RETENTION_DAYS` are deleted, in one batch; then expired OAuth grants and tokens are purged.
  */
 export async function cleanup(env: Env, now = nowSeconds()): Promise<void> {
@@ -79,6 +81,9 @@ export async function cleanup(env: Env, now = nowSeconds()): Promise<void> {
         "UPDATE pending_actions SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?",
       )
       .bind(now),
+    db
+      .prepare("DELETE FROM pending_actions WHERE status != 'pending' AND expires_at < ?")
+      .bind(now - PENDING_KEEP_SECONDS),
     db.prepare("DELETE FROM flow_states WHERE expires_at <= ?").bind(now),
     db.prepare("DELETE FROM rate_counters WHERE window_start < ?").bind(now - COUNTER_KEEP_SECONDS),
     db.prepare("DELETE FROM audit_log WHERE at < ?").bind(auditBefore),

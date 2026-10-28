@@ -28,7 +28,7 @@ export interface AuditEntry {
 export interface AuditLog {
   write(entry: AuditEntry): Promise<void>;
   /** The owner's entries, newest first; `before` is Unix seconds. */
-  read(opts?: { limit?: number; before?: number }): Promise<AuditLogRow[]>;
+  read(opts?: { limit?: number; before?: { at: number; id: number } }): Promise<AuditLogRow[]>;
 }
 
 export interface AuditDeps {
@@ -108,22 +108,26 @@ export function auditRefusedSignin(
 
 /**
  * The owner's rows and the refused sign-ins (no owner; one owner in v1), newest first. `before`
- * (Unix seconds) pages back; `limit` is 1 to 200, 50 by default.
+ * (the `at` and `id` of the last row shown) pages back; `limit` is 1 to 200, 50 by default.
  */
 export function readAudit(
   db: D1Database,
   ownerId: string,
-  opts: { limit?: number; before?: number } = {},
+  opts: { limit?: number; before?: { at: number; id: number } } = {},
 ): Promise<AuditLogRow[]> {
   const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 50), 1), 200);
-  const before = opts.before ?? null;
+  const at = opts.before?.at ?? null;
+  const id = opts.before?.id ?? null;
   return all<AuditLogRow>(
     db,
-    `SELECT * FROM audit_log WHERE (owner_id = ? OR owner_id IS NULL) AND (? IS NULL OR at < ?)
+    `SELECT * FROM audit_log WHERE (owner_id = ? OR owner_id IS NULL)
+       AND (? IS NULL OR at < ? OR (at = ? AND id < ?))
      ORDER BY at DESC, id DESC LIMIT ?`,
     ownerId,
-    before,
-    before,
+    at,
+    at,
+    at,
+    id,
     limit,
   );
 }
