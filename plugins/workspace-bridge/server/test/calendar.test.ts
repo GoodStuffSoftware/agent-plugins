@@ -655,8 +655,56 @@ describe("update_event", () => {
     const patch = calls.find((c) => c.method === "PATCH");
     expect(q(patch?.url).get("sendUpdates")).toBe("none");
     expect(body(patch?.body)).toEqual({
-      start: { dateTime: "2030-01-07T14:00:00", timeZone: "America/New_York" },
-      end: { dateTime: "2030-01-07T15:30:00-05:00", timeZone: "America/New_York" },
+      start: { dateTime: "2030-01-07T14:00:00", timeZone: "America/New_York", date: null },
+      end: { dateTime: "2030-01-07T15:30:00-05:00", timeZone: "America/New_York", date: null },
+    });
+  });
+
+  it("moving only the start of an all-day event stays all-day and keeps the day count", async () => {
+    const { ownerId } = await setup();
+    const allDay = {
+      ...fixture.event,
+      start: { date: "2030-01-07" },
+      end: { date: "2030-01-09" },
+    };
+    const calls = installGoogleRoutes([
+      { url, reply: () => googleJson(200, allDay) },
+      { method: "PATCH", url, reply: () => googleJson(200, allDay) },
+    ]);
+    const res = await call(ownerId, "update_event", { eventId: "evt1", startTime: "2030-01-10" });
+    expect(res.isError).toBe(false);
+    const patch = calls.find((c) => c.method === "PATCH");
+    expect(body(patch?.body)).toEqual({
+      start: { date: "2030-01-10", dateTime: null },
+      end: { date: "2030-01-12", dateTime: null },
+    });
+  });
+
+  it("a timed start on an all-day event needs an end", async () => {
+    const { ownerId } = await setup();
+    const allDay = { ...fixture.event, start: { date: "2030-01-07" }, end: { date: "2030-01-08" } };
+    installGoogleRoutes([{ url, reply: () => googleJson(200, allDay) }]);
+    const res = await call(ownerId, "update_event", {
+      eventId: "evt1",
+      startTime: "2030-01-07T10:00:00",
+    });
+    expect(res.json.error?.code).toBe("invalid_argument");
+  });
+
+  it("turning a timed event all-day clears dateTime", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      { method: "PATCH", url, reply: () => googleJson(200, fixture.event) },
+    ]);
+    await call(ownerId, "update_event", {
+      eventId: "evt1",
+      allDay: true,
+      startTime: "2030-01-07",
+      endTime: "2030-01-08",
+    });
+    expect(body(calls[0]?.body)).toEqual({
+      start: { date: "2030-01-07", dateTime: null },
+      end: { date: "2030-01-08", dateTime: null },
     });
   });
 
@@ -713,6 +761,20 @@ describe("delete_event", () => {
     expect(q(calls[0]?.url).get("sendUpdates")).toBe("none");
   });
 
+  it("deleting an already deleted event (410) succeeds", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([
+      {
+        method: "DELETE",
+        url: `${C}/calendars/primary/events/evt1`,
+        reply: () =>
+          googleJson(410, { error: { code: 410, message: "Resource has been deleted" } }),
+      },
+    ]);
+    const res = await call(ownerId, "delete_event", { eventId: "evt1" });
+    expect(res.isError).toBe(false);
+  });
+
   it("maps a 404", async () => {
     const { ownerId } = await setup();
     installGoogleRoutes([
@@ -746,11 +808,10 @@ describe("respond_to_event", () => {
     const patch = calls.find((c) => c.method === "PATCH");
     expect(q(patch?.url).get("sendUpdates")).toBe("none");
     const sent = body(patch?.body);
-    expect(Object.keys(sent)).toEqual(["attendees"]);
+    expect(Object.keys(sent).sort()).toEqual(["attendees", "attendeesOmitted"]);
+    expect(sent.attendeesOmitted).toBe(true);
     expect(sent.attendees).toEqual([
-      { email: "boss@example.com", displayName: "The Boss", responseStatus: "accepted" },
       { email: "work@example.com", responseStatus: "accepted", comment: "See you there" },
-      { email: "guest@example.com", displayName: "Guest", responseStatus: "needsAction" },
     ]);
   });
 

@@ -1007,6 +1007,26 @@ const updateEvent = defineTool({
         if ((e.date as string) <= (s.date as string)) e = { date: nextDay(s.date as string) };
         patch.start = s;
         patch.end = e;
+      } else if (current?.start?.date !== undefined && !(sp && ep)) {
+        // One side of an all-day event moves: stay all-day and keep the other side.
+        if ((sp && !sp.dateOnly) || (ep && !ep.dateOnly)) {
+          throw new ToolError(
+            "invalid_argument",
+            "This is an all-day event: give both startTime and endTime to make it a timed event.",
+          );
+        }
+        const curStart = current.start.date;
+        const curEnd = current.end?.date ?? nextDay(curStart);
+        const days = Math.max(1, Math.round((Date.parse(curEnd) - Date.parse(curStart)) / DAY_MS));
+        const newStart = sp ? localIso(sp).slice(0, 10) : curStart;
+        const newEnd = ep
+          ? localIso(ep).slice(0, 10)
+          : new Date(Date.parse(newStart) + days * DAY_MS).toISOString().slice(0, 10);
+        if (newEnd <= newStart) {
+          throw new ToolError("invalid_argument", "endTime must be after startTime.");
+        }
+        patch.start = { date: newStart };
+        patch.end = { date: newEnd };
       } else {
         const zone = explicitTz ?? (await tz());
         if (sp) patch.start = await eventTimeOf(sp, false, explicitTz, tz);
@@ -1016,8 +1036,6 @@ const updateEvent = defineTool({
           const len = current ? lengthOf(current) : null;
           const s = toInstantMs(sp, zone) as number;
           if (len !== null) patch.end = { dateTime: formatInTz(s + len, zone), timeZone: zone };
-          else if (current?.end?.date !== undefined)
-            patch.end = { date: nextDay(localIso(sp).slice(0, 10)) };
         }
         const sMs = sp ? (toInstantMs(sp, zone) as number) : undefined;
         const eMs = ep ? (toInstantMs(ep, zone) as number) : undefined;

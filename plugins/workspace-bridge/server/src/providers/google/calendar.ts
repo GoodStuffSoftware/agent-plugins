@@ -171,6 +171,17 @@ const WORKING_TYPE: Record<string, string> = {
   OFFICE_LOCATION: "officeLocation",
 };
 
+/** A patch is merged into the event: say which of `date` and `dateTime` the new time drops. */
+function clearOtherTimeKind(body: Record<string, unknown>): Record<string, unknown> {
+  for (const k of ["start", "end"] as const) {
+    const t = body[k] as Record<string, unknown> | undefined;
+    if (t === undefined) continue;
+    if (t.date !== undefined && t.dateTime === undefined) body[k] = { ...t, dateTime: null };
+    else if (t.dateTime !== undefined && t.date === undefined) body[k] = { ...t, date: null };
+  }
+  return body;
+}
+
 /** The Google event body for the parts of `i` that are present. */
 function toBody(i: EventInput): Record<string, unknown> {
   const body: Record<string, unknown> = {};
@@ -312,7 +323,7 @@ export const googleCalendar: CalendarService = {
     const e = await gjson<GEvent>(
       a,
       eventUrl(calendarId, eventId),
-      { method: "PATCH", json: toBody(patch) },
+      { method: "PATCH", json: clearOtherTimeKind(toBody(patch)) },
       {
         fields: EVENT_FIELDS,
         query: { sendUpdates, supportsAttachments: true, conferenceDataVersion: 1 },
@@ -323,12 +334,18 @@ export const googleCalendar: CalendarService = {
   },
 
   async deleteEvent(a, calendarId, eventId, sendUpdates) {
-    await gjson<undefined>(
-      a,
-      eventUrl(calendarId, eventId),
-      { method: "DELETE" },
-      { query: { sendUpdates } },
-    );
+    try {
+      await gjson<undefined>(
+        a,
+        eventUrl(calendarId, eventId),
+        { method: "DELETE" },
+        { query: { sendUpdates } },
+      );
+    } catch (e) {
+      // 410 Gone: the event was already deleted, which is what the caller wanted.
+      if (e instanceof ToolError && e.details?.status === 410) return;
+      throw e;
+    }
   },
 
   async respond(a, calendarId, eventId, response, sendUpdates) {
@@ -345,20 +362,20 @@ export const googleCalendar: CalendarService = {
         "This account is not an attendee of the event, so it has no response to set.",
       );
     }
-    // Google replaces the attendee list on a patch: send every entry back, change only our own.
-    const attendees = list.map((x) =>
-      x.self === true
-        ? attendeeOut({
-            ...attendeeIn(x),
-            responseStatus: response.status,
-            ...(response.comment === undefined ? {} : { comment: response.comment }),
-          })
-        : attendeeOut(attendeeIn(x)),
-    );
+    // Send only our own entry with attendeesOmitted: Google then updates just our response and
+    // leaves the other attendees as they are, even if they changed since we read the list.
+    const self = list.find((x) => x.self === true) as GAttendee;
+    const attendees = [
+      attendeeOut({
+        ...attendeeIn(self),
+        responseStatus: response.status,
+        ...(response.comment === undefined ? {} : { comment: response.comment }),
+      }),
+    ];
     const e = await gjson<GEvent>(
       a,
       eventUrl(calendarId, eventId),
-      { method: "PATCH", json: { attendees } },
+      { method: "PATCH", json: { attendees, attendeesOmitted: true } },
       { fields: EVENT_FIELDS, query: { sendUpdates } },
     );
     if (!e) throw new ToolError("upstream_error", "Google answered with an empty body.");
