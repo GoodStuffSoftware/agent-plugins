@@ -1,7 +1,7 @@
 // `GET /oauth/google/callback` (ARCHITECTURE s.1.5): consume the single-use flow state, then
 // dispatch on its kind. `signin` (M4b) checks the ID token, resolves the owner and sets the owner
-// session; `link` is M7's. `src/index.ts` routes the path here by exact match, outside Hono, and
-// adds the security headers.
+// session; `link` (M7) is `finishLink` in `link.ts`. `src/index.ts` routes the path here by exact
+// match, outside Hono, and adds the security headers.
 //
 // Every failure answers with a page and sets no cookie. A refused identity also gets a log line
 // with a keyed hash of the address, never the address.
@@ -11,6 +11,7 @@ import { config, type Env } from "../env";
 import { notConfigured, notice, redirect, signinClient } from "./consent";
 import { consumeFlow, FLOW_COOKIE, signinPayload } from "./flow-state";
 import { callbackUrl, checkIdToken, exchangeCode, type GoogleClient } from "./google-oidc";
+import { finishLink } from "./link";
 import { emailHash, resolveOwner } from "./owners";
 import { getAuth } from "./server";
 import { clearCookie, createSession } from "./session";
@@ -45,9 +46,7 @@ export async function handleCallback(
     case "signin":
       return finishSignin(req, env, client, url, flow.payload);
     case "link":
-      // M7: the link leg (plan s.4.3). It must compare the owner id stored in the flow payload
-      // with the current owner session, check LINKABLE_EMAILS, and store the Google tokens.
-      return notice(501, "Not available", "Linking a mailbox is not available yet.");
+      return finishLink(req, env, client, url, flow.payload);
   }
 }
 
