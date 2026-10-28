@@ -482,7 +482,7 @@ const shareFile = defineTool({
         to: [recipient(spec)],
         providerRef: null,
         result: "pending",
-        detail: `held for approval: role=${spec.role} type=${spec.type} file=${t.id}`,
+        detail: `approval requested: role=${spec.role} type=${spec.type} file=${t.id}`,
       });
       return {
         action: "Share a Drive file",
