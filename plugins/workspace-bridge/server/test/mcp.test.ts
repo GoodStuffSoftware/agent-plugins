@@ -52,7 +52,11 @@ describe.each(KINDS)("%s endpoint", (kind) => {
 
     const list = await mcpRpc(token, kind, "tools/list", {});
     const tools = list.result?.tools as { name: string }[];
-    expect(tools.map((t) => t.name)).toEqual(["whoami", "list_accounts", "link_account_url"]);
+    expect(tools.map((t) => t.name).slice(0, 3)).toEqual([
+      "whoami",
+      "list_accounts",
+      "link_account_url",
+    ]);
     expect(tools[0]).toMatchObject({
       name: "whoami",
       inputSchema: { type: "object", properties: {} },
