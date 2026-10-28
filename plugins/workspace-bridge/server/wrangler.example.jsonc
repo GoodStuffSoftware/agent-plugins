@@ -1,0 +1,31 @@
+// Example config. Copy to wrangler.jsonc (git-ignored) and replace every placeholder.
+// Secrets (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, TOKEN_KEK, COOKIE_SECRET,
+// OWNER_EMAILS, LINKABLE_EMAILS) are set with `wrangler secret put`, not here.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "workspace-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "workspace-bridge",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "00000000000000000000000000000000" }],
+  "observability": { "enabled": true },
+  "vars": {
+    "SEND_ENABLED": "false",
+    "SETUP_MODE": "true",
+    "SEND_REQUIRES_CONFIRM": "false",
+    "SEND_PER_HOUR": "20",
+    "SEND_PER_DAY": "100",
+    "MAX_RECIPIENTS": "20",
+    "MAX_ATTACHMENT_BYTES": "524288",
+    "MAX_SEND_ATTACHMENT_BYTES": "524288",
+    "CURRENT_KEY_VERSION": "1"
+  }
+}

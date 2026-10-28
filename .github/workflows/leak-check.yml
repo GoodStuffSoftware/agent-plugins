@@ -1,0 +1,29 @@
+name: Leak check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - name: Scan tracked files for private names
+        env:
+          PRIVATE_NAMES: ${{ secrets.PRIVATE_NAMES }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "$PRIVATE_NAMES" ] && [ "$IS_FORK" != "true" ] && [ "$ACTOR" != "dependabot[bot]" ]; then
+            echo "::error::PRIVATE_NAMES secret is empty; the leak check would pass without scanning."
+            exit 1
+          fi
+          node scripts/leak-check.mjs
