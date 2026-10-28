@@ -85,9 +85,12 @@ const GOOGLE_EVENT_TYPE: Record<string, string> = {
 const DEFAULT_EVENT_TYPES = ["default", "outOfOffice", "focusTime", "fromGmail"];
 
 const timeText = (what: string) =>
-  z.string().min(1).describe(
-    `${what} (ISO 8601, for example 2026-04-30T10:00:00). Pass the local time with no UTC offset and no trailing Z; the time zone is timeZone, else the calendar's own.`,
-  );
+  z
+    .string()
+    .min(1)
+    .describe(
+      `${what} (ISO 8601, for example 2026-04-30T10:00:00). Pass the local time with no UTC offset and no trailing Z; the time zone is timeZone, else the calendar's own.`,
+    );
 
 const attendeeInput = z.object({
   email: z.string().min(3).describe("Required. Attendee's email address."),
@@ -109,7 +112,11 @@ const guestPermissions = z.object({
   guestsCanModify: z.boolean().optional(),
   guestsCanSeeGuests: z.boolean().optional(),
 });
-const AVAILABILITY = ["AVAILABILITY_UNSPECIFIED", "AVAILABILITY_BUSY", "AVAILABILITY_FREE"] as const;
+const AVAILABILITY = [
+  "AVAILABILITY_UNSPECIFIED",
+  "AVAILABILITY_BUSY",
+  "AVAILABILITY_FREE",
+] as const;
 const visibility = z.enum(["default", "public", "private"]).optional();
 
 const hhmm = /^([01]?\d|2[0-3]):([0-5]\d)$/;
@@ -156,7 +163,10 @@ async function target(
   const dc = calId === undefined ? null : ctx.ids.parse(calId);
   const de = eventId === undefined ? null : ctx.ids.parse(eventId);
   if (dc && de && dc.shortId !== de.shortId) {
-    throw new ToolError("invalid_argument", "The calendar id and the event id belong to different accounts.");
+    throw new ToolError(
+      "invalid_argument",
+      "The calendar id and the event id belong to different accounts.",
+    );
   }
   const [a] = await ctx.accounts.resolve(selector, (dc ?? de)?.shortId);
   if (!a) throw new ToolError("account_not_found", "No linked account.");
@@ -183,7 +193,12 @@ function lengthOf(e: EventInfo): number | null {
   return Number.isNaN(d) || d <= 0 ? null : d;
 }
 
-function view(ctx: ToolContext, a: AccountRef, e: EventInfo, calId: string): Record<string, unknown> {
+function view(
+  ctx: ToolContext,
+  a: AccountRef,
+  e: EventInfo,
+  calId: string,
+): Record<string, unknown> {
   const key = accountKey(a.shortId);
   const w = (t: string | undefined, cap?: number): string | undefined =>
     t === undefined
@@ -199,7 +214,9 @@ function view(ctx: ToolContext, a: AccountRef, e: EventInfo, calId: string): Rec
     summary: w(e.summary),
     description: w(e.description, MAX_DESCRIPTION_CHARS),
     descriptionTruncated:
-      e.description !== undefined && e.description.length > MAX_DESCRIPTION_CHARS ? true : undefined,
+      e.description !== undefined && e.description.length > MAX_DESCRIPTION_CHARS
+        ? true
+        : undefined,
     location: w(e.location),
     start: e.start,
     end: e.end,
@@ -351,7 +368,8 @@ async function listAcross(ctx: ToolContext, args: ListArgs) {
       firstSkip ??= e;
     }
   }
-  if (eligible.length === 0) throw firstSkip ?? new ToolError("account_not_found", "No linked account.");
+  if (eligible.length === 0)
+    throw firstSkip ?? new ToolError("account_not_found", "No linked account.");
   const keys = eligible.map(({ a }) => accountKey(a.shortId));
 
   const query = await ctx.cursors.queryHash({
@@ -388,7 +406,8 @@ async function listAcross(ctx: ToolContext, args: ListArgs) {
         : year
           ? Math.max(today + 365 * DAY_MS, minMs + DAY_MS)
           : minMs + 7 * DAY_MS;
-      if (maxMs <= minMs) throw new ToolError("invalid_argument", "endTime must be after startTime.");
+      if (maxMs <= minMs)
+        throw new ToolError("invalid_argument", "endTime must be after startTime.");
       const page = await svc.listEvents(a, cal, {
         timeMin: new Date(minMs).toISOString(),
         timeMax: new Date(maxMs).toISOString(),
@@ -425,7 +444,7 @@ const listEvents = defineTool({
   name: "list_events",
   title: "List events",
   description:
-    "Returns events on a calendar in a time range, recurring events expanded. Default window: the start of today to seven days later; set startTime and endTime only when a range was asked for. Use fullText for a keyword filter. With account \"all\" the primary calendars of every account are merged by start time.",
+    'Returns events on a calendar in a time range, recurring events expanded. Default window: the start of today to seven days later; set startTime and endTime only when a range was asked for. Use fullText for a keyword filter. With account "all" the primary calendars of every account are merged by start time.',
   component: "calendar",
   scopes: ["calendar"],
   endpoints: ["full", "ro"],
@@ -433,14 +452,46 @@ const listEvents = defineTool({
   untrusted: true,
   input: z.object({
     calendarId,
-    startTime: z.string().optional().describe("Lower bound (ISO 8601, local time, no offset). Default: the start of today."),
-    endTime: z.string().optional().describe("Upper bound (ISO 8601, local time, no offset). Default: the lower bound plus 7 days."),
-    fullText: z.string().optional().describe("Case-insensitive text matched against title, description, location and attendees."),
-    eventType: z.array(z.enum(EVENT_TYPES)).optional().describe("Event types to return. Default: DEFAULT, OUT_OF_OFFICE, FOCUS_TIME, FROM_GMAIL."),
-    orderBy: z.enum(["default", "startTime", "startTimeDesc", "lastModified"]).optional().describe("default and startTime: start time ascending. lastModified: last change ascending. startTimeDesc is not supported."),
-    pageSize: z.number().int().min(1).max(250).optional().describe("Default 100, max 250. 10 is plenty for most questions."),
+    startTime: z
+      .string()
+      .optional()
+      .describe("Lower bound (ISO 8601, local time, no offset). Default: the start of today."),
+    endTime: z
+      .string()
+      .optional()
+      .describe(
+        "Upper bound (ISO 8601, local time, no offset). Default: the lower bound plus 7 days.",
+      ),
+    fullText: z
+      .string()
+      .optional()
+      .describe(
+        "Case-insensitive text matched against title, description, location and attendees.",
+      ),
+    eventType: z
+      .array(z.enum(EVENT_TYPES))
+      .optional()
+      .describe("Event types to return. Default: DEFAULT, OUT_OF_OFFICE, FOCUS_TIME, FROM_GMAIL."),
+    orderBy: z
+      .enum(["default", "startTime", "startTimeDesc", "lastModified"])
+      .optional()
+      .describe(
+        "default and startTime: start time ascending. lastModified: last change ascending. startTimeDesc is not supported.",
+      ),
+    pageSize: z
+      .number()
+      .int()
+      .min(1)
+      .max(250)
+      .optional()
+      .describe("Default 100, max 250. 10 is plenty for most questions."),
     pageToken: z.string().optional().describe("nextPageToken of the previous page."),
-    timeZone: z.string().optional().describe("IANA zone for startTime, endTime and the times in the answer. Default: the calendar's own."),
+    timeZone: z
+      .string()
+      .optional()
+      .describe(
+        "IANA zone for startTime, endTime and the times in the answer. Default: the calendar's own.",
+      ),
     account: accountAll,
   }),
   handler: (args, ctx) =>
@@ -464,7 +515,7 @@ const searchEvents = defineTool({
   name: "search_events",
   title: "Search events",
   description:
-    "Searches events on the primary calendar by text (title, description, location, attendees; every word must match). Looks one year back and one year ahead of today unless startTime and endTime are given. With account \"all\" the primary calendars of every account are merged by start time.",
+    'Searches events on the primary calendar by text (title, description, location, attendees; every word must match). Looks one year back and one year ahead of today unless startTime and endTime are given. With account "all" the primary calendars of every account are merged by start time.',
   component: "calendar",
   scopes: ["calendar"],
   endpoints: ["full", "ro"],
@@ -476,7 +527,10 @@ const searchEvents = defineTool({
     endTime: z.string().optional().describe("Upper bound (ISO 8601, local time, no offset)."),
     pageSize: z.number().int().min(1).max(250).optional().describe("Default 100, max 250."),
     pageToken: z.string().optional().describe("nextPageToken of the previous page."),
-    timeZone: z.string().optional().describe("IANA zone for startTime and endTime. Default: the calendar's own."),
+    timeZone: z
+      .string()
+      .optional()
+      .describe("IANA zone for startTime and endTime. Default: the calendar's own."),
     account: accountAll,
   }),
   handler: (args, ctx) =>
@@ -529,19 +583,40 @@ const suggestTime = defineTool({
   endpoints: ["full", "ro"],
   annotations: { readOnlyHint: true, openWorldHint: false },
   input: z.object({
-    attendeeEmails: z.array(z.string().min(3)).min(1).max(50).describe("Required. Calendars (email addresses) to find common free time for."),
+    attendeeEmails: z
+      .array(z.string().min(3))
+      .min(1)
+      .max(50)
+      .describe("Required. Calendars (email addresses) to find common free time for."),
     startTime: timeText("Required. Start of the range to search"),
     endTime: timeText("Required. End of the range to search"),
-    durationMinutes: z.number().int().min(5).max(480).optional().describe("Minimum length of a slot. Default 30."),
+    durationMinutes: z
+      .number()
+      .int()
+      .min(5)
+      .max(480)
+      .optional()
+      .describe("Minimum length of a slot. Default 30."),
     preferences: z
       .object({
         startHour: z.string().optional().describe('Earliest slot start as "HH:mm". Default 09:00.'),
         endHour: z.string().optional().describe('Latest slot end as "HH:mm". Default 17:00.'),
         excludeWeekends: z.boolean().optional(),
-        pageSize: z.number().int().min(1).max(50).optional().describe("Max slots to return. Default 5."),
+        pageSize: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Max slots to return. Default 5."),
       })
       .optional(),
-    timeZone: z.string().optional().describe("IANA zone for the range, the working hours and the answer. Default: the primary calendar's."),
+    timeZone: z
+      .string()
+      .optional()
+      .describe(
+        "IANA zone for the range, the working hours and the answer. Default: the primary calendar's.",
+      ),
     account,
   }),
   async handler(args, ctx) {
@@ -549,7 +624,11 @@ const suggestTime = defineTool({
     if (!a) throw new ToolError("account_not_found", "No linked account.");
     const svc = ctx.use(CALENDAR, a);
     const prefs = args.preferences ?? {};
-    const hour = (text: string | undefined, dflt: [number, number], field: string): [number, number] => {
+    const hour = (
+      text: string | undefined,
+      dflt: [number, number],
+      field: string,
+    ): [number, number] => {
       if (text === undefined) return dflt;
       const m = hhmm.exec(text);
       if (!m) throw new ToolError("invalid_argument", `${field} must be "HH:mm" (24-hour).`);
@@ -563,9 +642,13 @@ const suggestTime = defineTool({
     const tz = checkZone(args.timeZone) ?? (await svc.calendarTimeZone(a, "primary"));
     const startMs = toInstantMs(parseOrThrow(args.startTime, "startTime"), tz) as number;
     const endMs = toInstantMs(parseOrThrow(args.endTime, "endTime"), tz) as number;
-    if (endMs <= startMs) throw new ToolError("invalid_argument", "endTime must be after startTime.");
+    if (endMs <= startMs)
+      throw new ToolError("invalid_argument", "endTime must be after startTime.");
     if (endMs - startMs > MAX_FREEBUSY_DAYS * DAY_MS) {
-      throw new ToolError("invalid_argument", `The range may be at most ${MAX_FREEBUSY_DAYS} days.`);
+      throw new ToolError(
+        "invalid_argument",
+        `The range may be at most ${MAX_FREEBUSY_DAYS} days.`,
+      );
     }
     const durMs = (args.durationMinutes ?? 30) * 60_000;
     const wanted = prefs.pageSize ?? 5;
@@ -643,7 +726,10 @@ function nextDay(date: string): string {
   return new Date(Date.parse(`${date}T00:00:00Z`) + DAY_MS).toISOString().slice(0, 10);
 }
 
-function attendeesOf(list: readonly AttendeeIn[] | undefined, emails: readonly string[] | undefined): EventAttendee[] {
+function attendeesOf(
+  list: readonly AttendeeIn[] | undefined,
+  emails: readonly string[] | undefined,
+): EventAttendee[] {
   const out: EventAttendee[] = [];
   const seen = new Set<string>();
   const add = (x: EventAttendee) => {
@@ -709,7 +795,12 @@ const createEvent = defineTool({
     startTime: timeText("Required. Start time"),
     endTime: timeText("Required. End time"),
     calendarId,
-    allDay: z.boolean().optional().describe("The event spans whole days; the dates of startTime and endTime are used (the end date is exclusive)."),
+    allDay: z
+      .boolean()
+      .optional()
+      .describe(
+        "The event spans whole days; the dates of startTime and endTime are used (the end date is exclusive).",
+      ),
     timeZone: z.string().optional().describe("IANA zone, only when the user named one."),
     description: z.string().optional(),
     location: z.string().optional(),
@@ -724,11 +815,21 @@ const createEvent = defineTool({
     guestPermissions: guestPermissions.optional(),
     overrideReminders: z.array(reminderInput).optional(),
     useDefaultReminders: z.boolean().optional(),
-    recurrenceData: z.array(z.string()).optional().describe("RRULE, RDATE or EXDATE lines (RFC 5545)."),
+    recurrenceData: z
+      .array(z.string())
+      .optional()
+      .describe("RRULE, RDATE or EXDATE lines (RFC 5545)."),
     visibility,
     workingLocationProperties: z
       .object({
-        type: z.enum(["WORKING_LOCATION_TYPE_UNSPECIFIED", "HOME_OFFICE", "CUSTOM_LOCATION", "OFFICE_LOCATION"]).optional(),
+        type: z
+          .enum([
+            "WORKING_LOCATION_TYPE_UNSPECIFIED",
+            "HOME_OFFICE",
+            "CUSTOM_LOCATION",
+            "OFFICE_LOCATION",
+          ])
+          .optional(),
         customLocationLabel: z.string().optional(),
         officeLocation: z
           .object({
@@ -759,9 +860,12 @@ const createEvent = defineTool({
     const start = await eventTimeOf(sp, allDay, explicitTz, tz);
     let end = await eventTimeOf(ep, allDay, explicitTz, tz);
     if (allDay) {
-      if ((end.date as string) <= (start.date as string)) end = { date: nextDay(start.date as string) };
+      if ((end.date as string) <= (start.date as string))
+        end = { date: nextDay(start.date as string) };
     } else {
-      const zone = explicitTz ?? (sp.offsetMinutes === undefined || ep.offsetMinutes === undefined ? await tz() : undefined);
+      const zone =
+        explicitTz ??
+        (sp.offsetMinutes === undefined || ep.offsetMinutes === undefined ? await tz() : undefined);
       const s = toInstantMs(sp, zone);
       const e = toInstantMs(ep, zone);
       if (s !== null && e !== null && e <= s) {
@@ -829,7 +933,10 @@ const updateEvent = defineTool({
     summary: z.string().optional(),
     startTime: z.string().optional().describe("New start (ISO 8601, local time, no offset)."),
     endTime: z.string().optional().describe("New end (ISO 8601, local time, no offset)."),
-    allDay: z.boolean().optional().describe("Make the event all-day; startTime and endTime are then required."),
+    allDay: z
+      .boolean()
+      .optional()
+      .describe("Make the event all-day; startTime and endTime are then required."),
     timeZone: z.string().optional().describe("IANA zone, only when the user named one."),
     description: z.string().optional(),
     location: z.string().optional(),
@@ -870,7 +977,9 @@ const updateEvent = defineTool({
       removedUrls.size > 0 ||
       (args.startTime !== undefined) !== (args.endTime !== undefined);
     const current = needsCurrent ? await svc.getEvent(t.a, t.cal, eventId) : undefined;
-    const tz = lazy(async () => current?.start?.timeZone ?? (await svc.calendarTimeZone(t.a, t.cal)));
+    const tz = lazy(
+      async () => current?.start?.timeZone ?? (await svc.calendarTimeZone(t.a, t.cal)),
+    );
 
     const patch: EventInput = defined({
       summary: args.summary,
@@ -907,7 +1016,8 @@ const updateEvent = defineTool({
           const len = current ? lengthOf(current) : null;
           const s = toInstantMs(sp, zone) as number;
           if (len !== null) patch.end = { dateTime: formatInTz(s + len, zone), timeZone: zone };
-          else if (current?.end?.date !== undefined) patch.end = { date: nextDay(localIso(sp).slice(0, 10)) };
+          else if (current?.end?.date !== undefined)
+            patch.end = { date: nextDay(localIso(sp).slice(0, 10)) };
         }
         const sMs = sp ? (toInstantMs(sp, zone) as number) : undefined;
         const eMs = ep ? (toInstantMs(ep, zone) as number) : undefined;
@@ -926,7 +1036,8 @@ const updateEvent = defineTool({
     if (addAtt.length > 0 || removed.size > 0) {
       const byEmail = new Map<string, EventAttendee>();
       for (const x of current?.attendees ?? []) byEmail.set(x.email.toLowerCase(), x);
-      for (const x of addAtt) byEmail.set(x.email.toLowerCase(), { ...byEmail.get(x.email.toLowerCase()), ...x });
+      for (const x of addAtt)
+        byEmail.set(x.email.toLowerCase(), { ...byEmail.get(x.email.toLowerCase()), ...x });
       for (const e of removed) byEmail.delete(e);
       patch.attendees = [...byEmail.values()];
     }
@@ -936,7 +1047,10 @@ const updateEvent = defineTool({
       patch.attachments = [...kept, ...addAttach.filter((x) => !have.has(x.fileUrl))];
     }
     if (Object.keys(patch).length === 0) {
-      throw new ToolError("invalid_argument", "Nothing to change: give at least one field to update.");
+      throw new ToolError(
+        "invalid_argument",
+        "Nothing to change: give at least one field to update.",
+      );
     }
     const sendUpdates = sendUpdatesOf(args.notificationLevel);
     const e = await svc.updateEvent(t.a, t.cal, eventId, patch, sendUpdates);
@@ -989,7 +1103,9 @@ const respondToEvent = defineTool({
   untrusted: true,
   input: z.object({
     eventId: z.string().min(1).describe("Required. The id of the event to respond to."),
-    responseStatus: z.enum(["accepted", "declined", "tentative"]).describe("Required. accepted, declined or tentative."),
+    responseStatus: z
+      .enum(["accepted", "declined", "tentative"])
+      .describe("Required. accepted, declined or tentative."),
     responseComment: z.string().optional().describe("A comment sent with the response."),
     calendarId,
     notificationLevel,
@@ -998,13 +1114,15 @@ const respondToEvent = defineTool({
   async handler(args, ctx) {
     const t = await target(ctx, args.account, args.calendarId, args.eventId);
     const sendUpdates = sendUpdatesOf(args.notificationLevel);
-    const e = await ctx.use(CALENDAR, t.a).respond(
-      t.a,
-      t.cal,
-      t.event as string,
-      defined({ status: args.responseStatus, comment: args.responseComment }),
-      sendUpdates,
-    );
+    const e = await ctx
+      .use(CALENDAR, t.a)
+      .respond(
+        t.a,
+        t.cal,
+        t.event as string,
+        defined({ status: args.responseStatus, comment: args.responseComment }),
+        sendUpdates,
+      );
     return { event: view(ctx, t.a, e, t.cal), notified: sendUpdates };
   },
 });

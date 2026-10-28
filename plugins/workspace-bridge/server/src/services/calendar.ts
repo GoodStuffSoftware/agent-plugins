@@ -275,7 +275,10 @@ export function tzOffsetMs(ms: number, tz: string): number {
 }
 
 /** The instant at which `tz` shows the wall-clock time `p` (the later one in a repeated hour). */
-export function zonedToMs(p: Pick<ParsedTime, "y" | "m" | "d" | "h" | "mi" | "s">, tz: string): number {
+export function zonedToMs(
+  p: Pick<ParsedTime, "y" | "m" | "d" | "h" | "mi" | "s">,
+  tz: string,
+): number {
   const wall = Date.UTC(p.y, p.m - 1, p.d, p.h, p.mi, p.s);
   let ms = wall - tzOffsetMs(wall, tz);
   const again = wall - tzOffsetMs(ms, tz);

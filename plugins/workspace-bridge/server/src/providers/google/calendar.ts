@@ -8,7 +8,6 @@ import type {
   EventInfo,
   EventInput,
   EventTime,
-  SendUpdates,
 } from "../../services/calendar";
 import { gjson } from "./http";
 
@@ -128,8 +127,7 @@ function attendeeOut(a: EventAttendee): GAttendee {
 
 function toEvent(e: GEvent): EventInfo {
   const meet =
-    e.hangoutLink ??
-    e.conferenceData?.entryPoints?.find((p) => p.entryPointType === "video")?.uri;
+    e.hangoutLink ?? e.conferenceData?.entryPoints?.find((p) => p.entryPointType === "video")?.uri;
   const guest = defined({
     guestsCanInviteOthers: e.guestsCanInviteOthers,
     guestsCanModify: e.guestsCanModify,
@@ -156,7 +154,10 @@ function toEvent(e: GEvent): EventInfo {
     reminders:
       e.reminders === undefined
         ? undefined
-        : defined({ useDefault: e.reminders.useDefault === true, overrides: e.reminders.overrides }),
+        : defined({
+            useDefault: e.reminders.useDefault === true,
+            overrides: e.reminders.overrides,
+          }),
     colorId: e.colorId,
     guestPermissions: Object.keys(guest).length > 0 ? guest : undefined,
     created: e.created,
@@ -182,7 +183,10 @@ function toBody(i: EventInput): Record<string, unknown> {
   if (i.recurrence !== undefined) body.recurrence = i.recurrence;
   if (i.attachments !== undefined) body.attachments = i.attachments;
   if (i.reminders !== undefined) {
-    body.reminders = defined({ useDefault: i.reminders.useDefault, overrides: i.reminders.overrides });
+    body.reminders = defined({
+      useDefault: i.reminders.useDefault,
+      overrides: i.reminders.overrides,
+    });
   }
   if (i.colorId !== undefined) body.colorId = i.colorId;
   if (i.visibility !== undefined) body.visibility = i.visibility;
