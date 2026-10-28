@@ -1,0 +1,36 @@
+{
+  "sent": { "id": "m_sent", "threadId": "t_sent", "labelIds": ["SENT"] },
+  "sendAs": {
+    "sendAs": [
+      { "sendAsEmail": "work@example.com", "isPrimary": true, "isDefault": true, "verificationStatus": "accepted" },
+      { "sendAsEmail": "alias@example.com", "displayName": "Team Alias", "verificationStatus": "accepted" },
+      { "sendAsEmail": "unverified@example.com", "verificationStatus": "pending" }
+    ]
+  },
+  "original": {
+    "id": "m_orig",
+    "threadId": "t_orig",
+    "headers": {
+      "Message-ID": "<orig-1@mail.example.net>",
+      "References": "<root-0@mail.example.net>",
+      "Subject": "Quarterly plan",
+      "From": "Sam Sender <sam@example.net>",
+      "To": "work@example.com, pat@example.net",
+      "Cc": "kim@example.net, alias@example.com",
+      "Date": "Mon, 26 Oct 2026 09:00:00 +0000"
+    },
+    "text": "Here is the plan for next quarter.\nSecond line."
+  },
+  "draft": {
+    "id": "d1",
+    "message": {
+      "payload": {
+        "headers": [
+          { "name": "From", "value": "work@example.com" },
+          { "name": "To", "value": "dan@example.net" },
+          { "name": "Subject", "value": "Draft subject" }
+        ]
+      }
+    }
+  }
+}
