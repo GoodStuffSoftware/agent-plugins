@@ -1,11 +1,14 @@
-// Fake Google for the sign-in tests (ARCHITECTURE s.6): `fetch` is stubbed, and only Google's
-// token endpoint answers. It checks the client credentials, the redirect URI and the PKCE
-// verifier, uses each code once, and returns an unsigned ID token with test claims. Any other
-// outgoing request fails the test.
+// Fake Google (ARCHITECTURE s.6). For the sign-in tests `fetch` is stubbed and only Google's
+// token endpoint answers: it checks the client credentials, the redirect URI and the PKCE
+// verifier, uses each code once, and returns an unsigned ID token with test claims. For tool
+// tests, `installGoogleRoutes` answers a route table of Google API URLs and `linkGoogleAccount`
+// seeds a linked account with sealed tokens. Any other outgoing request fails the test.
 
+import { env } from "cloudflare:workers";
 import { vi } from "vitest";
 import { GOOGLE_AUTHORIZE_URL, GOOGLE_TOKEN_URL } from "../../src/auth/google-oidc";
-import { base64url, randomBytes, sha256 } from "../../src/core/crypto";
+import { base64url, randomBytes, randomId, seal, sha256 } from "../../src/core/crypto";
+import { type AccountRow, insertAccount, nowSeconds, upsertToken } from "../../src/core/db";
 
 export const GOOGLE_CLIENT_ID = "test-client";
 export const GOOGLE_CLIENT_SECRET = "test-secret";
@@ -112,4 +115,121 @@ export function installFakeGoogle(): FakeGoogle {
     throw new Error(`unexpected fetch: ${req.method} ${req.url}`);
   });
   return google;
+}
+
+/** One route of the fake Google APIs. */
+export interface GoogleRoute {
+  /** `GET` by default. */
+  method?: string;
+  /** Matched against the URL without its query; a trailing `*` matches a prefix. */
+  url: string;
+  /** `n` counts the calls this route has answered before, from 0. */
+  reply: (req: Request, n: number) => Response | Promise<Response>;
+}
+
+/** A request the fake answered: what a test may assert on. */
+export interface GoogleCall {
+  method: string;
+  /** The full URL, query included. */
+  url: string;
+  authorization: string | null;
+  body: string;
+}
+
+/** A Google JSON answer, such as an error body `{ error: { code, status, errors } }`. */
+export const googleJson = (
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Response =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...headers },
+  });
+
+/** The token endpoint's answer to a refresh: `access_token` is the token handed out. */
+export const tokenRoute = (access_token: string): GoogleRoute => ({
+  method: "POST",
+  url: GOOGLE_TOKEN_URL,
+  reply: () =>
+    googleJson(200, { access_token, expires_in: 3599, token_type: "Bearer", scope: "openid" }),
+});
+
+/**
+ * Stubs `fetch` with a route table; restore with `vi.restoreAllMocks()`. The first matching route
+ * answers; an unmatched request throws. Returns the calls made, in order.
+ */
+export function installGoogleRoutes(routes: readonly GoogleRoute[]): GoogleCall[] {
+  const calls: GoogleCall[] = [];
+  const counts = new Map<GoogleRoute, number>();
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const req = new Request(input, init);
+    const url = new URL(req.url);
+    const bare = url.origin + url.pathname;
+    calls.push({
+      method: req.method,
+      url: req.url,
+      authorization: req.headers.get("Authorization"),
+      body: await req.clone().text(),
+    });
+    const route = routes.find(
+      (r) =>
+        (r.method ?? "GET") === req.method &&
+        (r.url.endsWith("*") ? bare.startsWith(r.url.slice(0, -1)) : bare === r.url),
+    );
+    if (!route) throw new Error(`unexpected fetch: ${req.method} ${req.url}`);
+    const n = counts.get(route) ?? 0;
+    counts.set(route, n + 1);
+    return route.reply(req, n);
+  });
+  return calls;
+}
+
+/** A new owner row; storage is not rolled back between tests, so each test makes its own. */
+export async function newOwner(): Promise<string> {
+  const id = randomId("o_");
+  await env.DB.prepare("INSERT INTO owners (id, created_at) VALUES (?, 0)").bind(id).run();
+  return id;
+}
+
+export interface LinkedGoogle {
+  row: AccountRow;
+  accessToken: string;
+  refreshToken: string;
+}
+
+/**
+ * A linked Google account with sealed tokens: an access token valid for an hour, so the first
+ * call needs no refresh, and a refresh token. Components default to every component, with the
+ * scopes stored as granted.
+ */
+export async function linkGoogleAccount(
+  ownerId: string,
+  opts: { label?: string; components?: readonly string[]; grantedScopes?: string } = {},
+): Promise<LinkedGoogle> {
+  const label = opts.label ?? "work";
+  const row = await insertAccount(env.DB, {
+    ownerId,
+    label,
+    address: `${label}@example.com`,
+    provider: "google",
+    components: opts.components ?? ["mail", "mail.send", "calendar", "files", "contacts"],
+    grantedScopes: opts.grantedScopes ?? "",
+  });
+  if (!row) throw new Error("account insert failed");
+  const accessToken = `ya29.${randomId("at-")}`;
+  const refreshToken = `1//${randomId("rt-")}`;
+  const who = { ownerId, accountId: row.id };
+  await upsertToken(env.DB, {
+    accountId: row.id,
+    kind: "refresh",
+    sealed: await seal(refreshToken, { ...who, kind: "refresh" }, env),
+  });
+  await upsertToken(env.DB, {
+    accountId: row.id,
+    kind: "access",
+    sealed: await seal(accessToken, { ...who, kind: "access" }, env),
+    expiresAt: nowSeconds() + 3600,
+  });
+  return { row, accessToken, refreshToken };
 }

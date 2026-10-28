@@ -1,5 +1,7 @@
 // Account repository and selector resolution (ARCHITECTURE s.3.2, s.3.4).
 
+import type { Env } from "../env";
+import { type AccountComponent, isAccountComponent } from "../providers/google/base";
 import type { AccountRef } from "../services/types";
 import { type AccountRow, first, listAccounts } from "./db";
 import { ToolError } from "./errors";
@@ -24,6 +26,52 @@ export function toAccountRef(row: AccountRow): AccountRef {
 export async function loadAccountRefs(db: D1Database, ownerId: string): Promise<AccountRef[]> {
   return (await listAccounts(db, ownerId)).map(toAccountRef);
 }
+
+/** The enabled components in a row's `components` JSON; anything malformed counts as off. */
+export function parseComponents(json: string): AccountComponent[] {
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return Array.isArray(parsed) ? [...new Set(parsed.filter(isAccountComponent))] : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * What a tool call knows about an account it resolved, beyond the `AccountRef`: the stored row
+ * (components, granted scopes, status) and the request's `env`. `ctx.use` reads the components,
+ * the provider HTTP clients the env, ids and granted scopes. It is kept off the ref, and the ref is
+ * frozen, so a handler cannot point a ref at another account or switch a component on.
+ */
+export interface AccountState {
+  readonly row: Readonly<AccountRow>;
+  readonly components: readonly AccountComponent[];
+  readonly env: Env;
+}
+
+const states = new WeakMap<AccountRef, AccountState>();
+
+/**
+ * The owner's accounts as frozen refs, each recorded with its state. The tool context loads
+ * accounts this way, so only refs that came from `ctx.accounts` in a call reach a provider.
+ */
+export async function loadAccountsWithState(env: Env, ownerId: string): Promise<AccountRef[]> {
+  return (await listAccounts(env.DB, ownerId)).map((row) => {
+    const ref = Object.freeze(toAccountRef(row));
+    states.set(
+      ref,
+      Object.freeze({
+        row: Object.freeze({ ...row }),
+        components: Object.freeze(parseComponents(row.components)),
+        env,
+      }),
+    );
+    return ref;
+  });
+}
+
+/** The state recorded for a ref from `loadAccountsWithState`; undefined for any other object. */
+export const accountState = (a: AccountRef): AccountState | undefined => states.get(a);
 
 /** `owners.default_account_id`, or null when unset (or the owner is unknown). */
 export async function getDefaultAccountId(db: D1Database, ownerId: string): Promise<string | null> {
@@ -61,6 +109,8 @@ export interface ResolverDeps {
   ownerId: string;
   /** The issuer, for `accountsUrl`. */
   publicUrl: string;
+  /** The owner's accounts; `loadAccountRefs` by default. The tool context passes `loadAccountsWithState`. */
+  load?: () => Promise<AccountRef[]>;
 }
 
 const SHORT_ID = /^a?([1-9][0-9]{0,8})$/;
@@ -70,7 +120,7 @@ export function createAccountResolver(deps: ResolverDeps): AccountResolver {
   const accountsUrl = `${deps.publicUrl.replace(/\/+$/, "")}/accounts`;
   let loaded: Promise<AccountRef[]> | undefined;
   const accounts = (): Promise<AccountRef[]> => {
-    loaded ??= loadAccountRefs(deps.db, deps.ownerId);
+    loaded ??= deps.load ? deps.load() : loadAccountRefs(deps.db, deps.ownerId);
     return loaded;
   };
 

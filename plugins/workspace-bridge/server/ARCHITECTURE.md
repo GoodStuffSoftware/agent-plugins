@@ -257,7 +257,7 @@ Paths are under `plugins/workspace-bridge/server/`. M is the milestone that crea
 | `src/services/<cap>.ts`         | family  | One capability interface and its key per file.                                                                                                                                                                                          |
 | `src/providers/registry.ts`     | M9      | Builds providers from the families' bindings; backs `ctx.use()`.                                                                                                                                                                        |
 | `src/providers/google/base.ts`  | M7      | `ACCOUNT_COMPONENTS`, Google scopes, `scopesFor(components)`, `grantedComponents`, revoke. Authorize and token URLs are in `auth/google-oidc.ts`.                                                                                       |
-| `src/providers/google/http.ts`  | M9      | `gfetch`: bearer from the broker, `fields=`, one retry, error mapping.                                                                                                                                                                  |
+| `src/providers/google/http.ts`  | M9      | `gfetch`, `gjson`: component check, bearer, `fields=`, 401 retry, error mapping (s.3.3).                                                                                                                                                |
 | `src/providers/google/batch.ts` | M10     | Gmail batch requests (`multipart/mixed`) for metadata.                                                                                                                                                                                  |
 | `src/providers/google/<cap>.ts` | family  | One file per capability (`gmail-*`, `calendar`, `drive-*`, `people`).                                                                                                                                                                   |
 | `src/registry/types.ts`         | M5      | `ToolDef`, `ToolContext`, `Family`, `Component`; re-exports `Kind` and `Scope` from `auth/endpoints.ts`.                                                                                                                                |
@@ -310,19 +310,20 @@ export interface Family {
 export interface CompiledTool { def: ToolDef; schema: StandardSchemaWithJSON; listed: Tool; challenge: ScopeChallengeHandler }
 export interface Registry {
   byKind: Readonly<Record<Kind, readonly CompiledTool[]>>;
+  providers: ProviderRegistry;                                        // the families' bindings (s.3.6)
   listFor(kind: Kind, granted: readonly string[]): readonly Tool[];  // memo: kind + sorted scopes
 }
 export function compileRegistry(families: readonly Family[]): Registry;  // tests compile extra families
 export const REGISTRY: Registry;                                        // compileRegistry(FAMILIES)
 ```
 
-`Kind` and `Scope` are defined in `src/auth/endpoints.ts` (M4a), which the auth layer needs before M5; `registry/types.ts` re-exports them. Until M9 adds `services/`, `Family.bindings` is typed `Readonly<Record<string, readonly unknown[]>>`; M9 narrows it. `defineTool(def)` is an identity helper that types the handler's arguments from `input`.
+`Kind` and `Scope` are defined in `src/auth/endpoints.ts` (M4a), which the auth layer needs before M5; `registry/types.ts` re-exports them. `Family.bindings` is `Partial<Record<ProviderId, readonly Binding[]>>` (s.3.6); the providers are built inside `compileRegistry`, so a test registry carries its test bindings. `defineTool(def)` is an identity helper that types the handler's arguments from `input`.
 
 `compile.ts` runs `z.toJSONSchema(def.input, { target: 'draft-2020-12', io: 'input' })` once per tool, wraps the result with `precomputed()` (s.1.4) and freezes it. At load it also checks that family ids and tool names are unique, names are snake_case, every tool has an endpoint, and `scopes` is a subset of `SCOPES[k]` for every `k` in `endpoints` (which keeps `mail.send` off `ro`). A test imports the module, so a bad definition fails CI rather than production.
 
 Endpoint rule (plan s.10.6): `ro` gets read tools plus `create_draft` and `update_draft`, and no send, reply, forward, share, filter, trash or label-write tool. `admin` gets admin tools. Account and meta tools are on all three. Server names per endpoint: `workspace-bridge`, `workspace-bridge-readonly`, `workspace-bridge-admin` (plan s.4.1).
 
-`register.ts` wraps every handler in this order: per-grant rate check, `approval.when` (if true, store a pending action and return its preview), handler, error mapping. An approved pending action later runs the same handler from `/approvals/:id` with a context built from the stored grant. M5 ships `checkRate` as a no-op and `gateApproval` failing closed (`internal`) whenever `approval.when` is true; M9 and M14 fill both without moving the call sites.
+`register.ts` wraps every handler in this order: per-grant rate check, `approval.when` (if true, store a pending action and return its preview), handler, error mapping. An approved pending action later runs the same handler from `/approvals/:id` with a context built from the stored grant. `checkRate` calls `ctx.limits.call(tool)`; `gateApproval` builds `approval.preview` and returns `ctx.pending.create(...)`. Until M14 fills the stubs, the limit never trips and `create` throws `internal`, so a call that needs approval fails closed. An exception that is not a `ToolError` is logged as one redacted line before it becomes `internal` (s.3.3).
 
 **Deviation from plan (parameter names).** Plan s.8 writes params in snake_case; the captured official tools (`test/fixtures/parity/*.json`) use camelCase (`messageId`, `labelIds`, `pageToken`, `startTime`, `fileId`). Plan s.8.7 says captured names win, so tools use the official names and additions follow the same style (`account`, `maxBodyChars`, `messageOffset`). Where the official required set differs from plan s.8, the official one wins: `create_label(displayName)`, `respond_to_event(eventId, responseStatus)`, `suggest_time(attendeeEmails, startTime, endTime)`, `create_file(title)`, `share_file(fileId, role)`, and `update_message_labels(messageId)` with one message, not a list.
 
@@ -354,7 +355,7 @@ export interface ToolContext {
 }
 ```
 
-M5 implements `kind`, `ownerId`, `grant`, `publicUrl`, `env`, `now` and `waitUntil` (`registry/types.ts`, `registry/context.ts`); M9 adds the rest to both files.
+All fields exist since M9 (`registry/types.ts`, `registry/context.ts`, `toolContext(scope, registry.providers)`). `sendAs`, `audit`, `limits` and `pending` are M9 stubs with final signatures (`core/{send-as,audit,ratelimit,pending}.ts`); M14 fills the bodies. `ctx.accounts` loads the owner's accounts with `loadAccountsWithState`, which records each frozen `AccountRef` with its row, components and env in a module `WeakMap` (`accountState`). `ctx.use` and `gfetch` look the account up by object identity, so an `AccountRef` must come from `ctx.accounts` in the same call; any other object (a copy, a hand-built ref) is a programming error and ends as `internal`.
 
 `grantId` is the middle segment of the bearer token (OP:1686), read in one function (`grantIdOf`) with its own test. If the format changes, `unwrapToken()` (OP:1338) is the fallback at the cost of a KV read.
 
@@ -380,6 +381,10 @@ Handlers throw `ToolError(code, message, details?)`. The wrapper returns `{ isEr
 | `internal`                                               | broker: Google OAuth client missing or refused; anything else                             | tool error, generic message or the secret to check            | 200  |
 
 An approval is not an error: the tool returns `{ status: 'pending_approval', pendingActionId, approvalUrl, preview, expiresAt }` without `isError`. HTTP 429 appears only on `/oauth/register` (DCR limit per `CF-Connecting-IP`, plan s.4.1), with `Retry-After: 60` and body `{ "error": "temporarily_unavailable", ... }`. The SDK rejects zod failures before the handler runs, with a result that is not our error shape (pinned in `test/mcp.test.ts`): `{ content: [{ type: 'text', text: 'Input validation error: Invalid arguments for tool <name>: <path>: <message>, ...' }], isError: true }`, one `path: message` per zod issue, joined by `, `.
+
+Google answers (`providers/google/http.ts`, M9): `gfetch` first refuses an account whose component for the URL is off (`component_disabled`, nothing sent), so an implementation handed one account cannot reach another past a switched-off component. A 403 "insufficient permissions" is `component_disabled` when the account's stored `granted_scopes` never covered the component (`opts.component`, else taken from the URL), else `needs_relink`; any other 403 is `upstream_error` `{ status: 403 }`; 400 is `invalid_argument` `{ status }`; a timeout (10 s per attempt) or network failure is `upstream_error` without `status`. A 5xx is retried once except on POST, which opts in with `retry: true`, so a send never runs twice. Messages name the account (`a<shortId>`), never Google's body. `googleError` maps one status for batch parts too.
+
+Internal-error log (N3): `register.ts` logs one line per non-`ToolError`, `{"event":"tool_internal_error","tool","errorClass","message"}`, where `redactMessage` cuts every argument value, brace and bracket blocks, quoted text, email addresses and token-like runs (16+ characters), then cuts at 200 characters. No arguments, bodies, tokens or stacks.
 
 **Deviation from plan (s.10.6 test).** A forged `send_message` call on `/mcp/ro` returns `InvalidParams` "Tool not found", not 403: the tool is not registered there (SDKJ:1777), and a 403 would invite a step-up that can never succeed on that endpoint.
 
@@ -478,9 +483,26 @@ export const mailLabels: Family = {
 // Design. src/providers/registry.ts
 export interface Provider {
   id: ProviderId;
-  scopesFor(c: readonly Component[]): string[];
+  scopesFor(c: readonly AccountComponent[]): string[]; // google only; others throw until built
   get<T>(cap: Capability<T>): T | undefined;
 }
+export interface ProviderRegistry {
+  get(id: ProviderId): Provider;
+} // every id present
+export function createProviderRegistry(families: readonly Family[]): ProviderRegistry; // duplicate binding throws at load
+// src/providers/google/http.ts (M9). `a` must come from ctx.accounts; only https://*.googleapis.com.
+export function gfetch(
+  a: AccountRef,
+  url: string | URL,
+  init?: GoogleInit,
+  opts?: { fields?; query?; component?; retry? },
+): Promise<Response>;
+export function gjson<T>(
+  a: AccountRef,
+  url: string | URL,
+  init?: GoogleInit,
+  opts?: GoogleFetchOptions,
+): Promise<T>;
 // src/core/token-broker.ts (M8). AccountRef satisfies BrokerAccount { ownerId, accountId }.
 export function createTokenBroker(env: Env): TokenBroker; // cheap; state is per isolate
 export interface TokenBroker {
@@ -491,7 +513,7 @@ export interface TokenBroker {
 
 **Token broker (M8).** `accessToken(a)` returns the isolate's cached token, else the sealed D1 access token while more than 5 minutes remain (`EXPIRY_MARGIN_SECONDS`), else a refresh at Google's token endpoint with the sealed refresh token. Concurrent calls for one account share one refresh; the token request times out after 10 s (`TOKEN_TIMEOUT_MS`), and callers stop waiting for a shared refresh after 15 s (`REFRESH_WAIT_MS`), when the next call starts a new one. A refresh writes one D1 batch: the access token, plus the refresh token when Google rotated it or its row is under an older key version, all sealed under `CURRENT_KEY_VERSION` (lazy key rotation). Both writes apply only while the refresh row is still the one used, so a relink that lands meanwhile is never overwritten. A 400 `invalid_grant` marks the account `needs_relink` and deletes its access row, only if the refresh row is still the one Google refused; later calls throw `needs_relink` (`{ linkUrl: PUBLIC_URL/accounts }`) without calling Google, until a relink stores a new refresh token and sets `status` back to `ok`. Network failures, 5xx and malformed replies throw `upstream_error` and change nothing; a missing or refused Google client is `internal`. Google 401 contract: the Google HTTP client calls `invalidate(a)`, then `accessToken(a)`, and retries once; a second 401 is `needs_relink`.
 
-`ctx.use(cap, a)` checks, in order: the capability's component is on for the account (`component_disabled`), the account's provider has a binding (`not_supported_by_provider`); then it returns the implementation.
+`ctx.use(cap, a)` checks, in order: the capability's component is on for the account (`component_disabled`, `{ component, accountsUrl }`), the account's provider has a binding (`not_supported_by_provider`, `{ capability, provider }`); then it returns the implementation. `componentFor(cap)` (`registry/context.ts`) gives the account component: `mail.send` for the `mail.send` capability, `mail` for the other mail capabilities, the capability's own component otherwise. `admin` is no account component, so admin capabilities are refused until their milestone defines the check (fail closed). The component and the provider come from the stored row, read once per call. With `account: "all"`, a family calls `ctx.use` per account and skips the accounts where it throws `component_disabled` or `not_supported_by_provider`; it fails only when no account is left (the recipe in `progress.md`, M9b).
 
 Account components (`providers/google/base.ts`, M7) are `mail`, `mail.send`, `calendar`, `files` and `contacts`, stored in `accounts.components`. Sending is its own account component so a mailbox can be linked without send: `ctx.use` (M9) checks `mail.send` for the `mail.send` capability and `mail` for the other `mail.*` capabilities. Google's `scopesFor` takes account components: `mail` asks for `gmail.modify` and `gmail.settings.basic`, `mail.send` alone for `gmail.send` (covered by `gmail.modify` otherwise), `calendar` for `calendar`, `files` for `drive`, `contacts` for `contacts.readonly` and `contacts.other.readonly` (plan s.9).
 

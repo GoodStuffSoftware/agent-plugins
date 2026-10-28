@@ -60,6 +60,98 @@ export function toToolResult(e: unknown): CallToolResult {
   return { isError: true, content: [{ type: "text", text }] };
 }
 
+/** Longest message an internal-error log line keeps. */
+const LOG_MESSAGE_MAX = 200;
+const MAX_ARG_VALUES = 200;
+
+/** The string (and long number) values in the call's arguments, longest first. */
+function argValues(args: unknown): string[] {
+  const out = new Set<string>();
+  const walk = (v: unknown, depth: number): void => {
+    if (out.size >= MAX_ARG_VALUES || depth > 8) return;
+    if (typeof v === "string") {
+      if (v.length >= 3) out.add(v);
+    } else if (typeof v === "number" || typeof v === "bigint") {
+      const s = String(v);
+      if (s.length >= 4) out.add(s);
+    } else if (v && typeof v === "object") {
+      for (const x of Object.values(v)) walk(x, depth + 1);
+    }
+  };
+  walk(args, 0);
+  return [...out].sort((a, b) => b.length - a.length);
+}
+
+/** Longest message the redaction passes read; the pattern passes are quadratic on huge input. */
+const REDACT_INPUT_MAX = 2000;
+/** A message longer than this is not redacted at all: the line says so instead. */
+const REDACT_SCAN_MAX = 100_000;
+
+/** Replaces every case-insensitive occurrence of each value (no RegExp, so any length is safe). */
+function cutValues(m: string, values: string[]): string {
+  const lower = m.toLowerCase();
+  // Lowercasing can change lengths outside ASCII; then fall back to exact matches.
+  if (lower.length !== m.length) {
+    let out = m;
+    for (const v of values) out = out.split(v).join("[arg]");
+    return out;
+  }
+  const spans: Array<[number, number]> = [];
+  for (const v of values) {
+    const needle = v.toLowerCase();
+    if (needle.length !== v.length || needle.length > lower.length) continue;
+    for (let at = lower.indexOf(needle); at !== -1; at = lower.indexOf(needle, at + needle.length))
+      spans.push([at, at + needle.length]);
+  }
+  spans.sort((x, y) => x[0] - y[0]);
+  let out = "";
+  let from = 0;
+  for (const [start, end] of spans) {
+    if (end <= from) continue;
+    out += `${m.slice(from, Math.max(from, start))}[arg]`;
+    from = end;
+  }
+  return out + m.slice(from);
+}
+
+/**
+ * An error message with nothing of the caller's or Google's left in it. Every argument value is
+ * cut out of the whole message first (so a spaced-text value longer than the later cap is still
+ * found), then the message is cut to 2000 characters and braces and brackets (JSON bodies),
+ * quoted text, email addresses and long token-like runs are removed, whitespace is collapsed and
+ * the result is cut at 200 characters. A message over 100000 characters is not scanned: the log
+ * line says `[message too long]` instead.
+ */
+export function redactMessage(message: string, args?: unknown): string {
+  if (message.length > REDACT_SCAN_MAX) return "[message too long]";
+  let m = cutValues(message, argValues(args)).slice(0, REDACT_INPUT_MAX);
+  m = m
+    .replace(/\{[\s\S]*\}/g, "{...}")
+    .replace(/\[(?!arg\])[\s\S]*\]/g, "[...]")
+    .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '"..."')
+    .replace(/[^\s@<>()"',;:]+@[^\s@<>()"',;:]+/g, "[email]")
+    .replace(/[A-Za-z0-9._~+/=-]{16,}/g, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim();
+  return m.length > LOG_MESSAGE_MAX ? `${m.slice(0, LOG_MESSAGE_MAX)}...` : m;
+}
+
+/**
+ * The one structured log line for an error that is not a `ToolError` (s.3.3): the tool name, the
+ * error class and the redacted message. No arguments, no response bodies, no tokens, no stack.
+ */
+export function internalErrorLine(tool: string, e: unknown, args?: unknown): string {
+  const name = e instanceof Error ? e.name : typeof e;
+  const errorClass = /^[A-Za-z0-9_$.]{1,64}$/.test(name) ? name : "Error";
+  const raw = e instanceof Error ? e.message : typeof e === "string" ? e : "";
+  return JSON.stringify({
+    event: "tool_internal_error",
+    tool,
+    errorClass,
+    message: redactMessage(String(raw), args),
+  });
+}
+
 /** A successful call: one text block of compact JSON, no `structuredContent` in v1. */
 export function okResult(value: unknown): CallToolResult {
   return { content: [{ type: "text", text: JSON.stringify(value ?? null) ?? "null" }] };

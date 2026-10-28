@@ -9,6 +9,7 @@ import type {
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { KINDS, type Kind, SCOPES } from "../auth/endpoints";
+import { createProviderRegistry, type ProviderRegistry } from "../providers/registry";
 import { FAMILIES } from "../tools";
 import type { Family, ToolDef } from "./types";
 
@@ -27,6 +28,8 @@ export interface CompiledTool {
 
 export interface Registry {
   readonly byKind: Readonly<Record<Kind, readonly CompiledTool[]>>;
+  /** The families' provider bindings, which `ctx.use` resolves through (s.3.6). */
+  readonly providers: ProviderRegistry;
   /** The tools a grant with `granted` may see on `kind`. Memoised on kind plus sorted scopes. */
   listFor(kind: Kind, granted: readonly string[]): readonly Tool[];
 }
@@ -71,7 +74,8 @@ function deepFreeze<T>(value: T): T {
 /**
  * Checks and compiles the families. Throws at load on a duplicate family id or tool name, a name
  * that is not snake_case, a tool on no endpoint, or a scope outside an endpoint's `SCOPES`
- * (which keeps `mail.send` off `/mcp/ro`). A test imports this module, so CI catches it.
+ * (which keeps `mail.send` off `/mcp/ro`), and on a bad provider binding (`createProviderRegistry`).
+ * A test imports this module, so CI catches it.
  */
 export function compileRegistry(families: readonly Family[]): Registry {
   const familyIds = new Set<string>();
@@ -116,9 +120,11 @@ export function compileRegistry(families: readonly Family[]): Registry {
   for (const k of KINDS) Object.freeze(byKind[k]);
   Object.freeze(byKind);
 
+  const providers = createProviderRegistry(families);
   const memo = new Map<string, readonly Tool[]>();
   return Object.freeze({
     byKind,
+    providers,
     listFor(kind: Kind, granted: readonly string[]): readonly Tool[] {
       const key = `${kind} ${[...granted].sort().join(" ")}`;
       let tools = memo.get(key);

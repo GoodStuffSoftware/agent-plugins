@@ -3,7 +3,17 @@
 import type { ToolAnnotations } from "@modelcontextprotocol/server";
 import type { z } from "zod";
 import type { Kind, Scope } from "../auth/endpoints";
+import type { AccountResolver } from "../core/accounts";
+import type { AuditLog } from "../core/audit";
+import type { CursorCodec } from "../core/cursor";
+import type { IdCodec } from "../core/ids";
+import type { PendingActions } from "../core/pending";
+import type { RateLimiter } from "../core/ratelimit";
+import type { SendAsCache } from "../core/send-as";
+import type { Untrusted } from "../core/untrusted";
 import type { Env } from "../env";
+import type { Binding, Capability } from "../services/capability";
+import type { AccountRef, ProviderId } from "../services/types";
 
 export type { Kind, Scope } from "../auth/endpoints";
 
@@ -16,10 +26,7 @@ export interface Grant {
   readonly scopes: readonly Scope[];
 }
 
-/**
- * What a handler gets besides its arguments. M5 fields only; M9 adds `untrusted`, `accounts`,
- * `use`, `ids`, `cursors`, `sendAs`, `audit`, `limits` and `pending` (s.3.2).
- */
+/** What a handler gets besides its arguments (s.3.2). A new one per tool call. */
 export interface ToolContext {
   readonly kind: Kind;
   /** From the token's props, never from arguments. */
@@ -30,6 +37,23 @@ export interface ToolContext {
   readonly env: Env;
   /** Milliseconds; tests inject a clock. */
   readonly now: () => number;
+  /** One nonce per tool call (s.3.7). */
+  readonly untrusted: Untrusted;
+  /** The owner's accounts, read once per call (s.3.4). Pass the refs it returns as they are. */
+  readonly accounts: AccountResolver;
+  /**
+   * The account's implementation of `cap`. Throws `component_disabled` (`{ component,
+   * accountsUrl }`) when the capability's component is off for the account, then
+   * `not_supported_by_provider` (`{ capability, provider }`) when its provider has no binding.
+   * `a` must come from `accounts.resolve` in this call.
+   */
+  use<T>(cap: Capability<T>, a: AccountRef): T;
+  readonly ids: IdCodec;
+  readonly cursors: CursorCodec;
+  readonly sendAs: SendAsCache;
+  readonly audit: AuditLog;
+  readonly limits: RateLimiter;
+  readonly pending: PendingActions;
   waitUntil(p: Promise<unknown>): void;
 }
 
@@ -62,11 +86,8 @@ export interface Family {
   /** For example `mail.labels`. */
   id: string;
   tools: readonly ToolDef[];
-  /**
-   * Capability implementations per provider (s.3.6). Typed loosely until M9 adds
-   * `services/{capability,types}.ts` and narrows it to `Partial<Record<ProviderId, readonly Binding[]>>`.
-   */
-  bindings: Readonly<Record<string, readonly unknown[]>>;
+  /** Capability implementations per provider (s.3.6). */
+  bindings: Readonly<Partial<Record<ProviderId, readonly Binding[]>>>;
   /** Official tool names not built yet (s.5). Only shrinks. */
   parityPending: readonly string[];
 }
