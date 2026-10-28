@@ -19,12 +19,19 @@ export interface Untrusted {
   wrap(text: string, attrs: UntrustedAttrs): string;
 }
 
-// U+200B-U+200F, U+202A-U+202E, U+2060-U+2069, U+FEFF.
+// U+200B-U+200F, U+202A-U+202E, U+2060-U+2069, U+FEFF (s.3.7), plus other invisible characters
+// that hide text from a human reader: U+00AD, U+034F, U+061C, U+180E, and the Unicode Tags block
+// U+E0000-U+E007F.
 const isHiddenControl = (c: number): boolean =>
   (c >= 0x200b && c <= 0x200f) ||
   (c >= 0x202a && c <= 0x202e) ||
   (c >= 0x2060 && c <= 0x2069) ||
-  c === 0xfeff;
+  (c >= 0xe0000 && c <= 0xe007f) ||
+  c === 0xfeff ||
+  c === 0x00ad ||
+  c === 0x034f ||
+  c === 0x061c ||
+  c === 0x180e;
 
 /** Removes zero-width and bidirectional control characters. */
 export function stripHiddenControls(text: string): string {

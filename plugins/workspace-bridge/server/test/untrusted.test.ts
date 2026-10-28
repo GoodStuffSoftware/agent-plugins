@@ -80,6 +80,12 @@ describe("untrusted wrapper", () => {
     expect(out).toContain(">payment<");
   });
 
+  it("also strips other invisible characters, including the Unicode Tags block", () => {
+    const u = createUntrusted();
+    const hidden = [0x00ad, 0x034f, 0x061c, 0x180e, 0xe0000, 0xe0041, 0xe007f].map(cp).join("");
+    expect(u.wrap(`a${hidden}b`, ATTRS)).toContain(">ab<");
+  });
+
   it("keeps ordinary non-ASCII text, newlines and angle brackets that are not our tag", () => {
     const u = createUntrusted();
     const body = "café 日本語 \u{1F600}\nline <b>bold</b> a < b";
