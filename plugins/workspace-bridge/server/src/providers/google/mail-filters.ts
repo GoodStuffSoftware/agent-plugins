@@ -65,7 +65,7 @@ export const googleFilters: FilterService = {
       {},
       { fields: `filter(${FIELDS})` },
     );
-    return (r?.filter ?? []).map(toInfo);
+    return (r?.filter ?? []).filter((f) => f.id).map(toInfo);
   },
 
   async create(a, { criteria, action }) {

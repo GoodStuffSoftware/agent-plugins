@@ -261,6 +261,12 @@ describe("create_filter without forwarding", () => {
       action: { addLabelIds: ["Label_1"] },
     });
     expect(lonelySize.json.error.code).toBe("invalid_argument");
+    // hasAttachment: false is not a criterion: it would match all mail.
+    const noRealCriterion = await call(ownerId, "create_filter", {
+      criteria: { hasAttachment: false },
+      action: { removeLabelIds: ["INBOX"] },
+    });
+    expect(noRealCriterion.json.error.code).toBe("invalid_argument");
     expect(calls).toHaveLength(0);
     expect(await pendingRows(ownerId)).toHaveLength(0);
   });
@@ -437,6 +443,15 @@ describe("delete_filter", () => {
     expect(json.error.code).toBe("not_found");
     const rows = await auditRows(ownerId);
     expect(rows.map((r) => [r.tool, r.result])).toEqual([["delete_filter", "error"]]);
+  });
+
+  it("refuses an id that could reshape the URL", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([]);
+    for (const filterId of ["..", ".", "a/b", "x?y"]) {
+      expect((await call(ownerId, "delete_filter", { filterId })).isError).toBe(true);
+    }
+    expect(calls).toHaveLength(0);
   });
 
   it("refuses an id of one account with a selector naming another", async () => {

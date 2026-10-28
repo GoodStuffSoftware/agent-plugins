@@ -5,7 +5,7 @@
 // addresses: Gmail verifies those with their owner.
 
 import { z } from "zod";
-import { ToolError } from "../core/errors";
+import { internalErrorLine, ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
 import { googleFilters } from "../providers/google/mail-filters";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
@@ -70,11 +70,12 @@ type CreateArgs = {
   account?: string;
 };
 
-const CRITERIA_KEYS = ["from", "to", "subject", "query", "negatedQuery", "hasAttachment", "size"];
+const CRITERIA_KEYS = ["from", "to", "subject", "query", "negatedQuery", "size"] as const;
 
 /** Rejects a filter Gmail would refuse anyway, with a clearer message and before it is held. */
 function check({ criteria, action }: CreateArgs): void {
-  if (!CRITERIA_KEYS.some((k) => criteria[k as keyof typeof criteria] !== undefined)) {
+  // hasAttachment: false matches nothing in particular, so only true counts as a criterion.
+  if (!CRITERIA_KEYS.some((k) => criteria[k] !== undefined) && criteria.hasAttachment !== true) {
     throw new ToolError("invalid_argument", "Give at least one criterion for the filter to match.");
   }
   if ((criteria.size === undefined) !== (criteria.sizeComparison === undefined)) {
@@ -153,7 +154,10 @@ async function audited<T extends { id: string }>(
       .catch(() => undefined);
     throw e;
   }
-  await ctx.audit.write({ account: a, result: "ok", providerRef: out.id, ...entry });
+  // The change is made: a failing audit write must not turn it into an error the caller would retry.
+  await ctx.audit
+    .write({ account: a, result: "ok", providerRef: out.id, ...entry })
+    .catch((e) => console.error(internalErrorLine("filter audit", e)));
   return out;
 }
 
@@ -257,7 +261,11 @@ const deleteFilter = defineTool({
     openWorldHint: false,
   },
   input: z.object({
-    filterId: z.string().min(1).max(200).describe("The filter's id from list_filters."),
+    filterId: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]+$|^a[0-9]+:[A-Za-z0-9_-]+$/, "Not a filter id.")
+      .max(200)
+      .describe("The filter's id from list_filters."),
     account,
   }),
   async handler(args, ctx) {
