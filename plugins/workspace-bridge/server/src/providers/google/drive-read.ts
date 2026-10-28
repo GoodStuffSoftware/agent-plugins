@@ -14,12 +14,12 @@ const BASE = "https://www.googleapis.com/drive/v3";
 
 const LIST_FIELDS =
   "id,name,mimeType,modifiedTime,createdTime,size,webViewLink,parents,driveId,shared,ownedByMe,starred,trashed,owners(displayName,emailAddress,me)";
-const META_FIELDS = `${LIST_FIELDS},description,lastModifyingUser(displayName,emailAddress,me)`;
+export const META_FIELDS = `${LIST_FIELDS},description,lastModifyingUser(displayName,emailAddress,me)`;
 const RECENT_FIELDS = `${LIST_FIELDS},viewedByMeTime,modifiedByMeTime,sharedWithMeTime`;
 
 const enc = encodeURIComponent;
 
-interface RawFile extends Omit<DriveFile, "size" | "sortTime"> {
+export interface RawFile extends Omit<DriveFile, "size" | "sortTime"> {
   /** Drive sends the byte count as a string. */
   size?: string;
   viewedByMeTime?: string;
@@ -32,7 +32,7 @@ const ms = (t: string | undefined): number => {
   return Number.isNaN(v) ? 0 : v;
 };
 
-function toFile(r: RawFile, sortTime?: number): DriveFile {
+export function toFile(r: RawFile, sortTime?: number): DriveFile {
   const { size, viewedByMeTime, modifiedByMeTime, sharedWithMeTime, ...rest } = r;
   const f: DriveFile = { ...rest };
   if (size !== undefined && size !== "" && !Number.isNaN(Number(size))) f.size = Number(size);
