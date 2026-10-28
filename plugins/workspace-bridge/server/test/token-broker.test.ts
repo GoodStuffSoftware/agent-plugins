@@ -6,7 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } fr
 import { GOOGLE_TOKEN_URL } from "../src/auth/google-oidc";
 import { open, randomBytes, randomId, type SealAad, type Sealed, seal } from "../src/core/crypto";
 import { getToken, insertAccount, nowSeconds, upsertToken } from "../src/core/db";
-import { type BrokerAccount, createTokenBroker } from "../src/core/token-broker";
+import { ToolError, toToolResult } from "../src/core/errors";
+import {
+  type BrokerAccount,
+  createTokenBroker,
+  REFRESH_WAIT_MS,
+  TOKEN_TIMEOUT_MS,
+} from "../src/core/token-broker";
 import type { Env } from "../src/env";
 import { GOOGLE_CLIENT_SECRET as CLIENT_SECRET, GOOGLE_CLIENT_ID } from "./helpers/google";
 
@@ -56,6 +62,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -160,12 +167,13 @@ function spyDb(base: Env = ENV): { env: Env; sql: string[]; batches: string[][] 
 const writes = (sql: readonly string[]): string[] =>
   sql.filter((q) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(q));
 
-async function caught(p: Promise<unknown>): Promise<Error & { code?: string; details?: unknown }> {
+/** The rejection of `p`, which must be M5's `ToolError` so the MCP wrapper keeps its code. */
+async function caught(p: Promise<unknown>): Promise<ToolError> {
   try {
     await p;
   } catch (e) {
-    if (e instanceof Error) return e;
-    throw new Error(`expected an Error, got ${String(e)}`);
+    expect(e).toBeInstanceOf(ToolError);
+    return e as ToolError;
   }
   throw new Error("expected a rejection");
 }
@@ -201,6 +209,7 @@ describe("token broker: cache layers", () => {
     const spy = spyDb();
     expect(await createTokenBroker(spy.env).accessToken(a)).toBe(fresh);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
     expect(Object.fromEntries(forms[0] ?? [])).toEqual({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
@@ -278,6 +287,81 @@ describe("token broker: cache layers", () => {
     // Back to normal: memory, no further refresh.
     expect(await broker.accessToken(a)).toBe(fresh);
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes when the D1 access token does not open", async () => {
+    const { a } = await link({ accessExpiresIn: null });
+    // Sealed for another account: AES-GCM refuses it under this account's AAD.
+    await upsertToken(env.DB, {
+      accountId: a.accountId,
+      kind: "access",
+      sealed: await seal(accessTokenValue(), { ...aad(a, "access"), accountId: "ac_other" }, ENV),
+      expiresAt: nowSeconds() + 3600,
+    });
+    const fresh = accessTokenValue();
+    replies.push(granted(fresh));
+    expect(await createTokenBroker(ENV).accessToken(a)).toBe(fresh);
+    const row = await getToken(env.DB, a.accountId, "access");
+    expect(await open(row as Sealed, aad(a, "access"), ENV)).toBe(fresh);
+  });
+
+  it("does not let a refresh overwrite tokens a relink stored meanwhile", async () => {
+    const { a } = await link({ accessExpiresIn: 0 });
+    const relinkedRefresh = refreshTokenValue();
+    const relinkedAccess = accessTokenValue();
+    // A relink stores new tokens while Google answers the old refresh token.
+    replies.push(async () => {
+      await upsertToken(env.DB, {
+        accountId: a.accountId,
+        kind: "refresh",
+        sealed: await seal(relinkedRefresh, aad(a, "refresh"), ENV),
+      });
+      await upsertToken(env.DB, {
+        accountId: a.accountId,
+        kind: "access",
+        sealed: await seal(relinkedAccess, aad(a, "access"), ENV),
+        expiresAt: nowSeconds() + 3600,
+      });
+      return granted(accessTokenValue(), { refresh_token: refreshTokenValue() });
+    });
+    const broker = createTokenBroker(ENV);
+    expect(await broker.accessToken(a)).toBe(relinkedAccess);
+    const refreshRow = await getToken(env.DB, a.accountId, "refresh");
+    const accessRow = await getToken(env.DB, a.accountId, "access");
+    expect(await open(refreshRow as Sealed, aad(a, "refresh"), ENV)).toBe(relinkedRefresh);
+    expect(await open(accessRow as Sealed, aad(a, "access"), ENV)).toBe(relinkedAccess);
+    expect(await broker.accessToken(a)).toBe(relinkedAccess);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops waiting for a stalled refresh and starts a new one", async () => {
+    expect(TOKEN_TIMEOUT_MS).toBeLessThan(REFRESH_WAIT_MS);
+    const { a } = await link({ accessExpiresIn: 0 });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    let reached: () => void = () => {};
+    const atGoogle = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    // Google never answers, and the refresh that asked never settles.
+    replies.push(() => {
+      reached();
+      return new Promise<Response>(() => {});
+    });
+    const broker = createTokenBroker(ENV);
+    const first = caught(broker.accessToken(a));
+    await atGoogle;
+    const joined = caught(broker.accessToken(a));
+    await vi.advanceTimersByTimeAsync(REFRESH_WAIT_MS);
+    for (const error of [await first, await joined]) {
+      expect(error.code).toBe("upstream_error");
+      expect(error.message).toBe("Google's token endpoint did not answer in time.");
+    }
+
+    const fresh = accessTokenValue();
+    replies.push(granted(fresh));
+    expect(await broker.accessToken(a)).toBe(fresh);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(await status(a)).toBe("ok");
   });
 
   it("re-seals both rows under v2 on the first refresh after CURRENT_KEY_VERSION moves", async () => {
@@ -418,8 +502,29 @@ describe("token broker: refused and failed refreshes", () => {
         `Google OAuth is not configured: set the ${missing} secret on the Worker.`,
       );
     }
+    const both = await caught(
+      createTokenBroker(
+        envWith({ GOOGLE_CLIENT_ID: " ", GOOGLE_CLIENT_SECRET: undefined }),
+      ).accessToken(a),
+    );
+    expect(both.message).toBe(
+      "Google OAuth is not configured: set the GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET secrets on the Worker.",
+    );
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(await status(a)).toBe("ok");
+  });
+
+  it("marks an account with no refresh token needs_relink without calling Google", async () => {
+    const { a } = await link({ accessExpiresIn: 0 });
+    await env.DB.prepare("DELETE FROM account_tokens WHERE account_id = ? AND kind = 'refresh'")
+      .bind(a.accountId)
+      .run();
+    const error = await caught(createTokenBroker(ENV).accessToken(a));
+    expect(error.code).toBe("needs_relink");
+    expect(error.details).toEqual({ linkUrl: LINK_URL });
+    expect(await status(a)).toBe("needs_relink");
+    expect(await getToken(env.DB, a.accountId, "access")).toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it("reports an account unlinked meanwhile as account_not_found", async () => {
@@ -435,7 +540,7 @@ describe("token broker: refused and failed refreshes", () => {
     const { a, refreshToken, accessToken } = await link({ accessExpiresIn: 0 });
     const echoed = accessTokenValue();
     const broker = createTokenBroker(ENV);
-    const errors: Error[] = [];
+    const errors: ToolError[] = [];
     const replyCases: Reply[] = [
       new TypeError(`fetch failed for refresh_token=${refreshToken}`),
       json(500, { error: "internal", detail: refreshToken }),
@@ -453,7 +558,7 @@ describe("token broker: refused and failed refreshes", () => {
       await caught(createTokenBroker(envWith({ GOOGLE_CLIENT_SECRET: undefined })).accessToken(a)),
     );
 
-    expect(errors.map((e) => (e as { code?: string }).code)).toEqual([
+    expect(errors.map((e) => e.code)).toEqual([
       "upstream_error",
       "upstream_error",
       "upstream_error",
@@ -465,7 +570,8 @@ describe("token broker: refused and failed refreshes", () => {
     for (const e of errors) {
       const text = JSON.stringify({
         message: e.message,
-        details: (e as { details?: unknown }).details,
+        details: e.details,
+        result: toToolResult(e),
         stack: e.stack,
         cause: String(e.cause),
         own: Object.getOwnPropertyNames(e).map((p) => String(Reflect.get(e, p))),
