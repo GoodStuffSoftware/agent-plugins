@@ -19,4 +19,11 @@ jobs:
       - name: Scan tracked files for private names
         env:
           PRIVATE_NAMES: ${{ secrets.PRIVATE_NAMES }}
-        run: node scripts/leak-check.mjs
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          if [ -z "$PRIVATE_NAMES" ] && [ "$IS_FORK" != "true" ] && [ "$ACTOR" != "dependabot[bot]" ]; then
+            echo "::error::PRIVATE_NAMES secret is empty; the leak check would pass without scanning."
+            exit 1
+          fi
+          node scripts/leak-check.mjs
