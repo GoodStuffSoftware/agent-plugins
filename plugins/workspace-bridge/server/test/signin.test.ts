@@ -57,6 +57,7 @@ function initialize(kind: Kind, token: string): Promise<Response> {
     new Request(ISSUER + PATH[kind], {
       method: "POST",
       headers: {
+        Host: new URL(ISSUER).host,
         Authorization: `Bearer ${token}`,
         Accept: "application/json, text/event-stream",
         "Content-Type": "application/json",
