@@ -52,9 +52,13 @@ describe.each(KINDS)("%s endpoint", (kind) => {
 
     const list = await mcpRpc(token, kind, "tools/list", {});
     const tools = list.result?.tools as { name: string }[];
-    const toolNames = tools.map((t) => t.name);
-    expect(toolNames.slice(0, 3)).toEqual(["whoami", "list_accounts", "link_account_url"]);
-    expect(toolNames).toContain("get_pending_action");
+    // Family tools join the list as they land; the account tools are always there, first.
+    expect(tools.map((t) => t.name).slice(0, 3)).toEqual([
+      "whoami",
+      "list_accounts",
+      "link_account_url",
+    ]);
+    expect(tools.map((t) => t.name)).toContain("get_pending_action");
     expect(tools[0]).toMatchObject({
       name: "whoami",
       inputSchema: { type: "object", properties: {} },
