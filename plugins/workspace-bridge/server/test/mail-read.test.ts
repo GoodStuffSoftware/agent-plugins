@@ -755,7 +755,8 @@ describe("review fixes", () => {
     } while (pageToken && pages < 40);
     expect(biggest).toBeLessThanOrEqual(100);
     expect(pages).toBeGreaterThan(10);
-    expect(seen.size).toBeGreaterThan(200);
+    expect(seen.size).toBe(300);
+    expect(pageToken).toBeUndefined();
   });
 
   it("wraps the attachment mime type", async () => {
