@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCOPES } from "../src/auth/endpoints";
+import { warmupRetry } from "../src/providers/google/contacts";
 import fixture from "./fixtures/google/contacts.json";
 import {
   type GoogleCall,
@@ -192,6 +193,31 @@ describe("search_contacts", () => {
     expect(pages).toBe(2);
   });
 
+  it("retries an empty first search once, after the warm-up", async () => {
+    const { ownerId } = await setup();
+    const prev = warmupRetry.ms;
+    warmupRetry.ms = 1;
+    try {
+      let real = 0;
+      const calls = installGoogleRoutes([
+        {
+          url: SEARCH,
+          reply: (req) => {
+            if (queryOf(req) === "") return googleJson(200, {});
+            real++;
+            return googleJson(200, real === 1 ? {} : fixture.searchContacts);
+          },
+        },
+        { url: OTHER, reply: () => googleJson(200, {}) },
+      ]);
+      const { json } = await call(ownerId, "search_contacts", { query: "ada" });
+      expect((json.contacts as unknown[]).length).toBe(2);
+      expect(calls.filter((c) => c.url.startsWith(SEARCH))).toHaveLength(3);
+    } finally {
+      warmupRetry.ms = prev;
+    }
+  });
+
   it("rejects a pageToken from another query", async () => {
     const { ownerId } = await setup();
     installGoogleRoutes(peopleRoutes());
@@ -280,7 +306,13 @@ describe("get_contact", () => {
   it("refuses an other-contact id and a malformed name without calling Google", async () => {
     const { ownerId } = await setup();
     const calls = installGoogleRoutes([]);
-    for (const resourceName of ["a1:otherContacts/c2001", "a1:people/../x"]) {
+    for (const resourceName of [
+      "a1:otherContacts/c2001",
+      "a1:people/../x",
+      "a1:people/..",
+      "a1:people/.",
+      "people/me",
+    ]) {
       const res = await call(ownerId, "get_contact", { resourceName });
       expect(res.json.error?.code).toBe("invalid_argument");
     }

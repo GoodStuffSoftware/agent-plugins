@@ -109,7 +109,8 @@ const searchContacts = defineTool({
 const getContact = defineTool({
   name: "get_contact",
   title: "Get contact",
-  description: "Returns one of the account's contacts by the id search_contacts gave.",
+  description:
+    'Returns one of the account\'s own contacts by the id search_contacts gave. Ids of source "other" (people only emailed) are refused: search_contacts already returns their full details.',
   component: "contacts",
   scopes: ["contacts"],
   endpoints: ["full", "ro"],

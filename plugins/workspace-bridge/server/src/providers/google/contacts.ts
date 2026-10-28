@@ -54,6 +54,9 @@ function toInfo(p: Person, source: ContactInfo["source"]): ContactInfo | null {
  */
 const warmed = new Set<string>();
 
+/** Pause before the one retry of an empty first search; tests set `ms` to 0. */
+export const warmupRetry = { ms: 2000 };
+
 async function search(
   a: AccountRef,
   source: ContactInfo["source"],
@@ -64,16 +67,24 @@ async function search(
     source === "contact" ? `${BASE}/people:searchContacts` : `${BASE}/otherContacts:search`;
   const readMask = source === "contact" ? CONTACT_MASK : OTHER_MASK;
   const key = `${a.accountId}:${source}`;
-  if (!warmed.has(key)) {
+  const justWarmed = !warmed.has(key);
+  if (justWarmed) {
     await gjson(a, url, {}, { query: { query: "", readMask, pageSize: 1 }, fields: "results" });
     warmed.add(key);
   }
-  const r = await gjson<{ results?: { person?: Person }[] }>(
-    a,
-    url,
-    {},
-    { query: { query, readMask, pageSize: Math.min(limit, SEARCH_CAP) }, fields: RESULT_FIELDS },
-  );
+  const run = () =>
+    gjson<{ results?: { person?: Person }[] }>(
+      a,
+      url,
+      {},
+      { query: { query, readMask, pageSize: Math.min(limit, SEARCH_CAP) }, fields: RESULT_FIELDS },
+    );
+  let r = await run();
+  if (justWarmed && !r?.results?.length && warmupRetry.ms > 0) {
+    // The cache fills lazily after the warm-up: give it a moment and ask once more.
+    await new Promise((resolve) => setTimeout(resolve, warmupRetry.ms));
+    r = await run();
+  }
   return (r?.results ?? [])
     .map((x) => (x.person ? toInfo(x.person, source) : null))
     .filter((x): x is ContactInfo => x !== null);
@@ -99,7 +110,10 @@ export const googleContacts: ContactService = {
   },
 
   async get(a, resourceName) {
-    if (!/^people\/[A-Za-z0-9._-]+$/.test(resourceName)) {
+    if (
+      !/^people\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(resourceName) ||
+      resourceName === "people/me"
+    ) {
       throw new ToolError(
         "invalid_argument",
         'resourceName must look like "people/c123". Other contacts cannot be fetched by id; search_contacts returns their full details.',

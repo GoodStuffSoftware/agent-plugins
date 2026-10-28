@@ -17,8 +17,8 @@ export interface ContactInfo {
 
 export interface ContactService {
   /**
-   * Contacts and other contacts matching `query`, merged, one entry per email address (the
-   * account's own contact wins), at most `limit` items in total.
+   * Contacts and other contacts matching `query`, merged; an other contact whose emails are
+   * all already covered by one of the account's own contacts is dropped, at most `limit` items in total.
    */
   search(a: AccountRef, query: string, limit: number): Promise<ContactInfo[]>;
   /** One of the account's own contacts by resource name (`people/...`). */
