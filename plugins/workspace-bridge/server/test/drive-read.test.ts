@@ -88,6 +88,11 @@ describe("driveQuery", () => {
     );
     expect(driveQuery("name contains 'x'")).toBe("(name contains 'x') and trashed = false");
   });
+  it("treats a sentence that merely contains an operator word as plain text", () => {
+    expect(driveQuery("what is your name in French")).toBe(
+      "fullText contains 'what is your name in French' and trashed = false",
+    );
+  });
 });
 
 describe("search_files", () => {
@@ -457,6 +462,15 @@ describe("download_file_content", () => {
     });
     expect(resourceOf(b).mimeType).toBe("application/pdf");
     expect(calls.filter((c) => c.url.includes("/export"))).toHaveLength(2);
+  });
+
+  it("rejects empty exportMimeType and revisionId", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([]);
+    for (const extra of [{ exportMimeType: "" }, { revisionId: "" }]) {
+      const r = await raw(ownerId, "download_file_content", { fileId: "1Doc", ...extra });
+      expect(r.isError).toBe(true);
+    }
   });
 });
 

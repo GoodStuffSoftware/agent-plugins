@@ -45,7 +45,7 @@ function toFile(r: RawFile, sortTime?: number): DriveFile {
 const QUOTED = /'(?:[^'\\]|\\.)*'/g;
 const HOLE = "\u0000(\\d+)\u0000";
 const FIELD_USE = new RegExp(
-  "\\b(?:name|title|fullText|mimeType|modifiedTime|viewedByMeTime|createdTime|parentId|owner|sharedWithMe|starred|trashed|properties|appProperties|visibility|folderProperties)\\s*(?:contains|!=|<=|>=|=|<|>|has|in)(?![A-Za-z0-9_])" +
+  "\\b(?:name|title|fullText|mimeType|modifiedTime|viewedByMeTime|createdTime|parentId|owner|sharedWithMe|starred|trashed|properties|appProperties|visibility|folderProperties)\\s*(?:contains|!=|<=|>=|=|<|>|has)\\s*(?:\u0000|\\{|true\\b|false\\b)" +
     `|${HOLE}\\s+in\\s+(?:parents|owners|writers|readers)\\b`,
   "i",
 );
