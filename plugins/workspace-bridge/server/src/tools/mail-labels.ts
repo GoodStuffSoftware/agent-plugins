@@ -16,8 +16,13 @@ const account = z
   .optional()
   .describe("Label, address or a1; the default account when omitted.");
 
-const LIST_VISIBILITY = ["LABEL_SHOW", "LABEL_SHOW_IF_UNREAD", "LABEL_HIDE"] as const;
-const MESSAGE_VISIBILITY = ["SHOW", "HIDE"] as const;
+const LIST_VISIBILITY = [
+  "LABEL_LIST_VISIBILITY_UNSPECIFIED",
+  "LABEL_SHOW",
+  "LABEL_SHOW_IF_UNREAD",
+  "LABEL_HIDE",
+] as const;
+const MESSAGE_VISIBILITY = ["MESSAGE_LIST_VISIBILITY_UNSPECIFIED", "SHOW", "HIDE"] as const;
 
 /** Preset tiles (gmail.json) as the background and text colors Gmail accepts. */
 const PRESETS: Readonly<Record<string, LabelColor>> = {
@@ -54,6 +59,10 @@ const legacyColor = z
   .describe("Deprecated: use colorPreset. Hex colors Gmail accepts, both fields together.");
 
 const styleInput = {
+  autoCreateParentLabels: z
+    .boolean()
+    .optional()
+    .describe("Accepted for compatibility; Gmail shows a nested name under its parent either way."),
   labelListVisibility: z.enum(LIST_VISIBILITY).optional(),
   messageListVisibility: z.enum(MESSAGE_VISIBILITY).optional(),
   colorPreset: z
@@ -64,14 +73,18 @@ const styleInput = {
 };
 
 function styleOf(args: {
-  labelListVisibility?: LabelInput["labelListVisibility"];
-  messageListVisibility?: LabelInput["messageListVisibility"];
+  labelListVisibility?: (typeof LIST_VISIBILITY)[number];
+  messageListVisibility?: (typeof MESSAGE_VISIBILITY)[number];
   colorPreset?: string;
   color?: { backgroundColor?: string; textColor?: string };
 }): LabelInput {
   const out: LabelInput = {};
-  if (args.labelListVisibility) out.labelListVisibility = args.labelListVisibility;
-  if (args.messageListVisibility) out.messageListVisibility = args.messageListVisibility;
+  if (args.labelListVisibility && args.labelListVisibility !== LIST_VISIBILITY[0]) {
+    out.labelListVisibility = args.labelListVisibility;
+  }
+  if (args.messageListVisibility && args.messageListVisibility !== MESSAGE_VISIBILITY[0]) {
+    out.messageListVisibility = args.messageListVisibility;
+  }
   const preset = args.colorPreset ? PRESETS[args.colorPreset] : undefined;
   if (preset) out.color = preset;
   else if (args.color) {
@@ -110,6 +123,18 @@ async function resolveIds(
   const head = target === undefined ? undefined : decoded[0];
   return { a, target: head === undefined ? undefined : provider(head), labels: rest.map(provider) };
 }
+
+/** TRASH and SPAM are moved by the state tools (M12), which carry the right annotations. */
+function refuseStateLabels(ids: readonly string[]): void {
+  if (ids.some((id) => id === "TRASH" || id === "SPAM")) {
+    throw new ToolError(
+      "invalid_argument",
+      "TRASH and SPAM cannot be added as labels: use the trash and spam tools.",
+    );
+  }
+}
+
+const bare = (id: string) => id.replace(/^a[0-9]+:/, "");
 
 function view(ctx: ToolContext, a: AccountRef, l: Label) {
   return { ...l, id: ctx.ids.encode(a, l.id) };
@@ -257,6 +282,7 @@ function changeTool(opts: {
         string,
         string
       >;
+      if (opts.mode === "add") refuseStateLabels(a.labelIds.map(bare));
       const r = await resolveIds(ctx, a.account, a[idKey], a.labelIds);
       if (r.target === undefined) throw new ToolError("invalid_argument", `${idKey} is required.`);
       await ctx
@@ -332,6 +358,7 @@ const updateMessageLabels = defineTool({
     if (add.length === 0 && remove.length === 0) {
       throw new ToolError("invalid_argument", "Give addLabelIds or removeLabelIds.");
     }
+    refuseStateLabels(add.map(bare));
     const r = await resolveIds(ctx, args.account, args.messageId, [...add, ...remove]);
     if (r.target === undefined) throw new ToolError("invalid_argument", "messageId is required.");
     await ctx

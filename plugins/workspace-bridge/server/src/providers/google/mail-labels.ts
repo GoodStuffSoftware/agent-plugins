@@ -16,10 +16,24 @@ interface GLabel {
   color?: { backgroundColor?: string; textColor?: string };
 }
 
+// Gmail REST spells visibility in camelCase; the tools use the official upper-case names.
+const LIST_TO_GMAIL: Record<string, string> = {
+  LABEL_SHOW: "labelShow",
+  LABEL_SHOW_IF_UNREAD: "labelShowIfUnread",
+  LABEL_HIDE: "labelHide",
+};
+const MSG_TO_GMAIL: Record<string, string> = { SHOW: "show", HIDE: "hide" };
+const invert = (m: Record<string, string>) =>
+  Object.fromEntries(Object.entries(m).map(([k, v]) => [v, k]));
+const LIST_FROM_GMAIL = invert(LIST_TO_GMAIL);
+const MSG_FROM_GMAIL = invert(MSG_TO_GMAIL);
+
 function toLabel(l: GLabel): Label {
   const out: Label = { id: l.id, name: l.name, type: l.type === "system" ? "system" : "user" };
-  if (l.labelListVisibility) out.labelListVisibility = l.labelListVisibility;
-  if (l.messageListVisibility) out.messageListVisibility = l.messageListVisibility;
+  if (l.labelListVisibility)
+    out.labelListVisibility = LIST_FROM_GMAIL[l.labelListVisibility] ?? l.labelListVisibility;
+  if (l.messageListVisibility)
+    out.messageListVisibility = MSG_FROM_GMAIL[l.messageListVisibility] ?? l.messageListVisibility;
   if (l.color?.backgroundColor && l.color.textColor) {
     out.color = { backgroundColor: l.color.backgroundColor, textColor: l.color.textColor };
   }
@@ -37,8 +51,12 @@ function mapConflict(e: unknown): never {
 function body(l: LabelInput): Record<string, unknown> {
   const b: Record<string, unknown> = {};
   if (l.name !== undefined) b.name = l.name;
-  if (l.labelListVisibility !== undefined) b.labelListVisibility = l.labelListVisibility;
-  if (l.messageListVisibility !== undefined) b.messageListVisibility = l.messageListVisibility;
+  if (l.labelListVisibility !== undefined) {
+    b.labelListVisibility = LIST_TO_GMAIL[l.labelListVisibility] ?? l.labelListVisibility;
+  }
+  if (l.messageListVisibility !== undefined) {
+    b.messageListVisibility = MSG_TO_GMAIL[l.messageListVisibility] ?? l.messageListVisibility;
+  }
   if (l.color !== undefined) b.color = l.color;
   return b;
 }

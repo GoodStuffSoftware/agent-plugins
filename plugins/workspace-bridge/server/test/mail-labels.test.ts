@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCOPES } from "../src/auth/endpoints";
-import { googleJson, installGoogleRoutes, linkGoogleAccount, newOwner } from "./helpers/google";
+import {
+  googleJson,
+  installGoogleRoutes,
+  linkGoogleAccount,
+  newOwner,
+  tokenRoute,
+} from "./helpers/google";
 import { mcpRpc, toolJson } from "./helpers/mcp";
 import { mintToken } from "./helpers/tokens";
 
@@ -138,7 +144,7 @@ describe("create_label", () => {
     expect((res.json.label as { id: string }).id).toMatch(/^a\d+:Label_9$/);
     expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({
       name: "Projects/Alpha",
-      labelListVisibility: "LABEL_SHOW",
+      labelListVisibility: "labelShow",
       color: { backgroundColor: "#4a86e8", textColor: "#ffffff" },
     });
   });
@@ -168,6 +174,61 @@ describe("create_label", () => {
     const refused =
       error !== undefined || (result as { isError?: boolean } | undefined)?.isError === true;
     expect(refused).toBe(true);
+  });
+});
+
+describe("review fixes", () => {
+  it("TRASH and SPAM cannot be added as labels", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([]);
+    const a = await call(ownerId, "label_message", { messageId: "m1", labelIds: ["TRASH"] });
+    expect(a.json.error?.code).toBe("invalid_argument");
+    const b = await call(ownerId, "update_message_labels", {
+      messageId: "m1",
+      addLabelIds: ["SPAM"],
+    });
+    expect(b.json.error?.code).toBe("invalid_argument");
+  });
+
+  it("UNSPECIFIED visibility is accepted and not sent; Gmail spelling maps back", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      {
+        method: "POST",
+        url: `${G}/labels`,
+        reply: () =>
+          googleJson(200, {
+            id: "L2",
+            name: "X",
+            type: "user",
+            labelListVisibility: "labelShowIfUnread",
+            messageListVisibility: "hide",
+          }),
+      },
+    ]);
+    const res = await call(ownerId, "create_label", {
+      displayName: "X",
+      labelListVisibility: "LABEL_LIST_VISIBILITY_UNSPECIFIED",
+      autoCreateParentLabels: true,
+    });
+    expect(JSON.parse(calls[0]?.body ?? "{}")).toEqual({ name: "X" });
+    expect(res.json.label).toMatchObject({
+      labelListVisibility: "LABEL_SHOW_IF_UNREAD",
+      messageListVisibility: "HIDE",
+    });
+  });
+
+  it("refreshes once on a 401", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([
+      {
+        url: `${G}/labels`,
+        reply: (_r, n) => (n === 0 ? googleJson(401, {}) : googleJson(200, { labels: [] })),
+      },
+      tokenRoute("ya29.fresh"),
+    ]);
+    const res = await call(ownerId, "list_labels", {});
+    expect(res.isError).toBe(false);
   });
 });
 
