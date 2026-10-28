@@ -11,6 +11,7 @@ import {
   SERVER_NAME,
 } from "../src/auth/endpoints";
 import { base32, hex, hmacSha256, randomId, sha256Hex, timingSafeEqual } from "../src/core/crypto";
+import { mcpRpc, toolJson } from "./helpers/mcp";
 import { authorizeCode, exchangeCode, mintToken, REDIRECT_URI } from "./helpers/tokens";
 
 const ISSUER = "https://mcp.example.com";
@@ -86,11 +87,11 @@ describe("resource servers", () => {
     async ({ tokenKind, at }) => {
       const ownerId = randomId("o_");
       const token = await mintToken({ kind: tokenKind, scopes: SCOPES[tokenKind], ownerId });
-      const res = await call(PATH[at], token);
       if (tokenKind === at) {
-        expect(res.status).toBe(200);
-        expect(await res.json()).toEqual({ kind: at, ownerId, scope: [...SCOPES[at]] });
+        const res = await mcpRpc(token, at, "tools/call", { name: "whoami", arguments: {} });
+        expect(toolJson(res.result)).toMatchObject({ kind: at, ownerId, scopes: [...SCOPES[at]] });
       } else {
+        const res = await call(PATH[at], token);
         expect(res.status).toBe(401);
         expect(res.headers.get("WWW-Authenticate")).toContain(`resource_metadata="${prm(at)}"`);
       }
@@ -120,9 +121,8 @@ describe("resource servers", () => {
   it("passes only the endpoint's scopes to the MCP layer", async () => {
     const ownerId = randomId("o_");
     const token = await mintToken({ kind: "ro", scopes: [...ALL_SCOPES], ownerId });
-    const res = await call(PATH.ro, token);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ kind: "ro", ownerId, scope: [...SCOPES.ro] });
+    const res = await mcpRpc(token, "ro", "tools/call", { name: "whoami", arguments: {} });
+    expect(toolJson(res.result)).toMatchObject({ kind: "ro", ownerId, scopes: [...SCOPES.ro] });
   });
 
   it("keeps only the endpoint's own scopes", () => {
