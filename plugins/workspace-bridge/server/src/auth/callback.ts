@@ -7,6 +7,7 @@
 // with a keyed hash of the address, never the address.
 
 import { authorizationErrorRedirect } from "@cloudflare/workers-oauth-provider";
+import { auditRefusedSignin } from "../core/audit";
 import { config, type Env } from "../env";
 import { notConfigured, notice, redirect, signinClient } from "./consent";
 import { consumeFlow, FLOW_COOKIE, signinPayload } from "./flow-state";
@@ -99,11 +100,10 @@ async function finishSignin(
 
   const owner = await resolveOwner(env, identity.email, identity.sub);
   if (!owner.ok) {
-    log("signin_refused", {
-      reason: owner.reason,
-      email_hash: await emailHash(env, identity.email),
-      country: req.cf?.country ?? null,
-    });
+    const hash = await emailHash(env, identity.email);
+    const country = typeof req.cf?.country === "string" ? req.cf.country : null;
+    log("signin_refused", { reason: owner.reason, email_hash: hash, country });
+    await auditRefusedSignin(env, { reason: owner.reason, emailHash: hash, country });
     return notice(403, "Not allowed", "This Google account cannot sign in to this server.");
   }
 

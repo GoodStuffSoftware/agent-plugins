@@ -103,7 +103,11 @@ export function createSendAsCache(deps: SendAsDeps): SendAsCache {
   const { env } = deps;
   const nowS = (): number => Math.floor(deps.now() / 1000);
   const rows = (a: AccountRef): Promise<SendAsRow[]> =>
-    all<SendAsRow>(env.DB, "SELECT * FROM send_as WHERE account_id = ? ORDER BY email", a.accountId);
+    all<SendAsRow>(
+      env.DB,
+      "SELECT * FROM send_as WHERE account_id = ? ORDER BY email",
+      a.accountId,
+    );
 
   async function refresh(a: AccountRef): Promise<SendAsAddress[]> {
     if (!deps.use) throw new Error("sendAs.refresh needs ctx.use");

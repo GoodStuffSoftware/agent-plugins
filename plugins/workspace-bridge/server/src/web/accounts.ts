@@ -10,6 +10,7 @@ import { Hono } from "hono";
 import { notConfigured, signinClient, startSignin } from "../auth/consent";
 import { normalizeLabel, sealingNotReady, sealingReady, startLink } from "../auth/link";
 import { checkCsrf, csrfToken, readSession, type Session } from "../auth/session";
+import { writeAudit } from "../core/audit";
 import { currentKeyVersion, open, seal, type TokenKind } from "../core/crypto";
 import {
   type AccountRow,
@@ -199,7 +200,7 @@ accountsRoutes.get("/", async (c) => {
     .split(",")
     .filter(isAccountComponent);
   const body = html`<h1>Linked mailboxes</h1>
-<p>Signed in as ${session.email}.</p>
+<p>Signed in as ${session.email}. <a href="/accounts/audit">Sending switch and audit log</a></p>
 ${
   partial.length > 0
     ? html`<p><strong>Google did not grant everything asked for.</strong> These stay off: ${partial.map((p) => COMPONENT_LABELS[p]).join(", ")}.</p>`
@@ -566,7 +567,14 @@ accountsRoutes.post("/unlink", async (c) => {
       .prepare("DELETE FROM accounts WHERE id = ? AND owner_id = ?")
       .bind(account.id, session.ownerId),
   ]);
-  // M14: write the `unlink` audit row here (plan s.4.3 step 5, s.10.2).
+  await writeAudit(db, {
+    at: nowSeconds(),
+    ownerId: session.ownerId,
+    accountId: account.id,
+    tool: "unlink",
+    result: "ok",
+    detail: revoked ? "provider grant revoked" : "provider grant not revoked",
+  });
   console.log(
     JSON.stringify({
       event: "account_unlinked",

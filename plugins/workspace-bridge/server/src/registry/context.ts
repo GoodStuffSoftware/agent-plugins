@@ -1,10 +1,15 @@
 // Builds the ToolContext per call (ARCHITECTURE s.3.2): accounts, `ctx.use`, ids, cursors, the
-// untrusted wrapper and the guardrails (M9 stubs, M14 bodies), and holds the wrapper hooks for
+// untrusted wrapper and the guardrails (M14), and holds the wrapper hooks for
 // the per-grant rate check and the approval gate.
 
 import type { AuthInfo } from "@modelcontextprotocol/server";
 import { endpointScopes, type Kind } from "../auth/endpoints";
-import { accountState, createAccountResolver, loadAccountsWithState } from "../core/accounts";
+import {
+  type AccountResolver,
+  accountState,
+  createAccountResolver,
+  loadAccountsWithState,
+} from "../core/accounts";
 import { createAuditLog } from "../core/audit";
 import { cursors } from "../core/cursor";
 import { ToolError } from "../core/errors";
@@ -82,7 +87,7 @@ export function toolContext(scope: RequestScope, providers: ProviderRegistry): T
   const publicUrl = config(env).issuer;
   const accountsUrl = `${publicUrl}/accounts`;
   const now = Date.now;
-  return {
+  const ctx: ToolContext = {
     kind: scope.kind,
     ownerId,
     grant,
@@ -124,23 +129,25 @@ export function toolContext(scope: RequestScope, providers: ProviderRegistry): T
     },
     ids,
     cursors,
-    sendAs: createSendAsCache({ env, now }),
+    sendAs: createSendAsCache({ env, now, use: (cap, a) => ctx.use(cap, a) }),
     audit: createAuditLog({ env, ownerId, grant, now }),
     limits: createRateLimiter({ env, grant, now }),
-    pending: createPendingActions({ env, ownerId, grant, publicUrl, now }),
+    pending: createPendingActions({ env, ownerId, grant, kind: scope.kind, publicUrl, now }),
     waitUntil: (p) => scope.exec.waitUntil(p),
   };
+  return ctx;
 }
 
-/** Per-grant call limit (`ctx.limits.call`): throws `rate_limited` when over. The M9 stub never trips. */
+/** Per-grant call limit (`ctx.limits.call`): throws `rate_limited` when over. */
 export async function checkRate(def: ToolDef, ctx: ToolContext): Promise<void> {
   await ctx.limits.call(def.name);
 }
 
 /**
  * Approval gate. Returns the value to answer with instead of running the handler (the pending
- * action from `ctx.pending.create`), or `undefined` to run it. Until M14 stores pending actions,
- * `create` throws, so a call that needs approval fails closed rather than running unapproved.
+ * action from `ctx.pending.create`), or `undefined` to run it. `when` and `preview` see a resolver
+ * that records the accounts they resolve; the action is bound to that account, and the approved
+ * run sees only it. An action that resolves no account, or more than one, cannot be held (`internal`).
  */
 export async function gateApproval(
   def: ToolDef,
@@ -148,7 +155,20 @@ export async function gateApproval(
   ctx: ToolContext,
 ): Promise<unknown> {
   if (!def.approval) return undefined;
-  if (!(await def.approval.when(args as never, ctx))) return undefined;
-  const preview = await def.approval.preview(args as never, ctx);
-  return ctx.pending.create({ tool: def.name, params: args, preview });
+  const seen = new Map<string, AccountRef>();
+  const accounts: AccountResolver = {
+    async resolve(selector, idPrefix, opts) {
+      const found = await ctx.accounts.resolve(selector, idPrefix, opts);
+      for (const a of found) seen.set(a.accountId, a);
+      return found;
+    },
+  };
+  const gated: ToolContext = { ...ctx, accounts };
+  if (!(await def.approval.when(args as never, gated))) return undefined;
+  const preview = await def.approval.preview(args as never, gated);
+  const [account] = seen.values();
+  if (seen.size !== 1 || !account) {
+    throw new Error(`${def.name}: an action held for approval must address exactly one account`);
+  }
+  return ctx.pending.create({ tool: def.name, account, params: args, preview });
 }

@@ -4,15 +4,28 @@
 // token carries neither, so a client can never approve its own request.
 
 import { Hono } from "hono";
-import { endpointScopes } from "../auth/endpoints";
 import { notConfigured, notice, redirect, signinClient, startSignin } from "../auth/consent";
+import { endpointScopes } from "../auth/endpoints";
 import { getAuth } from "../auth/server";
 import { checkCsrf, csrfToken, readSession, type Session } from "../auth/session";
 import { createAccountResolver, loadAccountsWithState } from "../core/accounts";
 import { readAudit, writeAudit } from "../core/audit";
-import { first, getAccount, listAccounts, nowSeconds, type PendingActionRow, run } from "../core/db";
+import {
+  first,
+  getAccount,
+  listAccounts,
+  nowSeconds,
+  type PendingActionRow,
+  run,
+} from "../core/db";
 import { type ErrorCode, INTERNAL_MESSAGE, internalErrorLine, ToolError } from "../core/errors";
-import { decidePending, finishPending, loadPending, parseStoredCall, pendingInfo } from "../core/pending";
+import {
+  decidePending,
+  finishPending,
+  loadPending,
+  parseStoredCall,
+  pendingInfo,
+} from "../core/pending";
 import { config, type Env } from "../env";
 import { REGISTRY, type Registry } from "../registry/compile";
 import { type RequestScope, toolContext } from "../registry/context";
@@ -124,21 +137,21 @@ async function runApproved(
   };
   const base = toolContext(scope, registry.providers);
   const accountId = row.account_id;
-  const ctx: ToolContext =
-    accountId === null
-      ? base
-      : {
-          ...base,
-          accounts: createAccountResolver({
-            db: env.DB,
-            ownerId: row.owner_id,
-            publicUrl: base.publicUrl,
-            load: async () =>
-              (await loadAccountsWithState(env, row.owner_id)).filter(
-                (a) => a.accountId === accountId,
-              ),
-          }),
-        };
+  // Always narrowed: a row without an account (never written by the gate) sees no account at all.
+  const ctx: ToolContext = {
+    ...base,
+    accounts: createAccountResolver({
+      db: env.DB,
+      ownerId: row.owner_id,
+      publicUrl: base.publicUrl,
+      load: async () =>
+        accountId === null
+          ? []
+          : (await loadAccountsWithState(env, row.owner_id)).filter(
+              (a) => a.accountId === accountId,
+            ),
+    }),
+  };
   try {
     const value = await tool.def.handler(call.args as never, ctx);
     await finishPending(env.DB, row.id, "executed", value);
@@ -248,9 +261,18 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     if (status === "rejected") {
       return message(200, "Rejected", "The action was rejected and will not run.");
     }
-    const outcome = await runApproved(env, c.executionCtx, registry, row);
+    const outcome = await runApproved(
+      env,
+      c.executionCtx as unknown as ExecutionContext,
+      registry,
+      row,
+    );
     return outcome.ok
-      ? message(200, "Approved", "The action ran. The client can read its result with get_pending_action.")
+      ? message(
+          200,
+          "Approved",
+          "The action ran. The client can read its result with get_pending_action.",
+        )
       : message(200, "Approved, but it failed", `The action did not complete: ${outcome.message}`);
   });
 
@@ -308,7 +330,9 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
 <thead><tr><th>Time (UTC)</th><th>Account</th><th>Tool</th><th>Result</th><th>From</th><th>To, cc, bcc</th><th>Subject</th><th>Detail</th><th>Client</th></tr></thead>
 <tbody>
 ${rows.map(
-  (r) => html`<tr><td>${iso(r.at)}</td><td>${r.account_id ? (labels.get(r.account_id) ?? r.account_id) : ""}</td><td>${r.tool}</td><td>${r.result}</td><td>${r.from_addr ?? ""}</td><td>${[addresses(r.to_addrs), addresses(r.cc_addrs), addresses(r.bcc_addrs)].filter((x) => x).join("; ")}</td><td>${r.subject ?? ""}</td><td>${r.detail ?? ""}</td><td>${r.client_id ?? ""}</td></tr>
+  (
+    r,
+  ) => html`<tr><td>${iso(r.at)}</td><td>${r.account_id ? (labels.get(r.account_id) ?? r.account_id) : ""}</td><td>${r.tool}</td><td>${r.result}</td><td>${r.from_addr ?? ""}</td><td>${[addresses(r.to_addrs), addresses(r.cc_addrs), addresses(r.bcc_addrs)].filter((x) => x).join("; ")}</td><td>${r.subject ?? ""}</td><td>${r.detail ?? ""}</td><td>${r.client_id ?? ""}</td></tr>
 `,
 )}
 </tbody>

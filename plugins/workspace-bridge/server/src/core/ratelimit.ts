@@ -62,7 +62,10 @@ export function createRateLimiter(deps: RateLimiterDeps): RateLimiter {
     const key = accountKey(a.shortId);
     const hour = await hit(env.DB, `send:h:${a.accountId}`, t, 3600, c.sendPerHour);
     if (hour !== undefined) {
-      throw limited(`Account ${key} has reached its limit of ${c.sendPerHour} sends per hour.`, hour);
+      throw limited(
+        `Account ${key} has reached its limit of ${c.sendPerHour} sends per hour.`,
+        hour,
+      );
     }
     const day = await hit(env.DB, `send:d:${a.accountId}`, t, 86400, c.sendPerDay);
     if (day !== undefined) {
@@ -96,7 +99,7 @@ export function createRateLimiter(deps: RateLimiterDeps): RateLimiter {
         "SELECT send_kill_switch FROM owners WHERE id = ?",
         a.ownerId,
       );
-      if (!owner || owner.send_kill_switch !== 0) {
+      if (owner?.send_kill_switch !== 0) {
         throw new ToolError(
           "send_disabled",
           `Sending is switched off. The owner can switch it back on at ${accountsUrl}.`,

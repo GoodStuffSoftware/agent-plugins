@@ -52,7 +52,9 @@ describe.each(KINDS)("%s endpoint", (kind) => {
 
     const list = await mcpRpc(token, kind, "tools/list", {});
     const tools = list.result?.tools as { name: string }[];
-    expect(tools.map((t) => t.name)).toEqual(["whoami", "list_accounts", "link_account_url"]);
+    const toolNames = tools.map((t) => t.name);
+    expect(toolNames.slice(0, 3)).toEqual(["whoami", "list_accounts", "link_account_url"]);
+    expect(toolNames).toContain("get_pending_action");
     expect(tools[0]).toMatchObject({
       name: "whoami",
       inputSchema: { type: "object", properties: {} },
@@ -258,7 +260,7 @@ describe("tool results", () => {
     });
   });
 
-  it("fails closed on a call that needs approval until approvals exist", async () => {
+  it("fails closed on a call held for approval that addresses no account", async () => {
     const res = await directRpc("full", ["mail.read"], "tools/call", {
       name: "test_approval",
       arguments: {},
