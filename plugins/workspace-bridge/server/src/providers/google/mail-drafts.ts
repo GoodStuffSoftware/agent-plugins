@@ -343,6 +343,14 @@ async function update(a: AccountRef, draftId: string, input: UpdateDraftInput): 
   const m = current.message;
   if (!m?.id) throw malformed();
   const p = m.payload;
+  // Gmail rewrites the whole draft, and files cannot be given back until M16: refuse rather than
+  // drop them without a word.
+  if (listAttachments(p).length > 0) {
+    throw new ToolError(
+      "invalid_argument",
+      "This draft has attachments, which update_draft cannot keep yet. Create a new draft instead.",
+    );
+  }
   const h = (name: string) => headerOf(p, name);
   const inReplyTo = normalizeMessageId(h("In-Reply-To") ?? "") ?? undefined;
   const references = sanitizeReferences(h("References"));

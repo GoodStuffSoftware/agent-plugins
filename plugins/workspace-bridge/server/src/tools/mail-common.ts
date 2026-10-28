@@ -98,6 +98,17 @@ function checkRecipient(name: string, entry: string): string {
     );
   }
   const [address] = parseAddresses(value);
+  // What goes into the header is a bare address or `display name <address>`; a display name that
+  // itself holds angle brackets would make the header say something other than what was checked.
+  const angle = value.match(/^(?:"(?:[^"\\]|\\.)*"|[^<>"]*)\s*<([^<>]+)>$/s);
+  if (value.includes("<") || value.includes(">")) {
+    if (!angle || angle[1]?.trim().toLowerCase() !== address) {
+      throw new ToolError(
+        "invalid_argument",
+        `Each ${name} entry must be one address such as user@example.com or Name <user@example.com>.`,
+      );
+    }
+  }
   if (!address || !/^[^\s<>@",;()[\]\\]+@[^\s<>@",;()[\]\\]+\.[^\s<>@",;()[\]\\]+$/.test(address)) {
     throw new ToolError("invalid_argument", `A ${name} entry is not a valid email address.`);
   }

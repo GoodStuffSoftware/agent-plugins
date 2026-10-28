@@ -157,6 +157,7 @@ describe("RFC 2047", () => {
     expect(encodeAddress("Doe, John <j@example.com>")).toBe('"Doe, John" <j@example.com>');
     expect(encodeAddress('"Doe, John" <j@example.com>')).toBe('"Doe, John" <j@example.com>');
     expect(encodeAddress("j@example.com")).toBe("j@example.com");
+    expect(encodeAddress("Bob (work) <b@example.com>")).toBe('"Bob (work)" <b@example.com>');
   });
 
   it("does not encode a name twice when it is read back and rebuilt", () => {

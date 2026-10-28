@@ -158,7 +158,7 @@ export function encodeAddress(address: string): string {
   const name = quotedName ? trimmed.slice(1, -1).replace(/\\(.)/g, "$1") : trimmed;
   if (!name) return `<${addr}>`;
   if (!/^[\x20-\x7e]*$/.test(name)) return `${encodeHeader(name)} <${addr}>`;
-  return /[",;:<>@[\]\\]/.test(name)
+  return /[",;:<>@[\]\\().]/.test(name)
     ? `"${name.replace(/(["\\])/g, "\\$1")}" <${addr}>`
     : `${name} <${addr}>`;
 }

@@ -271,6 +271,19 @@ describe("create_draft", () => {
     expect(empty.isError).toBe(false);
   });
 
+  it("refuses an entry whose display name would smuggle in more addresses", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([]);
+    for (const entry of [
+      "x <a@example.com> <b@example.net, c@example.org>",
+      "x <a@example.com> <b@example.net>",
+    ]) {
+      const res = await call(ownerId, "create_draft", { to: [entry], body: "b" });
+      expect(res.json.error.code, entry).toBe("invalid_argument");
+    }
+    expect(calls).toHaveLength(0);
+  });
+
   it("enforces the recipient cap across to, cc and bcc", async () => {
     const { ownerId } = await setup();
     const calls = installGoogleRoutes([]);
@@ -822,6 +835,36 @@ describe("update_draft", () => {
     expect(header(raw, "In-Reply-To")).toBe("<orig@mail.example.net>");
     expect(header(raw, "References")).toBe("<root@mail.example.net> <orig@mail.example.net>");
     expect(bodies(raw)).toEqual(["edited"]);
+  });
+
+  it("refuses to rewrite a draft that carries attachments instead of dropping them", async () => {
+    const { ownerId } = await setup();
+    const withFile = {
+      id: "d1",
+      message: {
+        id: "m1",
+        threadId: "t1",
+        payload: {
+          mimeType: "multipart/mixed",
+          headers: [{ name: "To", value: "bob@example.com" }],
+          parts: [
+            { mimeType: "text/plain", body: { data: b64u("hi") } },
+            {
+              mimeType: "application/pdf",
+              filename: "a.pdf",
+              body: { attachmentId: "att1", size: 10 },
+            },
+          ],
+        },
+      },
+    };
+    const calls = installGoogleRoutes([
+      { url: `${BASE}/drafts/d1`, reply: () => googleJson(200, withFile) },
+    ]);
+    const res = await call(ownerId, "update_draft", { draftId: "d1", subject: "new" });
+    expect(res.json.error.code).toBe("invalid_argument");
+    expect(res.json.error.message).toMatch(/attachments/);
+    expect(calls).toHaveLength(1);
   });
 
   it("refuses a from alias, injection and attachments before changing anything", async () => {
