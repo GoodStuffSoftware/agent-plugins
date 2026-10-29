@@ -19,7 +19,6 @@ import { SEND } from "../services/mail-send";
 import type { AccountRef } from "../services/types";
 import { loadAccountRefs } from "./accounts";
 import { all, nowSeconds } from "./db";
-import { parseAddresses } from "./mime";
 
 /**
  * A conservative RFC 5321 subset: a local part of letters, digits and `._+-` starting with a
@@ -37,23 +36,27 @@ const MAX_SHOWN = 100;
 
 /**
  * The addresses of recipient entries (`a@x.com`, `Name <a@x.com>`): lowercase, trimmed, display
- * names stripped, deduplicated, in first-seen order. An entry that does not yield exactly one
- * address stays as its trimmed lowercase text (clipped), which fails the strict pattern and so
+ * names stripped, deduplicated, in first-seen order. An entry that is not exactly an address or
+ * `Name <address>` stays as its trimmed lowercase text (clipped), which fails the strict pattern and so
  * counts as NEW.
  */
 export function normalizeRecipients(entries: readonly string[]): string[] {
   const out = new Set<string>();
   for (const entry of entries) {
-    const found = parseAddresses(entry);
-    const one = found.length === 1 ? found[0] : undefined;
     out.add(
-      one
-        ? one.trim().toLowerCase()
-        : entry.replace(/\s+/g, " ").trim().toLowerCase().slice(0, MAX_SHOWN),
+      addressOf(entry) ?? entry.replace(/\s+/g, " ").trim().toLowerCase().slice(0, MAX_SHOWN),
     );
   }
   out.delete("");
   return [...out];
+}
+
+/** `a@x.com` or `Name <a@x.com>` (quoted or plain name) and nothing else, lowercase; else null. */
+function addressOf(entry: string): string | null {
+  const t = entry.trim();
+  const named = /^(?:"(?:[^"\\]|\\.)*"|[^<>"@]*)\s*<([^<>\s]+)>$/.exec(t)?.[1];
+  const one = named ?? (/^[^\s<>",;]+$/.test(t) ? t : null);
+  return one ? one.toLowerCase() : null;
 }
 
 const CHUNK = 80;
@@ -140,18 +143,20 @@ async function contactHits(
   } catch {
     return [];
   }
-  const hits = await Promise.all(
-    addresses.slice(0, LOOKUP_LIMITS.contacts).map(async (address) => {
-      try {
-        const found = await contacts.search(a, address, 10);
-        return found.some((p) => p.emails.some((e) => e.trim().toLowerCase() === address))
-          ? address
-          : null;
-      } catch {
-        return null;
-      }
-    }),
-  );
+  const look = async (address: string): Promise<string | null> => {
+    try {
+      const found = await contacts.search(a, address, 10);
+      return found.some((p) => p.emails.some((e) => e.trim().toLowerCase() === address))
+        ? address
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  // The first lookup alone: it pays the one-time cache warm-up of each source, which the rest
+  // (run together) then skip, so a cold account costs 4 calls for the first and 2 for each more.
+  const [head, ...tail] = addresses.slice(0, LOOKUP_LIMITS.contacts);
+  const hits = [await look(head as string), ...(await Promise.all(tail.map(look)))];
   return hits.filter((x): x is string => x !== null);
 }
 
