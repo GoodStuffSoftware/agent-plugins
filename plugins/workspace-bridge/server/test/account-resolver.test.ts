@@ -94,6 +94,18 @@ describe("account repository", () => {
 });
 
 describe("AccountResolver", () => {
+  it("matches a free-form label ignoring case and surrounding spaces", async () => {
+    const { ownerId, refs } = await ownerWith(
+      ["Mike's Workspace", "w@example.com"],
+      ["home", "h@example.com"],
+    );
+    const r = resolverFor(ownerId);
+    for (const sel of ["mike's workspace", "MIKE'S WORKSPACE", "  Mike's Workspace "]) {
+      expect(await r.resolve(sel)).toEqual([refs[0]]);
+    }
+    expect(await r.resolve("W@example.com")).toEqual([refs[0]]);
+  });
+
   it("resolves by label, address, short id and prefix", async () => {
     const { ownerId, refs } = await ownerWith(
       ["work", "work@example.com"],
@@ -174,26 +186,6 @@ describe("AccountResolver", () => {
     const r = resolverFor(mine.ownerId);
     expect((await failure(r.resolve("secret"))).code).toBe("account_not_found");
     expect((await failure(r.resolve("s@example.com"))).code).toBe("account_not_found");
-  });
-
-  it("is ambiguous when a selector matches two accounts", async () => {
-    // Labels are unique per owner but not across case; an address can equal another's label.
-    const { ownerId } = await ownerWith(
-      ["Work", "a@example.com"],
-      ["work", "b@example.com"],
-      ["b@example.com2", "c@example.com"],
-    );
-    const r = resolverFor(ownerId);
-    // Exact case wins.
-    expect((await r.resolve("Work"))[0]?.shortId).toBe(1);
-    expect((await r.resolve("work"))[0]?.shortId).toBe(2);
-    // Neither case matches exactly.
-    const err = await failure(r.resolve("WORK"));
-    expect(err.code).toBe("ambiguous_account");
-    expect(err.details).toEqual({
-      accountsUrl: `${PUBLIC_URL}/accounts`,
-      candidates: ["Work", "work"],
-    });
   });
 
   it("is ambiguous when a label equals another account's address", async () => {

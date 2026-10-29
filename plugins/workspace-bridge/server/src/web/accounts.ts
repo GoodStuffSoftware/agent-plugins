@@ -8,7 +8,14 @@
 
 import { Hono } from "hono";
 import { notConfigured, signinClient, startSignin } from "../auth/consent";
-import { normalizeLabel, sealingNotReady, sealingReady, startLink } from "../auth/link";
+import {
+  LABEL_MAX,
+  LABEL_RULE,
+  normalizeLabel,
+  sealingNotReady,
+  sealingReady,
+  startLink,
+} from "../auth/link";
 import { checkCsrf, csrfToken, readSession, type Session } from "../auth/session";
 import { writeAudit } from "../core/audit";
 import { currentKeyVersion, open, seal, type TokenKind } from "../core/crypto";
@@ -97,7 +104,13 @@ function accountRow(account: AccountRow, isDefault: boolean, csrf: string): Safe
   const id: [string, string] = ["account", account.id];
   const excess = excessScopes(on, parseScopes(account.granted_scopes));
   return html`<tr>
-<td>${account.label}</td>
+<td>${account.label}
+<form method="post" action="/accounts/rename" style="display:inline">
+<input type="hidden" name="csrf" value="${csrf}">
+<input type="hidden" name="account" value="${account.id}">
+<input name="label" required maxlength="${LABEL_MAX}" value="${account.label}" title="${LABEL_RULE}" aria-label="New label for ${account.address}">
+<button type="submit">Rename</button>
+</form></td>
 <td>${account.address}</td>
 <td>${account.provider}</td>
 <td><ul>${ACCOUNT_COMPONENTS.map((c) => {
@@ -166,7 +179,8 @@ function linkForm(csrf: string): SafeHtml {
   return html`<h2>Link a mailbox</h2>
 <form method="post" action="/accounts/link">
 <input type="hidden" name="csrf" value="${csrf}">
-<p><label>Label <input name="label" required maxlength="32" pattern="[a-z0-9][a-z0-9._\\-]{0,31}" placeholder="personal"></label></p>
+<p><label>Label <input name="label" required maxlength="${LABEL_MAX}" title="${LABEL_RULE}" placeholder="Personal" aria-describedby="label-help"></label><br>
+<small id="label-help">${LABEL_RULE} Capitals and spaces are fine; two mailboxes cannot differ only by case.</small></p>
 <p><label>Google address (optional) <input type="email" name="login_hint" maxlength="254"></label></p>
 <fieldset><legend>Components</legend>
 <ul>${ACCOUNT_COMPONENTS.map(
@@ -199,7 +213,9 @@ accountsRoutes.get("/", async (c) => {
   const partial = (new URL(c.req.url).searchParams.get("partial") ?? "")
     .split(",")
     .filter(isAccountComponent);
+  const relinked = new URL(c.req.url).searchParams.get("relinked");
   const body = html`<h1>Linked mailboxes</h1>
+${relinked ? html`<p><strong>Re-linked ${relinked}.</strong> A linked mailbox keeps its label; use Rename to change its name.</p>` : ""}
 <p>Signed in as ${session.email}. <a href="/accounts/audit">Sending switch and audit log</a></p>
 ${
   partial.length > 0
@@ -266,7 +282,7 @@ accountsRoutes.post("/link", async (c) => {
     return result(
       400,
       "Label not valid",
-      'Use up to 32 lowercase letters, digits, ".", "_" or "-", starting with a letter or digit. "all" is reserved.',
+      `${LABEL_RULE} The label cannot be empty or "all" in any case.`,
     );
   }
   const chosen = ACCOUNT_COMPONENTS.filter((k) => form.getAll("components").includes(k));
@@ -285,6 +301,55 @@ accountsRoutes.post("/link", async (c) => {
     components: chosen,
     ...(loginHint !== "" ? { loginHint } : {}),
   });
+});
+
+/**
+ * Renames a mailbox. Only the display label changes: the account id, tokens, short id and the
+ * default-mailbox choice are untouched. Same rules as linking, and no other mailbox of the owner
+ * may have the label, ignoring case.
+ */
+accountsRoutes.post("/rename", async (c) => {
+  const env = c.env;
+  const posted = await authorizeAccountPost(c.req.raw, env);
+  if (posted instanceof Response) return posted;
+  const { session, form, account } = posted;
+
+  const label = normalizeLabel(form.get("label"));
+  if (!label) {
+    return result(
+      400,
+      "Label not valid",
+      `${LABEL_RULE} The label cannot be empty or "all" in any case.`,
+    );
+  }
+  const clash = await first<{ id: string }>(
+    env.DB,
+    "SELECT id FROM accounts WHERE owner_id = ? AND lower(label) = lower(?) AND id <> ?",
+    session.ownerId,
+    label,
+    account.id,
+  );
+  if (clash) {
+    return result(
+      409,
+      "Label in use",
+      `Another mailbox already has the label "${label}" (labels are compared ignoring case). Pick another label.`,
+    );
+  }
+  try {
+    await env.DB.prepare(
+      "UPDATE accounts SET label = ?, updated_at = ? WHERE id = ? AND owner_id = ?",
+    )
+      .bind(label, nowSeconds(), account.id, session.ownerId)
+      .run();
+  } catch {
+    return result(
+      409,
+      "Label in use",
+      "Another mailbox already has that label. Pick another label.",
+    );
+  }
+  return result(200, "Mailbox renamed", `${account.address} is now labelled "${label}".`);
 });
 
 /**

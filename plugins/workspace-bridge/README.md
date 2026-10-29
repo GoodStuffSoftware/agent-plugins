@@ -19,7 +19,7 @@ If you already added the server by hand (`claude mcp add --transport http ...`) 
 
 ## Tools
 
-Every account-scoped tool takes `account` (label, address or short id; the default account when omitted). Ids come back prefixed with the account, such as `a1:18c2f...`.
+Every account-scoped tool takes `account` (label, matched ignoring case; or address or short id; the default account when omitted). Ids come back prefixed with the account, such as `a1:18c2f...`.
 
 **Mail read.** `search_threads`, `get_thread`, `get_message`. Mail text comes back inside `<untrusted-...>` blocks.
 
