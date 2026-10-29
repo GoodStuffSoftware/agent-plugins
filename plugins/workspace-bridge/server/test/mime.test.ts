@@ -3,7 +3,10 @@
 import { describe, expect, it } from "vitest";
 import { ToolError } from "../src/core/errors";
 import {
+  b64urlToBytes,
+  binaryToBytes,
   buildRfc822,
+  bytesToB64,
   canonicalAddress,
   decodeEncodedWords,
   encodeAddress,
@@ -298,5 +301,29 @@ describe("reading a Gmail payload", () => {
     };
     expect(extractBody(payload)).toBe("Hi\nthere &  you");
     expect(htmlToText("<style>x{}</style><p>a</p><script>1</script>")).toBe("a");
+  });
+});
+
+describe("base64 hot paths", () => {
+  const allBytes = Uint8Array.from({ length: 256 }, (_, i) => i);
+  // Larger than one 8192-byte chunk, so the chunk seams are hit (524,289 is a multiple of 3: no padding).
+  const big = Uint8Array.from({ length: 524_289 }, (_, i) => (i * 31 + 7) & 0xff);
+
+  it("bytesToB64 matches Buffer on every byte value and on a body spanning many chunks", () => {
+    for (const bytes of [new Uint8Array(0), new Uint8Array([1, 2]), allBytes, big]) {
+      expect(bytesToB64(bytes)).toBe(Buffer.from(bytes).toString("base64"));
+    }
+  });
+
+  it("b64urlToBytes round-trips url-safe base64", () => {
+    for (const bytes of [allBytes, big, new Uint8Array([251, 255, 254])]) {
+      const url = Buffer.from(bytes).toString("base64url");
+      expect(Array.from(b64urlToBytes(url))).toEqual(Array.from(bytes));
+    }
+  });
+
+  it("binaryToBytes maps each char code to one byte", () => {
+    expect(Array.from(binaryToBytes("\u0000Aÿ"))).toEqual([0, 65, 255]);
+    expect(binaryToBytes("")).toHaveLength(0);
   });
 });

@@ -23,20 +23,29 @@ const bad = (message: string): ToolError => new ToolError("invalid_argument", me
 
 // ---- Encoding ----------------------------------------------------------------------------------
 
-// Chunked binary-to-base64: a spread into String.fromCharCode overflows the argument limit on
-// bodies past a few tens of kilobytes.
+// Chunked binary-to-base64: one String.fromCharCode call over the whole body overflows the
+// argument limit past a few tens of kilobytes. `apply` with the typed array is about 6 times
+// faster than a spread of it (13 ms against 2 ms for 512 KB, bench/bench.mjs), which matters on
+// the Free plan's 10 ms CPU budget.
 export function bytesToB64(bytes: Uint8Array): string {
   let bin = "";
   const CHUNK = 8192;
   for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+    // biome-ignore lint/suspicious/noExplicitAny: apply takes a typed array at run time
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as any);
   }
   return btoa(bin);
 }
 
+/** A binary string (one char per byte, as `atob` returns) as bytes; a plain loop, not `Uint8Array.from`. */
+export function binaryToBytes(bin: string): Uint8Array {
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
 export function b64urlToBytes(s: string): Uint8Array {
-  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/"));
-  return Uint8Array.from(bin, (ch) => ch.charCodeAt(0));
+  return binaryToBytes(atob(s.replace(/-/g, "+").replace(/_/g, "/")));
 }
 
 // ---- Header safety and folding ------------------------------------------------------------------
@@ -583,7 +592,7 @@ export function decodeEncodedWords(value: string): string {
           try {
             const bytes =
               encoding.toUpperCase() === "B"
-                ? Uint8Array.from(atob(text), (ch) => ch.charCodeAt(0))
+                ? binaryToBytes(atob(text))
                 : Uint8Array.from(
                     text
                       .replace(/_/g, " ")
