@@ -10,7 +10,6 @@ import { isMediaType } from "../core/mime";
 import { config } from "../env";
 import { googleAttachments } from "../providers/google/mail-attachments";
 import { defineTool, type Family } from "../registry/types";
-import { provide } from "../services/capability";
 import { ATTACHMENTS } from "../services/mail-attachments";
 
 const getAttachment = defineTool({
@@ -40,7 +39,9 @@ const getAttachment = defineTool({
     const d = ctx.ids.parse(args.messageId);
     const [a] = await ctx.accounts.resolve(args.account, d?.shortId);
     if (!a) throw new ToolError("account_not_found", "No linked account.");
-    const file = await ctx.use(ATTACHMENTS, a).get(a, d?.providerId ?? args.messageId, args.attachmentId, cap);
+    const file = await ctx
+      .use(ATTACHMENTS, a)
+      .get(a, d?.providerId ?? args.messageId, args.attachmentId, cap);
     const wrap = (text: string) =>
       ctx.untrusted.wrap(text, { source: "email", account: accountKey(a.shortId) });
     const mimeType = file.mimeType ?? "application/octet-stream";
@@ -63,7 +64,9 @@ const getAttachment = defineTool({
         resource: {
           uri: `workspace-bridge://mail/${encodeURIComponent(messageId)}/attachment`,
           // The resource's own type field is plain metadata: never pass through a hostile string.
-          mimeType: isMediaType(mimeType.toLowerCase()) ? mimeType.toLowerCase() : "application/octet-stream",
+          mimeType: isMediaType(mimeType.toLowerCase())
+            ? mimeType.toLowerCase()
+            : "application/octet-stream",
           blob: file.content,
         },
       },
@@ -73,7 +76,7 @@ const getAttachment = defineTool({
 
 export const mailAttachments: Family = {
   id: "mail.attachments",
-  tools: [getAttachment] as never,
-  bindings: { google: [provide(ATTACHMENTS, googleAttachments)] },
+  tools: [getAttachment],
+  bindings: { google: [googleAttachments] },
   parityPending: [],
 };
