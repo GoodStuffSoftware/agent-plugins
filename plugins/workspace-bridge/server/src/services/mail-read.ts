@@ -10,6 +10,20 @@ export type MessageFormat = (typeof MESSAGE_FORMATS)[number];
 export const DEFAULT_MAX_BODY_CHARS = 8192;
 export const MAX_BODY_CHARS = 32_768;
 
+/**
+ * Limits on one `get_thread` answer (plan s.3.4: CPU on the free tier is about 5 ms per MB of Gmail
+ * JSON). Messages are read in full newest first while their inline text (plain and HTML part
+ * sizes, attachments not counted) adds up to at most `MAX_RESPONSE_FETCH_BYTES` (the newest always
+ * is); the others of the window return their headers, attachment list and a note to call get_message. The bodies kept in one answer total at most
+ * `MAX_RESPONSE_BODY_CHARS`; a body cut by that limit ends with `RESPONSE_CAP_NOTE`.
+ */
+export const MAX_RESPONSE_FETCH_BYTES = 640 * 1024;
+export const MAX_RESPONSE_BODY_CHARS = 100_000;
+export const RESPONSE_CAP_NOTE =
+  "[truncated: the response size limit was reached; call get_message with this message id to read the full body]";
+export const OMITTED_NOTE =
+  "[body not included: the response size limit was reached; call get_message with this message id to read it]";
+
 export interface SearchQuery {
   query?: string;
   labelIds?: string[];
@@ -37,6 +51,8 @@ export interface BodyOpts {
   format: MessageFormat;
   maxBodyChars: number;
   includeHtml: boolean;
+  /** Raw HTML bytes decoded for the text conversion; the provider default when absent. */
+  htmlBytes?: number;
 }
 
 export interface AttachmentInfo {
