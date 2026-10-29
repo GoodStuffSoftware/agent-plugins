@@ -8,10 +8,10 @@ import { htmlToText, truncateBody } from "../../core/html-text";
 import {
   type AttachmentInfo,
   type BodyOpts,
-  type MailMessage,
-  type MailReader,
   MAX_RESPONSE_BODY_CHARS,
   MAX_RESPONSE_FETCH_BYTES,
+  type MailMessage,
+  type MailReader,
   OMITTED_NOTE,
   RESPONSE_CAP_NOTE,
   type ThreadDetail,
@@ -192,7 +192,8 @@ function toMessage(m: GMessage, opts: BodyOpts): MailMessage {
     out.text = t.text;
     out.truncated = t.truncated;
   } else if (found.html.length > 0) {
-    const html = joinParts(found.html, HTML_DECODE_BYTES, HTML_DECODE_BYTES);
+    const decode = opts.htmlBytes ?? HTML_DECODE_BYTES;
+    const html = joinParts(found.html, decode, decode);
     const t = truncateBody(htmlToText(html.text, { maxChars: max * 4 + 4096 }), max, html.clipped);
     out.text = t.text;
     out.truncated = t.truncated;
@@ -374,7 +375,10 @@ export const googleMailRead: MailReader = {
         continue;
       }
       const maxBodyChars = Math.min(opts.maxBodyChars, left);
-      const m = toMessage(f, { ...opts, maxBodyChars });
+      // Markup runs about 12 bytes to a character of text, so a thread decodes only what the cut needs
+      // (get_message keeps the full budget).
+      const htmlBytes = Math.min(HTML_DECODE_BYTES, Math.max(32 * 1024, maxBodyChars * 12));
+      const m = toMessage(f, { ...opts, maxBodyChars, htmlBytes });
       if (maxBodyChars < opts.maxBodyChars && m.truncated) capNote(m);
       left -= (m.text?.length ?? 0) + (m.html?.length ?? 0);
       built[i] = m;
