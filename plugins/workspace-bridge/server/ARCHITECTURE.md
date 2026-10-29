@@ -272,6 +272,8 @@ Paths are under `plugins/workspace-bridge/server/`. M is the milestone that crea
 
 Families (`src/tools/<family>.ts` plus their `services/` and `providers/google/` files): `meta` (M5: `whoami`), `account` (M9: `list_accounts`, `link_account_url`), `guardrails` (M14: `list_send_as`, `get_pending_action`), `mail-read` (M10), `mail-labels` (M11), `mail-state` (M12), `mail-drafts` (M13), `mail-send` (M15), `mail-attachments` (M16), `mail-filters` (M17), `calendar` (M18), `drive-read` (M19), `drive-write` (M20), `contacts` (M21); `admin-*` later (A1-A3).
 
+Sending is off until `SEND_ENABLED` is `"true"` (default `"false"`); `checkSend` in `core/ratelimit.ts` then also needs the owner's `send_kill_switch` at 0 (a per-owner switch on `/accounts/audit`, not per account) before the recipient cap and the hourly and daily counters apply.
+
 New in `wrangler.example.jsonc` (M4a): vars `PUBLIC_URL` (the issuer, `https://mcp.example.com`, an origin with no trailing slash) and `OWNER_CONTACT` (shown on `/` and `/privacy`; empty hides the line), and the `DCR_LIMIT` `ratelimits` binding (10 per 60 s).
 
 ## 3. Contracts
@@ -470,7 +472,7 @@ export const mailLabels: Family = {
 | `mail.state`       | `StateService`: `modify(a, target, { add?, remove? })`, `trash(a, target)`, `untrash(a, target)`                                                     | M12 |
 | `mail.drafts`      | `DraftService`: `create`, `get`, `list`, `update`, `remove`                                                                                          | M13 |
 | `mail.sendas`      | `SendAsService`: `list(a)`                                                                                                                           | M14 |
-| `mail.send`        | `SendService`: `send(a, OutgoingMessage)`, `sendDraft(a, draftId)`                                                                                   | M15 |
+| `mail.send`        | `SendService`: `prepare(a, input)`, `deliver(a, prepared, { from?, includeSignature })`, `readDraft(a, draftId)`, `sendDraft(a, draftId)`            | M15 |
 | `mail.attachments` | `AttachmentService`: `get(a, messageId, attachmentId, maxBytes)`                                                                                     | M16 |
 | `mail.filters`     | `FilterService`: `list`, `create`, `remove`                                                                                                          | M17 |
 | `calendar`         | `CalendarService`: `listCalendars`, `calendarTimeZone`, `listEvents`, `getEvent`, `createEvent`, `updateEvent`, `deleteEvent`, `respond`, `freeBusy` | M18 |

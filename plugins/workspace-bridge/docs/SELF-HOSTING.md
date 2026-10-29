@@ -8,8 +8,6 @@ This guide uses these placeholder values. Replace them with your own.
 - Your Google account: `you@example.com`
 - Cloudflare account id: `<your-account-id>`
 
-Sections 8 and 9 (connectors and plugin install) and the account-linking details in section 10 are finalized at release 0.1.0. Everything else matches the code on the main branch today.
-
 ## 1. What you need
 
 - A Cloudflare account.
@@ -256,9 +254,18 @@ These are the endpoints the Worker serves:
 
 Do your first sign-ins (section 10), then turn it off. Set `"SETUP_MODE": "false"` in `wrangler.jsonc` and deploy again. With it off, an unpinned address is refused.
 
-## 8. Connect Claude (finalized at release 0.1.0)
+## 8. Connect Claude
 
-claude.ai: Settings, Connectors, Add custom connector, URL `https://mcp.example.com/mcp`. Sign in with an address from `OWNER_EMAILS` and approve the consent page. The consent page lists one checkbox per capability. Untick what you do not want this client to have.
+The server has two MCP endpoints. Pick by what the client does.
+
+| Endpoint | Use it for | What it holds |
+|---|---|---|
+| `https://mcp.example.com/mcp` | Your own interactive sessions | Every tool, including send, share, filter and trash, subject to the guards in section 10 |
+| `https://mcp.example.com/mcp/ro` | Routines and any unattended run | Reads, plus draft create and update. No send, forward, share, filter or trash tool exists there |
+
+Do not confuse the path `/mcp` with Claude Code's `/mcp` command. The command only manages connections.
+
+claude.ai: Settings, Connectors, Add custom connector. Use the URL of the endpoint you want. Sign in with an address from `OWNER_EMAILS` and approve the consent page. It lists one checkbox per capability that endpoint offers. Untick what you do not want this client to have. A client can never hold more than its endpoint allows, so `/mcp/ro` never offers mail send.
 
 Claude Code:
 
@@ -266,13 +273,21 @@ Claude Code:
 claude mcp add --transport http workspace-bridge https://mcp.example.com/mcp
 ```
 
+Then run `/mcp` inside Claude Code, choose `workspace-bridge` and authenticate. The browser opens the same consent page.
+
 Claude desktop: connectors added in claude.ai show up in the desktop app when you sign in with the same account.
 
-For routines, add a second connector at `https://mcp.example.com/mcp/ro`. It cannot send, share or delete, whatever the routine is told to do.
+For routines, add a second connector at the `/mcp/ro` URL and give the routine only that one. Name it differently:
 
-## 9. Install the plugin (finalized at release 0.1.0)
+```sh
+claude mcp add --transport http workspace-bridge-ro https://mcp.example.com/mcp/ro
+```
 
-The plugin adds a skill that teaches agents how to address accounts, search all accounts, treat mail text as untrusted and confirm before sending.
+A prompt injection in a mail body cannot make a routine send mail, because the tool is not there.
+
+## 9. Install the plugin
+
+The plugin adds a skill that teaches agents how to address accounts, search all accounts, treat mail text as untrusted and confirm before sending. It also registers the server for you.
 
 ```sh
 claude plugin marketplace add GoodStuffSoftware/agent-plugins
@@ -282,17 +297,49 @@ claude plugin marketplace add GoodStuffSoftware/agent-plugins
 claude plugin install workspace-bridge@goodstuff --config server_url=https://mcp.example.com
 ```
 
-`server_url` is your server's base URL, with no trailing slash and no `/mcp`. Inside Claude Code, `/plugin install workspace-bridge@goodstuff` opens a dialog that asks for it instead, and `/plugin configure` changes it later. The setting is required and has no default. The plugin registers the HTTP MCP server at `<server_url>/mcp` for you, so skip the `claude mcp add` command in section 8 when you use the plugin. If you already added that connector, you will see the tools twice: remove one of the two.
+`server_url` is your server's base URL. It must not end in a slash and must not include `/mcp`. The plugin appends `/mcp` itself, so `https://mcp.example.com/` would produce `https://mcp.example.com//mcp`. Inside Claude Code, `/plugin install workspace-bridge@goodstuff` opens a dialog that asks for it instead, and `/plugin configure` changes it later. The setting is required and has no default. Skip the `claude mcp add` command in section 8 when you use the plugin. If you already added that connector, you will see the tools twice: remove one of the two. The plugin does not add the `/mcp/ro` endpoint; add that one by hand for routines.
 
-## 10. Link accounts and choose components (details finalized at release 0.1.0)
+## 10. First sign-in, linking accounts, sending and approvals
 
-1. Open `https://mcp.example.com/accounts` and sign in with an address from `OWNER_EMAILS`. With setup mode on, this pins your `sub`.
-2. Link each Google account you want Claude to use. Pick the components for it: mail, calendar, files, contacts. Each component asks Google for only its own scopes.
-3. Google shows "Google hasn't verified this app". Click Advanced, then Go to workspace-bridge (unsafe), then Allow. This is expected for a private app.
-4. Turn `SETUP_MODE` off (section 7).
-5. Ask Claude to run `list_accounts` to confirm every account appears.
+### First sign-in and setup mode
 
-Sending stays off until you set `SEND_ENABLED` to `"true"` and redeploy. Set `SEND_REQUIRES_CONFIRM` to `"true"` if you want to approve every send on `/accounts`. `/accounts` also has a switch that disables all sending at once.
+1. Check that `SETUP_MODE` is `"true"` in `wrangler.jsonc` and that you deployed it (section 7).
+2. Open `https://mcp.example.com/accounts` in a browser, or connect from Claude (section 8). Either asks you to sign in with Google. Use an address from `OWNER_EMAILS`.
+3. The first successful sign-in pins that address to your Google account id (`sub`).
+4. Set `"SETUP_MODE": "false"` in `wrangler.jsonc` and run `npx wrangler deploy`. From then on an address that was never pinned, or that returns with a different Google account, is refused. To add another owner address later, turn setup mode on for its first sign-in, then off again.
+
+### Link accounts
+
+Signing in proves you are the owner. Linking connects a Google mailbox to the server.
+
+1. On `/accounts`, find the Link a mailbox form.
+2. Label: a short lowercase name such as `personal` or `work`. Tools refer to an account by label, address or short id.
+3. Google address (optional): preselects the account in Google's picker.
+4. Components, all ticked by default: Mail (read, organize, drafts, filters), Mail send, Calendar, Drive files, Contacts. Each asks Google only for its own scopes. Untick Mail send to make a mailbox unable to send whatever else is set.
+5. Click Link with Google. Google shows "Google hasn't verified this app". Click Advanced, then Go to workspace-bridge (unsafe), then Allow. This is expected for a private app (section 5).
+6. The address Google returns must be in `LINKABLE_EMAILS`. If it is not, the server shows "Not allowed", stores nothing and revokes the new grant.
+7. Repeat for each account. The page lists every account with its components, status and actions: Turn on or Turn off per component, Re-link, Re-link minimal, Unlink, and a Default mailbox selector for tools that name no account.
+8. Ask Claude to run `list_accounts` to confirm every account appears.
+
+Turning a component on later asks Google for only the added scopes. Turning one off stops it working at once, but Google keeps the old access until you press Re-link minimal, which revokes the grant and asks again for only what is on.
+
+### Sending and approvals
+
+Sending is off by default. `SEND_ENABLED` in `wrangler.jsonc` is `"false"` in the example config, and while it is not `"true"` every `send_message`, `reply` and `forward` is refused with `send_disabled`, and so is a filter that forwards mail. A send also needs the owner's sending switch on. That switch is one setting for the whole owner, not per account. You find it on `/accounts`, link Sending switch and audit log (`/accounts/audit`), which shows both settings, a button to switch sending off or on, and the audit log. Switching off blocks every send at once without a deploy. The switch starts on, so `SEND_ENABLED` is the setting that actually opens sending.
+
+A message goes out only when all of these allow it:
+
+- `SEND_ENABLED` is `"true"` (change it, then `npx wrangler deploy`).
+- The owner switch on `/accounts/audit` is on.
+- The account has the Mail send component on.
+- The client's grant includes mail send and it connected through `/mcp`, not `/mcp/ro`.
+- The limits hold: `SEND_PER_HOUR` and `SEND_PER_DAY` per account, `MAX_RECIPIENTS` per message.
+
+To approve each send by hand, set `SEND_REQUIRES_CONFIRM` to `"true"` and deploy. Then `send_message`, `reply` and `forward` do not send. They answer `pending_approval` with a preview and an `approvalUrl` such as `https://mcp.example.com/approvals/<id>`. Open that URL in the browser where you are signed in as owner. The page shows the preview and the exact stored arguments, with Approve and Reject buttons. Approving runs the action once, and the send guards above still apply at that moment. An agent cannot approve: no tool does it, and an MCP token is refused on that page. The agent reads the outcome with `get_pending_action`. An open approval expires after 24 hours, and at most 50 can be open at once.
+
+Some actions are held for approval whatever `SEND_REQUIRES_CONFIRM` says: a filter that forwards mail or that trashes or spams it, and sharing a Drive file with anyone, a domain or an outside address.
+
+Every send, filter change and share is written to the audit log on `/accounts/audit`, without message bodies. The daily cleanup deletes rows older than `AUDIT_RETENTION_DAYS` (default 365).
 
 ## 11. Routines: read-only grant
 
@@ -322,7 +369,26 @@ npx wrangler d1 migrations apply workspace-bridge --remote
 npx wrangler deploy
 ```
 
-Then confirm the new version. Call the `whoami` tool, which returns the server version, and compare with the release you deployed. `npx wrangler deployments list` should show a new deployment. Compare your `wrangler.jsonc` with the new `wrangler.example.jsonc` for added vars.
+Migrations are additive and safe to run again: wrangler applies only the ones not yet applied. Run them before the deploy so the new code finds its tables.
+
+Then confirm. `npx wrangler deployments list` should show a new deployment, and `curl https://mcp.example.com/health` should return 200. The `version` field in `/health` and in the `whoami` tool is a fixed `0.0.0` in release 0.1.0, so it does not tell you which release is live; use the git tag you checked out and the deployment list. Compare your `wrangler.jsonc` with the new `wrangler.example.jsonc` for added vars.
+
+### Rotating the token encryption key
+
+Google tokens are sealed with `TOKEN_KEK`, which is key version 1. To move to a new key without relinking anything:
+
+1. Generate a value with `openssl rand -base64 32` and store it in your password manager.
+2. Set it as a new secret named `TOKEN_KEK_v2`. Leave `TOKEN_KEK` in place, because existing tokens still need it.
+
+```sh
+npx wrangler secret put TOKEN_KEK_v2
+```
+
+3. Set `"CURRENT_KEY_VERSION": "2"` in `wrangler.jsonc` and run `npx wrangler deploy`. New seals use version 2. A token moves to version 2 the next time it refreshes.
+4. To move them all now, open `/accounts` and press Re-encrypt all tokens in the Token encryption section. It reports how many stored tokens still use another version.
+5. Keep `TOKEN_KEK` and its backup until that count is 0. Version N reads the secret `TOKEN_KEK_vN`; a version whose secret is missing cannot be opened.
+
+The next rotation uses `TOKEN_KEK_v3` and `"CURRENT_KEY_VERSION": "3"`.
 
 ## 13. Troubleshooting
 
@@ -338,6 +404,15 @@ Then confirm the new version. Call the `whoami` tool, which returns the server v
 2. `SETUP_MODE` was `"true"` the first time you signed in. If you turned it off before the first sign-in, nothing is pinned and the address is refused. Turn it on, sign in once, turn it off.
 3. The Google account is the same one you pinned. A different Google account using the same address, or one already pinned to another address, is refused.
 4. The secrets exist. When sign-in is not configured, `/authorize` returns 503 while `/health` still returns 200.
+
+**An account refused when linking ("Not allowed").** The Google address you chose is not in `LINKABLE_EMAILS`, which is separate from `OWNER_EMAILS`. Nothing is stored and the new grant is revoked. Add the address to the secret (comma-separated, lowercase, no wildcards), run `npx wrangler secret put LINKABLE_EMAILS` with the full list, and link again. "Wrong Google account" means you picked a different Google account while relinking; relink with the account whose address is listed.
+
+**429 or `rate_limited`.** Four different limits give this, and each says which in its message.
+
+- Too many tool calls on one connection: 120 a minute per grant. Wait the `retryAfterSeconds` it reports.
+- Too many sends: `SEND_PER_HOUR` or `SEND_PER_DAY` per account. Raise the var and deploy, or wait.
+- HTTP 429 with `temporarily_unavailable` on `/oauth/register`: more than 10 client registrations a minute from one IP. Retry after 60 seconds.
+- Google itself is limiting the account. Wait the `retryAfterSeconds` it reports.
 
 **Custom domain does not answer, or the certificate is not ready.** Cloudflare creates the DNS record and issues the certificate on the first deploy. This can take a few minutes. Check that the zone is on Cloudflare, that no other DNS record already uses the host, and that `routes[0].pattern` matches the host without `https://`. Retry after a few minutes before changing anything.
 

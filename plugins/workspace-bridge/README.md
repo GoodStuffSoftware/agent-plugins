@@ -13,7 +13,7 @@ The server is one Cloudflare Worker (source in [`server/`](server)). It runs on 
 /plugin install workspace-bridge@goodstuff
 ```
 
-Claude Code asks for one setting, `server_url`: the base URL of your server, with no trailing slash and no `/mcp` suffix, for example `https://mcp.example.com`. It has no default. The plugin registers the HTTP MCP server at `<server_url>/mcp` and adds a skill that teaches agents how to use it. Sign in through the OAuth prompt with an address your server allows.
+Claude Code asks for one setting, `server_url`: the base URL of your server, which must not end in a slash and must not include `/mcp`, for example `https://mcp.example.com`. It has no default. The plugin registers the HTTP MCP server at `<server_url>/mcp` and adds a skill that teaches agents how to use it. Sign in through the OAuth prompt with an address your server allows.
 
 If you already added the server by hand (`claude mcp add --transport http ...`) or as a claude.ai connector, you do not need the plugin's server entry. Use one or the other, or you will see the tools twice.
 
