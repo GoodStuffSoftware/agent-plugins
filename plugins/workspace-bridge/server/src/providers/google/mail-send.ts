@@ -21,7 +21,6 @@ import {
   binaryToBytes,
   buildRfc822,
   decodeEncodedWords,
-  escapeHtml,
   extractBody,
   forwardHeaderBlock,
   forwardHtmlBlock,
@@ -46,6 +45,7 @@ import {
 } from "../../core/mime";
 import { isQueryableAddress } from "../../core/recipients";
 import type { SendAsAddress } from "../../core/send-as";
+import { appendSignature, signatureFor } from "../../core/signature";
 import { provide } from "../../services/capability";
 import {
   type AttachmentTotals,
@@ -310,11 +310,8 @@ function compose(
   signature: string | undefined,
 ): { body: string; htmlBody?: string } {
   let text = m.body;
-  let html = m.htmlBody ?? (signature ? escapeHtml(text).replace(/\n/g, "<br>\n") : undefined);
-  if (signature) {
-    text += `\n\n-- \n${htmlToText(signature)}`;
-    html = `${html ?? ""}<br>\n-- <br>\n${signature}`;
-  }
+  let html = m.htmlBody;
+  if (signature) ({ text, html } = appendSignature({ text, html }, signature));
   if (m.quote) {
     text = text ? `${text}\n\n${m.quote.plain}` : m.quote.plain;
     if (html !== undefined) html += `\n${m.quote.html}`;
@@ -340,12 +337,23 @@ async function deliver(
   opts: {
     from?: SendAsAddress | undefined;
     includeSignature: boolean;
+    signatureOptional?: boolean | undefined;
     maxAttachmentBytes: number;
   },
 ): Promise<SentMessage> {
-  const signature = opts.includeSignature
-    ? await signatureOf(a, opts.from?.email ?? a.address)
-    : undefined;
+  let signature: string | undefined;
+  if (opts.includeSignature) {
+    try {
+      signature = await signatureFor(
+        (email) => signatureOf(a, email),
+        opts.from?.email ?? a.address,
+        a.address,
+      );
+    } catch (e) {
+      // A signature added by default never stops a send; one the caller asked for does.
+      if (!opts.signatureOptional || !(e instanceof ToolError) || e.code === "internal") throw e;
+    }
+  }
   const carried = await fetchCarried(a, m, opts.maxAttachmentBytes);
   const raw = buildRfc822(
     {

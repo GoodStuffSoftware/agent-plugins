@@ -86,6 +86,8 @@ export interface AccountRow {
   granted_scopes: string;
   status: AccountStatus;
   send_as_fetched_at: number | null;
+  /** 1: add the Gmail signature to a send whose caller did not say; 0: do not. */
+  signature_default: 0 | 1;
   created_at: number;
   updated_at: number;
 }

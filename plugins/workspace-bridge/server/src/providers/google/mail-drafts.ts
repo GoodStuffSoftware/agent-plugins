@@ -15,7 +15,6 @@ import {
   b64urlToBytes,
   buildRfc822,
   decodeEncodedWords,
-  escapeHtml,
   extractBody,
   extractHtmlBody,
   type GmailPart,
@@ -34,6 +33,7 @@ import {
   singleLine,
   truncate,
 } from "../../core/mime";
+import { appendSignature, signatureFor } from "../../core/signature";
 import { provide } from "../../services/capability";
 import {
   type CreateDraftInput,
@@ -284,12 +284,8 @@ function compose(parts: {
   quote?: { plain: string; html: string } | undefined;
 }): { body: string; htmlBody?: string } {
   let text = parts.body ?? (parts.htmlBody ? htmlToText(parts.htmlBody) : "");
-  let html =
-    parts.htmlBody ?? (parts.signature ? escapeHtml(text).replace(/\n/g, "<br>\n") : undefined);
-  if (parts.signature) {
-    text += `\n\n-- \n${htmlToText(parts.signature)}`;
-    html = `${html ?? ""}<br>\n-- <br>\n${parts.signature}`;
-  }
+  let html = parts.htmlBody;
+  if (parts.signature) ({ text, html } = appendSignature({ text, html }, parts.signature));
   if (parts.quote) {
     text = text ? `${text}\n\n${parts.quote.plain}` : parts.quote.plain;
     if (html !== undefined) html += `\n${parts.quote.html}`;
@@ -319,7 +315,11 @@ async function create(a: AccountRef, input: CreateDraftInput): Promise<Draft> {
     }
   }
   const signature = input.includeSignature
-    ? await signatureOf(a, input.from?.email ?? a.address)
+    ? await signatureFor(
+        (email) => signatureOf(a, email),
+        input.from?.email ?? a.address,
+        a.address,
+      )
     : undefined;
   const text = compose({
     body: input.body,

@@ -193,6 +193,7 @@ describe("core tables", () => {
       "0002_core.sql",
       "0003_label_nocase.sql",
       "0004_send_recipients.sql",
+      "0005_signature_default.sql",
     ]);
     const columns = await env.DB.prepare("SELECT name FROM pragma_table_info('accounts')").all<{
       name: string;

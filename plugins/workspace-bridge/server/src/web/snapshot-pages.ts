@@ -44,6 +44,7 @@ const account = (over: Partial<AccountRow>): AccountRow => ({
   granted_scopes: "",
   status: "ok",
   send_as_fetched_at: null,
+  signature_default: 1,
   created_at: 0,
   updated_at: 0,
   ...over,

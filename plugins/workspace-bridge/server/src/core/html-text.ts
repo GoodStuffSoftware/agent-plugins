@@ -416,3 +416,75 @@ export function truncateBody(text: string, max: number, clipped = false): Trunca
   if (cut > 0 && last >= 0xd800 && last <= 0xdbff) cut--;
   return { text: text.slice(0, cut) + truncationMarker(cut), truncated: true };
 }
+
+/**
+ * `html` with every `<img>` that carries its picture inside the message (a `data:` URI) or points
+ * at a MIME part (`cid:`) taken out; the image's `alt` text stays in its place. Gmail turns such
+ * an image into an inline attachment when it sends the message, and mail clients such as Yahoo
+ * then show that part as a broken attachment. An `<img>` with a web address is left alone. One
+ * forward scan, like `htmlToText`.
+ */
+export function dropEmbeddedImages(html: string): string {
+  const lower = asciiLower(html);
+  let out = "";
+  let from = 0;
+  let at = nextPicture(lower, 0);
+  while (at >= 0) {
+    const name = lower.startsWith("<img", at) ? "img" : "source";
+    const after = lower.charCodeAt(at + 1 + name.length);
+    if ((after >= 97 && after <= 122) || (after >= 48 && after <= 57) || after === 45) {
+      at = nextPicture(lower, at + 4); // <image>, <imgx>: some other element
+      continue;
+    }
+    const end = tagEnd(html, at);
+    if (end < 0) {
+      // No `>` closes this tag, so a browser would not draw it; cut it and the rest here, which
+      // also keeps the scan linear (every later start would only scan to the end again).
+      out += html.slice(from, at);
+      return out;
+    }
+    const rest = html.slice(at + 1 + name.length, end - 1).replace(/^\/+/, " ");
+    if (embeddedSource(rest)) {
+      const alt = name === "img" ? attr(rest, "alt").trim() : "";
+      out += html.slice(from, at);
+      out += alt.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      from = end;
+      at = nextPicture(lower, from);
+    } else {
+      at = nextPicture(lower, at + 4);
+    }
+  }
+  return from === 0 ? html : out + html.slice(from);
+}
+
+/** The next `<img` or `<source` at or after `from`. */
+function nextPicture(lower: string, from: number): number {
+  const img = lower.indexOf("<img", from);
+  const source = lower.indexOf("<source", from);
+  return img < 0 ? source : source < 0 ? img : Math.min(img, source);
+}
+
+/** The index after the `>` that closes the tag at `at`, skipping a `>` inside quotes; -1 if none. */
+function tagEnd(html: string, at: number): number {
+  let quote = "";
+  for (let j = at + 1; j < html.length; j++) {
+    const c = html[j] as string;
+    if (quote) {
+      if (c === quote) quote = "";
+    } else if (c === '"' || c === "'") quote = c;
+    else if (c === ">") return j + 1;
+  }
+  return -1;
+}
+
+/** Whether the src or srcset of a tag (the text after its name) is a `data:` or `cid:` address. */
+function embeddedSource(rest: string): boolean {
+  for (const name of ["src", "srcset"]) {
+    const value = attr(rest, name)
+      .replace(/&colon;|&#0*58;|&#x0*3a;/gi, ":")
+      .replace(/[\t\n\r]/g, "")
+      .trim();
+    if (/^(?:data|cid):/i.test(value)) return true;
+  }
+  return false;
+}

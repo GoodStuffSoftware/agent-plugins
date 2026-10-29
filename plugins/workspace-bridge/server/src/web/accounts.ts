@@ -257,6 +257,24 @@ accountsRoutes.post("/allow/remove", async (c) => {
   return backToAccounts(env);
 });
 
+/** Turns "Add my Gmail signature" on or off for a mailbox (the default for sends that do not say). */
+accountsRoutes.post("/signature", async (c) => {
+  const env = c.env;
+  const posted = await authorizeAccountPost(c.req.raw, env);
+  if (posted instanceof Response) return posted;
+  const { session, form, account } = posted;
+  const on = form.get("on");
+  if (on !== "0" && on !== "1") {
+    return result(400, "Request refused", "Choose on or off.");
+  }
+  await env.DB.prepare(
+    "UPDATE accounts SET signature_default = ?, updated_at = ? WHERE id = ? AND owner_id = ?",
+  )
+    .bind(Number(on), nowSeconds(), account.id, session.ownerId)
+    .run();
+  return backToAccounts(env);
+});
+
 accountsRoutes.post("/link", async (c) => {
   const env = c.env;
   const posted = await authorizePost(c.req.raw, env);

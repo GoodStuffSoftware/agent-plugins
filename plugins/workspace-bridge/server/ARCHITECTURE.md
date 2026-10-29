@@ -473,21 +473,21 @@ export const mailLabels: Family = {
 };
 ```
 
-| Capability         | Interface and methods                                                                                                                                | M   |
-| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
-| `mail.read`        | `MailReader`: `search(a, q)`, `getThread(a, id, BodyOpts)`, `getMessage(a, id, BodyOpts)`                                                            | M10 |
-| `mail.labels`      | `LabelService`: above                                                                                                                                | M11 |
-| `mail.state`       | `StateService`: `modify(a, target, { add?, remove? })`, `trash(a, target)`, `untrash(a, target)`                                                     | M12 |
-| `mail.drafts`      | `DraftService`: `create`, `get`, `list`, `update`, `remove`                                                                                          | M13 |
-| `mail.sendas`      | `SendAsService`: `list(a)`                                                                                                                           | M14 |
-| `mail.send`        | `SendService`: `prepare(a, input)`, `deliver(a, prepared, { from?, includeSignature })`, `readDraft(a, draftId)`, `sendDraft(a, draftId)`            | M15 |
-| `mail.attachments` | `AttachmentService`: `get(a, messageId, attachmentId, maxBytes)`                                                                                     | M16 |
-| `mail.filters`     | `FilterService`: `list`, `create`, `remove`                                                                                                          | M17 |
-| `calendar`         | `CalendarService`: `listCalendars`, `calendarTimeZone`, `listEvents`, `getEvent`, `createEvent`, `updateEvent`, `deleteEvent`, `respond`, `freeBusy` | M18 |
-| `files.read`       | `FileReader`: `search`, `recent`, `metadata`, `readText`, `download`, `permissions`                                                                  | M19 |
-| `files.write`      | `FileWriter`: `create`, `update`, `copy`, `share`, `trash`                                                                                           | M20 |
-| `contacts`         | `ContactService`: `search`, `get`                                                                                                                    | M21 |
-| `admin.directory`  | `DirectoryAdminService`: users, aliases, groups, members, domains                                                                                    | A1  |
+| Capability         | Interface and methods                                                                                                                                         | M   |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- |
+| `mail.read`        | `MailReader`: `search(a, q)`, `getThread(a, id, BodyOpts)`, `getMessage(a, id, BodyOpts)`                                                                     | M10 |
+| `mail.labels`      | `LabelService`: above                                                                                                                                         | M11 |
+| `mail.state`       | `StateService`: `modify(a, target, { add?, remove? })`, `trash(a, target)`, `untrash(a, target)`                                                              | M12 |
+| `mail.drafts`      | `DraftService`: `create`, `get`, `list`, `update`, `remove`                                                                                                   | M13 |
+| `mail.sendas`      | `SendAsService`: `list(a)`                                                                                                                                    | M14 |
+| `mail.send`        | `SendService`: `prepare(a, input)`, `deliver(a, prepared, { from?, includeSignature, signatureOptional? })`, `readDraft(a, draftId)`, `sendDraft(a, draftId)` | M15 |
+| `mail.attachments` | `AttachmentService`: `get(a, messageId, attachmentId, maxBytes)`                                                                                              | M16 |
+| `mail.filters`     | `FilterService`: `list`, `create`, `remove`                                                                                                                   | M17 |
+| `calendar`         | `CalendarService`: `listCalendars`, `calendarTimeZone`, `listEvents`, `getEvent`, `createEvent`, `updateEvent`, `deleteEvent`, `respond`, `freeBusy`          | M18 |
+| `files.read`       | `FileReader`: `search`, `recent`, `metadata`, `readText`, `download`, `permissions`                                                                           | M19 |
+| `files.write`      | `FileWriter`: `create`, `update`, `copy`, `share`, `trash`                                                                                                    | M20 |
+| `contacts`         | `ContactService`: `search`, `get`                                                                                                                             | M21 |
+| `admin.directory`  | `DirectoryAdminService`: users, aliases, groups, members, domains                                                                                             | A1  |
 
 ```ts
 // Design. src/providers/registry.ts

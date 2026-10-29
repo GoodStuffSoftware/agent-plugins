@@ -1010,6 +1010,45 @@ describe("default account", () => {
   });
 });
 
+describe("Add my Gmail signature", () => {
+  const signatureOf = async (a: AccountRow): Promise<number | undefined> =>
+    (await accounts()).find((x) => x.id === a.id)?.signature_default;
+
+  it("is on for a new mailbox and toggles from the page", async () => {
+    const browser = await signIn();
+    const a = await linked(browser, "first");
+    expect(await signatureOf(a)).toBe(1);
+    let html = (await accountsPage(browser)).html;
+    expect(html).toContain("<h2>Gmail signature</h2>");
+    expect(html).toContain("<strong>on</strong>");
+
+    expect((await control(browser, "signature", a, [["on", "0"]])).status).toBe(303);
+    expect(await signatureOf(a)).toBe(0);
+    html = (await accountsPage(browser)).html;
+    expect(html).toContain("<strong>off</strong>");
+
+    expect((await control(browser, "signature", a, [["on", "1"]])).status).toBe(303);
+    expect(await signatureOf(a)).toBe(1);
+  });
+
+  it("refuses a bad value, a foreign mailbox and a missing token", async () => {
+    const browser = await signIn();
+    const a = await linked(browser, "first");
+    expect((await control(browser, "signature", a, [["on", "yes"]])).status).toBe(400);
+    expect((await control(browser, "signature", a)).status).toBe(400);
+    expect(
+      (await control(browser, "signature", { ...a, id: "ac_aaaaaaaaaaaaaaaa" }, [["on", "0"]]))
+        .status,
+    ).toBe(404);
+    const noToken = await post(browser, "/accounts/signature", [
+      ["account", a.id],
+      ["on", "0"],
+    ]);
+    expect(noToken.status).toBe(403);
+    expect(await signatureOf(a)).toBe(1);
+  });
+});
+
 describe("re-encrypt all", () => {
   const key2 = btoa(String.fromCharCode(...randomBytes(32)));
 

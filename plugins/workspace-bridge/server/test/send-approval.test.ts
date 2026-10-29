@@ -66,7 +66,9 @@ async function setup() {
   const linked = await linkGoogleAccount(ownerId, {
     components: ["mail", "mail.send", "calendar", "contacts"],
   });
-  await env.DB.prepare("UPDATE accounts SET send_as_fetched_at = ? WHERE id = ?")
+  await env.DB.prepare(
+    "UPDATE accounts SET send_as_fetched_at = ?, signature_default = 0 WHERE id = ?",
+  )
     .bind(Math.floor(Date.now() / 1000), linked.row.id)
     .run();
   return { ownerId, accountId: linked.row.id, key: `a${linked.row.short_id}` };

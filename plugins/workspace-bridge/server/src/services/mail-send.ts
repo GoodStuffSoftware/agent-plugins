@@ -118,6 +118,8 @@ export interface SendService {
     opts: {
       from?: SendAsAddress | undefined;
       includeSignature: boolean;
+      /** The signature came from the account's default, not the caller: a failed fetch skips it. */
+      signatureOptional?: boolean | undefined;
       /** Cap on the files of the message; checked again against what was really fetched. */
       maxAttachmentBytes: number;
     },

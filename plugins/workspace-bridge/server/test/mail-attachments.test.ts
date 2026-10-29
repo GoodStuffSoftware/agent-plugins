@@ -52,7 +52,9 @@ const ON = (extra: Partial<Env> = {}): Env => withEnv({ SEND_ENABLED: "true", ..
 async function setup() {
   const ownerId = await newOwner();
   const linked = await linkGoogleAccount(ownerId, { components: ["mail", "mail.send"] });
-  await env.DB.prepare("UPDATE accounts SET send_as_fetched_at = ? WHERE id = ?")
+  await env.DB.prepare(
+    "UPDATE accounts SET send_as_fetched_at = ?, signature_default = 0 WHERE id = ?",
+  )
     .bind(Math.floor(Date.now() / 1000), linked.row.id)
     .run();
   return { ownerId, key: `a${linked.row.short_id}` };

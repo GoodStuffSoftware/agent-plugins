@@ -14,6 +14,7 @@
 // records the count and total size of the files, never their content.
 
 import { z } from "zod";
+import { first } from "../core/db";
 import { ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
 import { parseAddresses } from "../core/mime";
@@ -50,7 +51,29 @@ const idParam = (what: string) => z.string().min(1).max(512).describe(what);
 const includeSignatureParam = z
   .boolean()
   .optional()
-  .describe("Append the account's Gmail signature for the From address. Defaults to false.");
+  .describe(
+    "Append the account's Gmail signature for the From address (an alias with no signature of its own uses the account's main one). When omitted, the account's \"Add my Gmail signature\" setting decides; it is on unless the owner turned it off. false never adds it.",
+  );
+
+/**
+ * Whether this send carries the signature: the caller's `includeSignature` when given, else the
+ * account's setting (on by default). A signature that came from the setting never stops a send
+ * (`signatureOptional`); one the caller asked for does when it cannot be fetched.
+ */
+async function signatureChoice(
+  ctx: ToolContext,
+  a: AccountRef,
+  asked: boolean | undefined,
+): Promise<{ includeSignature: boolean; signatureOptional: boolean }> {
+  if (asked !== undefined) return { includeSignature: asked, signatureOptional: false };
+  const row = await first<{ signature_default: number }>(
+    ctx.env.DB,
+    "SELECT signature_default FROM accounts WHERE id = ? AND owner_id = ?",
+    a.accountId,
+    a.ownerId,
+  );
+  return { includeSignature: row?.signature_default !== 0, signatureOptional: true };
+}
 
 /** The provider id of a (possibly prefixed) id, and the account a prefix names. */
 function idOf(ctx: ToolContext, id: string): { shortId: number | undefined; providerId: string } {
@@ -555,10 +578,10 @@ const sendMessage = defineTool({
         recipients: () => given,
         attachments: prepared.attachmentTotals,
       },
-      (from) =>
+      async (from) =>
         sender.deliver(a, prepared, {
           from,
-          includeSignature: args.includeSignature === true,
+          ...(await signatureChoice(ctx, a, args.includeSignature)),
           maxAttachmentBytes: sendCap(ctx),
         }),
     );
@@ -669,10 +692,10 @@ const reply = defineTool({
         recipients: () => checkRecipients(ctx.env, prepared),
         attachments: prepared.attachmentTotals,
       },
-      (from) =>
+      async (from) =>
         sender.deliver(a, prepared, {
           from,
-          includeSignature: args.includeSignature === true,
+          ...(await signatureChoice(ctx, a, args.includeSignature)),
           maxAttachmentBytes: sendCap(ctx),
         }),
     );
@@ -803,10 +826,10 @@ const forward = defineTool({
         recipients: () => given,
         attachments: prepared.attachmentTotals,
       },
-      (from) =>
+      async (from) =>
         sender.deliver(a, prepared, {
           from,
-          includeSignature: args.includeSignature === true,
+          ...(await signatureChoice(ctx, a, args.includeSignature)),
           maxAttachmentBytes: cap,
         }),
     );

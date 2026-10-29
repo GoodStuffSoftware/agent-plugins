@@ -64,7 +64,9 @@ async function setup(label = "work") {
     label,
     components: ["mail", "mail.send", "calendar", "contacts"],
   });
-  await env.DB.prepare("UPDATE accounts SET send_as_fetched_at = ? WHERE id = ?")
+  await env.DB.prepare(
+    "UPDATE accounts SET send_as_fetched_at = ?, signature_default = 0 WHERE id = ?",
+  )
     .bind(nowSeconds(), linked.row.id)
     .run();
   return { ownerId, accountId: linked.row.id, address: linked.row.address };

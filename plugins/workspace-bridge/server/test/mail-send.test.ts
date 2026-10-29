@@ -58,7 +58,9 @@ async function setup(opts: { fresh?: boolean } = {}) {
   const ownerId = await newOwner();
   const linked = await linkGoogleAccount(ownerId, { components: ["mail", "mail.send"] });
   if (opts.fresh !== false) {
-    await env.DB.prepare("UPDATE accounts SET send_as_fetched_at = ? WHERE id = ?")
+    await env.DB.prepare(
+      "UPDATE accounts SET send_as_fetched_at = ?, signature_default = 0 WHERE id = ?",
+    )
       .bind(Math.floor(Date.now() / 1000), linked.row.id)
       .run();
   }
@@ -878,5 +880,223 @@ describe("endpoints", () => {
     expect(res.isError).toBe(true);
     expect(calls).toHaveLength(0);
     expect(await auditRows(ownerId)).toHaveLength(0);
+  });
+});
+
+// ---- Gmail signature -----------------------------------------------------------------------------
+
+describe("Gmail signature", () => {
+  const WORK_SIG = `${SEND_AS}/work%40example.com`;
+  const ALIAS_SIG = `${SEND_AS}/alias%40example.com`;
+  const sigRoute = (url: string, signature: string): GoogleRoute => ({
+    url,
+    reply: () => googleJson(200, { signature }),
+  });
+  const sigCalls = (calls: GoogleCall[]) => calls.filter((c) => c.url.startsWith(`${SEND_AS}/`));
+  const setting = (key: string, on: 0 | 1) =>
+    env.DB.prepare("UPDATE accounts SET signature_default = ? WHERE short_id = ?")
+      .bind(on, Number(key.slice(1)))
+      .run();
+  const send = (ownerId: string, extra: Record<string, unknown> = {}) =>
+    call(ON(), ownerId, "send_message", {
+      to: ["bob@example.com"],
+      subject: "s",
+      body: "line one",
+      ...extra,
+    });
+
+  it("is on by default: text gets a '-- ' line, HTML a gmail_signature div with no dash line", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, "<b>Pat</b><br>Team"), sendRoute()]);
+    expect((await send(ownerId)).isError).toBe(false);
+    expect(query(sigCalls(calls)[0]).get("fields")).toBe("signature");
+    const [text, html] = bodies(sendCalls(calls)[0]?.body ?? "");
+    expect(text).toContain("line one\r\n\r\n-- \r\nPat");
+    expect(html).toContain('<div class="gmail_signature"><b>Pat</b><br>Team</div>');
+    expect(html).not.toContain("-- ");
+  });
+
+  it("is on by default for reply and forward", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([
+      originalRoute(),
+      sigRoute(WORK_SIG, "<i>Pat</i>"),
+      sendRoute(),
+    ]);
+    const r = await call(ON(), ownerId, "reply", { messageId: `${key}:m_orig`, body: "yes" });
+    expect(r.isError).toBe(false);
+    const f = await call(ON(), ownerId, "forward", {
+      messageId: `${key}:m_orig`,
+      to: ["dan@example.com"],
+      forwardText: "FYI",
+    });
+    expect(f.isError).toBe(false);
+    const sent = sendCalls(calls);
+    expect(sent).toHaveLength(2);
+    for (const c of sent) {
+      const [text, html] = bodies(c.body);
+      expect(text).toContain("-- \r\nPat");
+      expect(html).toContain('<div class="gmail_signature"><i>Pat</i></div>');
+    }
+  });
+
+  it("an explicit includeSignature=false wins over the setting", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, "<b>Pat</b>"), sendRoute()]);
+    expect((await send(ownerId, { includeSignature: false })).isError).toBe(false);
+    expect(sigCalls(calls)).toHaveLength(0);
+    expect(bodies(sendCalls(calls)[0]?.body ?? "")).toEqual(["line one"]);
+  });
+
+  it("with the setting off adds nothing unless the caller asks", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 0);
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, "<b>Pat</b>"), sendRoute()]);
+    await send(ownerId);
+    expect(sigCalls(calls)).toHaveLength(0);
+    await send(ownerId, { includeSignature: true });
+    expect(sigCalls(calls)).toHaveLength(1);
+    expect(bodies(sendCalls(calls)[1]?.body ?? "")[0]).toContain("-- \r\nPat");
+  });
+
+  it("an alias with no signature of its own uses the account's primary one", async () => {
+    const { ownerId, key } = await setup({ fresh: false });
+    await setting(key, 1);
+    const calls = installGoogleRoutes([
+      { url: SEND_AS, reply: () => googleJson(200, fx.sendAs) },
+      sigRoute(ALIAS_SIG, ""),
+      sigRoute(WORK_SIG, "<b>Primary Pat</b>"),
+      sendRoute(),
+    ]);
+    expect((await send(ownerId, { from: "alias@example.com" })).isError).toBe(false);
+    expect(sigCalls(calls).map((c) => new URL(c.url).pathname.split("/").pop())).toEqual([
+      "alias%40example.com",
+      "work%40example.com",
+    ]);
+    const [text, html] = bodies(sendCalls(calls)[0]?.body ?? "");
+    expect(text).toContain("-- \r\nPrimary Pat");
+    expect(html).toContain('<div class="gmail_signature"><b>Primary Pat</b></div>');
+  });
+
+  it("an alias with its own signature keeps it and never reads the primary one", async () => {
+    const { ownerId, key } = await setup({ fresh: false });
+    await setting(key, 1);
+    const calls = installGoogleRoutes([
+      { url: SEND_AS, reply: () => googleJson(200, fx.sendAs) },
+      sigRoute(ALIAS_SIG, "<b>Alias Pat</b>"),
+      sigRoute(WORK_SIG, "<b>Primary Pat</b>"),
+      sendRoute(),
+    ]);
+    await send(ownerId, { from: "alias@example.com" });
+    expect(sigCalls(calls)).toHaveLength(1);
+    expect(bodies(sendCalls(calls)[0]?.body ?? "")[0]).toContain("Alias Pat");
+  });
+
+  it("keeps a hosted https logo as an image and builds no attachment part", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const logo =
+      '<img src="https://ci3.googleusercontent.com/mail-sig/abc" alt="Good Stuff Software">';
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, `<p>Pat</p>${logo}`), sendRoute()]);
+    await send(ownerId);
+    const raw = sendCalls(calls)[0]?.body ?? "";
+    expect(bodies(raw)[1]).toContain(`<div class="gmail_signature"><p>Pat</p>${logo}</div>`);
+    expect(raw).toContain("multipart/alternative");
+    expect(raw).not.toContain("multipart/related");
+    expect(raw).not.toContain("multipart/mixed");
+    expect(raw).not.toMatch(/Content-Disposition/i);
+    expect(raw).not.toMatch(/Content-Type: image\//i);
+    expect(raw).not.toMatch(/Content-ID/i);
+    expect(bodies(raw)[1]).not.toContain("cid:");
+  });
+
+  it("drops a logo that is only a data: or cid: image, keeping its alt text", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const sig =
+      '<p>Pat</p><img alt="Good Stuff Software" src="data:image/png;base64,iVBORw0KGgo="><IMG SRC=\'cid:ii_123\' alt="x">';
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, sig), sendRoute()]);
+    await send(ownerId);
+    const raw = sendCalls(calls)[0]?.body ?? "";
+    const [text, html] = bodies(raw);
+    expect(html).toContain('<div class="gmail_signature"><p>Pat</p>Good Stuff Softwarex</div>');
+    expect(html).not.toMatch(/data:|cid:|<img/i);
+    expect(text).toContain("-- \r\nPat");
+    expect(raw).not.toMatch(
+      /Content-Disposition|Content-Type: image\/|multipart\/(related|mixed)/i,
+    );
+  });
+
+  it("cannot add a header or end a MIME part: the signature stays inside the base64 body", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const evil = "Pat\r\nBcc: evil@example.net\r\n\r\n--=_wb_x--\r\nContent-Type: text/html";
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, evil), sendRoute()]);
+    expect((await send(ownerId)).isError).toBe(false);
+    const raw = sendCalls(calls)[0]?.body ?? "";
+    expect(header(raw, "Bcc")).toBeUndefined();
+    expect(raw.split("\r\n\r\n")[0]).not.toContain("evil@example.net");
+    expect(raw.match(/^Content-Type: multipart\/alternative/gim)).toHaveLength(1);
+    expect(bodies(raw)[0]).toContain("Bcc: evil@example.net");
+  });
+
+  it("an empty signature adds nothing", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, " <div><br></div> "), sendRoute()]);
+    await send(ownerId);
+    expect(bodies(sendCalls(calls)[0]?.body ?? "")).toEqual(["line one"]);
+  });
+
+  it("a signature that cannot be read never stops a default send, but fails one asked for", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([
+      { url: WORK_SIG, reply: () => googleJson(403, { error: { message: "denied" } }) },
+      sendRoute(),
+    ]);
+    expect((await send(ownerId)).isError).toBe(false);
+    expect(bodies(sendCalls(calls)[0]?.body ?? "")).toEqual(["line one"]);
+    const asked = await send(ownerId, { includeSignature: true });
+    expect(asked.isError).toBe(true);
+    expect(sendCalls(calls)).toHaveLength(1);
+  });
+
+  it("a Google server error on the signature read also leaves a default send going", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([
+      { url: WORK_SIG, reply: () => googleJson(500, { error: { message: "boom" } }) },
+      sendRoute(),
+    ]);
+    expect((await send(ownerId)).isError).toBe(false);
+    expect(bodies(sendCalls(calls)[0]?.body ?? "")).toEqual(["line one"]);
+  });
+
+  it("still obeys SEND_ENABLED: a refused send reads no signature", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, "<b>Pat</b>"), sendRoute()]);
+    const res = await call(withEnv({ SEND_ENABLED: "false" }), ownerId, "send_message", {
+      to: ["bob@example.com"],
+      body: "b",
+    });
+    expect(res.json.error.code).toBe("send_disabled");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("still obeys the hold rule: a held send reads no signature", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    const calls = installGoogleRoutes([sigRoute(WORK_SIG, "<b>Pat</b>"), sendRoute()]);
+    const res = await call(ON({ SEND_REQUIRES_CONFIRM: "true" }), ownerId, "send_message", {
+      to: ["bob@example.com"],
+      body: "b",
+    });
+    expect(res.json.status).toBe("pending_approval");
+    expect(calls).toHaveLength(0);
   });
 });
