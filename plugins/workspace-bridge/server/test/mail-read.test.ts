@@ -728,7 +728,7 @@ describe("get_thread", () => {
 
     it("reads the newest messages in full while their sizes fit, the rest at metadata", async () => {
       const { token } = await setup();
-      const { routes, fetched } = threadRoutes("t9", thread(6, 200 * 1024));
+      const { routes, fetched } = threadRoutes("t9", thread(6, 300 * 1024));
       installGoogleRoutes(routes);
       const r = await call(token, "get_thread", { threadId: "t9" });
       const byId = new Map(fetched.map((f) => [f.id, f.format]));
@@ -801,6 +801,26 @@ describe("get_thread", () => {
         expect(m.text).toContain("pass maxBodyChars");
         expect(m.text).not.toContain("response size limit");
       }
+    });
+
+    it("decodes less HTML per message in a thread than get_message does", async () => {
+      const { token } = await setup();
+      const html = `<p>start</p>${"<p>filler words here</p>".repeat(10_000)}<p>tail marker</p>`;
+      const msg = {
+        ...fullMessage("m1", 1, ""),
+        sizeEstimate: html.length,
+        payload: {
+          mimeType: "text/html",
+          headers: hdr({ From: "Ann <ann@example.com>", Subject: "big" }),
+          body: { size: html.length, data: b64(html) },
+        },
+      };
+      installGoogleRoutes(threadRoutes("t9", [msg]).routes);
+      const r = await call(token, "get_thread", { threadId: "t9", maxBodyChars: 32_768 });
+      const m = (r.json.messages as Json[])[0] as Json;
+      expect(m.truncated).toBe(true);
+      expect(m.text).toContain("start");
+      expect(m.text).not.toContain("tail marker");
     });
 
     it("skips a message deleted since the index was read", async () => {

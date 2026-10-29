@@ -17,7 +17,7 @@ export const MAX_BODY_CHARS = 32_768;
  * and a note to call get_message. The bodies kept in one answer total at most
  * `MAX_RESPONSE_BODY_CHARS`; a body cut by that limit ends with `RESPONSE_CAP_NOTE`.
  */
-export const MAX_RESPONSE_FETCH_BYTES = 512 * 1024;
+export const MAX_RESPONSE_FETCH_BYTES = 640 * 1024;
 export const MAX_RESPONSE_BODY_CHARS = 100_000;
 export const RESPONSE_CAP_NOTE =
   "[truncated: the response size limit was reached; call get_message with this message id to read the full body]";
@@ -51,6 +51,8 @@ export interface BodyOpts {
   format: MessageFormat;
   maxBodyChars: number;
   includeHtml: boolean;
+  /** Raw HTML bytes decoded for the text conversion; the provider default when absent. */
+  htmlBytes?: number;
 }
 
 export interface AttachmentInfo {
