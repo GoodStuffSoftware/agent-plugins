@@ -5,13 +5,17 @@
 
 import { ToolError } from "../../core/errors";
 import { htmlToText, truncateBody } from "../../core/html-text";
-import type {
-  AttachmentInfo,
-  BodyOpts,
-  MailMessage,
-  MailReader,
-  ThreadDetail,
-  ThreadSummary,
+import {
+  type AttachmentInfo,
+  type BodyOpts,
+  type MailMessage,
+  type MailReader,
+  MAX_RESPONSE_BODY_CHARS,
+  MAX_RESPONSE_FETCH_BYTES,
+  OMITTED_NOTE,
+  RESPONSE_CAP_NOTE,
+  type ThreadDetail,
+  type ThreadSummary,
 } from "../../services/mail-read";
 import { batchJson, gmailBatch } from "./batch";
 import { gjson } from "./http";
@@ -56,6 +60,10 @@ const partFields = (depth: number): string =>
 const META_MESSAGE_FIELDS =
   "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(headers(name,value))";
 const FULL_MESSAGE_FIELDS = `id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(${partFields(PART_DEPTH)})`;
+/** What `get_thread` asks of the whole thread when it reads bodies: ids, order, drafts and sizes. */
+const THREAD_INDEX_FIELDS = "id,messages(id,labelIds,sizeEstimate)";
+/** Below this many characters left in the response budget, another body is not started. */
+const MIN_BODY_CHARS = 256;
 const SUMMARY_FIELDS = "id,messages(labelIds,snippet,internalDate,payload(headers(name,value)))";
 
 const header = (headers: GHeader[] | undefined, name: string): string => {
@@ -225,6 +233,14 @@ function summarize(t: GThread): ThreadSummary | null {
   };
 }
 
+/** Swaps the "pass maxBodyChars" marker for one that says the response limit cut this body. */
+function capNote(m: MailMessage): void {
+  const swap = (t: string | undefined): string | undefined =>
+    t?.replace(/\n\[truncated after \d+ characters[^\]]*\]$/, `\n${RESPONSE_CAP_NOTE}`);
+  m.text = swap(m.text);
+  if (m.html !== undefined) m.html = swap(m.html);
+}
+
 export const googleMailRead: MailReader = {
   async search(a, q) {
     const list = await gjson<{ threads?: { id: string }[]; nextPageToken?: string }>(
@@ -270,27 +286,100 @@ export const googleMailRead: MailReader = {
   },
 
   async getThread(a, id, opts) {
+    const limit = Math.max(1, opts.messageLimit);
+    const url = `${BASE}/threads/${encodeURIComponent(id)}`;
+    const windowOf = (messages: GMessage[]) => {
+      const all = messages.filter((m) => !(m.labelIds ?? []).includes("DRAFT"));
+      const offset = Math.min(Math.max(0, opts.messageOffset ?? all.length - limit), all.length);
+      return { total: all.length, offset, window: all.slice(offset, offset + limit) };
+    };
+
+    if (!hasBody(opts.format)) {
+      // No bodies: the thread is small at the metadata format, one call is enough.
+      const t = await gjson<GThread>(
+        a,
+        url,
+        {},
+        {
+          fields: `id,messages(${META_MESSAGE_FIELDS})`,
+          query: { format: "metadata", metadataHeaders: MESSAGE_HEADERS },
+        },
+      );
+      const w = windowOf(t?.messages ?? []);
+      return {
+        id: t?.id ?? id,
+        totalMessages: w.total,
+        messageOffset: w.offset,
+        messages: w.window.map((m) => toMessage(m, opts)),
+      };
+    }
+
+    // Bodies: the thread comes back as an index (ids, order, sizes), then only the window is read.
     const t = await gjson<GThread>(
       a,
-      `${BASE}/threads/${encodeURIComponent(id)}`,
+      url,
       {},
-      {
-        fields: `id,messages(${hasBody(opts.format) ? FULL_MESSAGE_FIELDS : META_MESSAGE_FIELDS})`,
-        query: {
-          format: formatOf(opts.format),
-          metadataHeaders: hasBody(opts.format) ? undefined : MESSAGE_HEADERS,
-        },
-      },
+      { fields: THREAD_INDEX_FIELDS, query: { format: "minimal" } },
     );
-    const all = (t?.messages ?? []).filter((m) => !(m.labelIds ?? []).includes("DRAFT"));
-    const limit = Math.max(1, opts.messageLimit);
-    const offset = Math.min(Math.max(0, opts.messageOffset ?? all.length - limit), all.length);
+    const { total, offset, window } = windowOf(t?.messages ?? []);
     const thread: ThreadDetail = {
       id: t?.id ?? id,
-      totalMessages: all.length,
+      totalMessages: total,
       messageOffset: offset,
-      messages: all.slice(offset, offset + limit).map((m) => toMessage(m, opts)),
+      messages: [],
     };
+    if (window.length === 0) return thread;
+
+    // The newest messages are read in full while their sizes fit the budget (the newest always
+    // is); the rest of the window comes back at the metadata format.
+    const full = new Set<number>();
+    let bytes = 0;
+    for (let i = window.length - 1; i >= 0; i--) {
+      bytes += (window[i] as GMessage).sizeEstimate ?? 0;
+      if (full.size > 0 && bytes > MAX_RESPONSE_FETCH_BYTES) break;
+      full.add(i);
+    }
+    const fullParams = new URLSearchParams({ format: "full", fields: FULL_MESSAGE_FIELDS });
+    const metaParams = new URLSearchParams({ format: "metadata", fields: META_MESSAGE_FIELDS });
+    for (const name of MESSAGE_HEADERS) metaParams.append("metadataHeaders", name);
+    const parts = await gmailBatch(
+      a,
+      window.map((m, i) => ({
+        id: `m${i}`,
+        path: `/gmail/v1/users/me/messages/${encodeURIComponent(m.id)}?${(full.has(i) ? fullParams : metaParams).toString()}`,
+      })),
+    );
+    const byId = new Map(parts.map((p) => [p.id, p]));
+    const fetched: (GMessage | null)[] = window.map((_, i) => {
+      const part = byId.get(`m${i}`);
+      // A message deleted since the index was read answers 404: it is simply gone.
+      if (part?.status === 404) return null;
+      // No readable answer is not a deletion: fail so a retry gets the message.
+      if (!part) throw new ToolError("upstream_error", "Google's batch reply was incomplete.");
+      return batchJson<GMessage>(a, part);
+    });
+
+    // Bodies are built newest first so a long thread spends its character budget on the newest.
+    let left = MAX_RESPONSE_BODY_CHARS;
+    const built: (MailMessage | null)[] = fetched.map(() => null);
+    for (let i = window.length - 1; i >= 0; i--) {
+      const f = fetched[i];
+      if (!f) continue;
+      if (!full.has(i) || left < MIN_BODY_CHARS) {
+        built[i] = {
+          ...toMessage(f, { ...opts, format: "METADATA_ONLY" }),
+          text: OMITTED_NOTE,
+          truncated: true,
+        };
+        continue;
+      }
+      const maxBodyChars = Math.min(opts.maxBodyChars, left);
+      const m = toMessage(f, { ...opts, maxBodyChars });
+      if (maxBodyChars < opts.maxBodyChars && m.truncated) capNote(m);
+      left -= (m.text?.length ?? 0) + (m.html?.length ?? 0);
+      built[i] = m;
+    }
+    thread.messages = built.filter((m): m is MailMessage => m !== null);
     return thread;
   },
 
