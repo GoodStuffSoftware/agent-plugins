@@ -11,6 +11,7 @@ import { notConfigured, signinClient, startSignin } from "../auth/consent";
 import {
   LABEL_MAX,
   LABEL_RULE,
+  labelClash,
   normalizeLabel,
   sealingNotReady,
   sealingReady,
@@ -322,20 +323,8 @@ accountsRoutes.post("/rename", async (c) => {
       `${LABEL_RULE} The label cannot be empty or "all" in any case.`,
     );
   }
-  const clash = await first<{ id: string }>(
-    env.DB,
-    "SELECT id FROM accounts WHERE owner_id = ? AND lower(label) = lower(?) AND id <> ?",
-    session.ownerId,
-    label,
-    account.id,
-  );
-  if (clash) {
-    return result(
-      409,
-      "Label in use",
-      `Another mailbox already has the label "${label}" (labels are compared ignoring case). Pick another label.`,
-    );
-  }
+  const clash = await labelClash(env.DB, session.ownerId, label, account.id);
+  if (clash) return result(409, "Label in use", `${clash} Pick another label.`);
   try {
     await env.DB.prepare(
       "UPDATE accounts SET label = ?, updated_at = ? WHERE id = ? AND owner_id = ?",

@@ -434,6 +434,11 @@ describe("link leg", () => {
     for (const label of ["All", "  ", "x".repeat(65)]) {
       expect((await control(browser, "rename", a, [["label", label]])).status).toBe(400);
     }
+    // Not another mailbox's address, and the case rule holds beyond ASCII.
+    expect((await control(browser, "rename", a, [["label", WORK.email]])).status).toBe(409);
+    const b = (await accounts()).find((x) => x.address === WORK.email) as AccountRow;
+    expect((await control(browser, "rename", b, [["label", "École"]])).status).toBe(200);
+    expect((await control(browser, "rename", a, [["label", "ÉCOLE"]])).status).toBe(409);
     // Keeping its own label in another case is allowed.
     expect((await control(browser, "rename", a, [["label", "mike's main <I>"]])).status).toBe(200);
     expect((await accounts()).find((x) => x.id === a.id)?.label).toBe("mike's main <I>");

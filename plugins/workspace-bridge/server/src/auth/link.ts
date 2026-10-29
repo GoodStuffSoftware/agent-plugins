@@ -9,7 +9,7 @@
 // cookie and writes no row.
 
 import { base64url, randomBytes, randomId, seal, sha256, type TokenKind } from "../core/crypto";
-import { type AccountRow, first, getAccount, nowSeconds } from "../core/db";
+import { type AccountRow, all, first, getAccount, nowSeconds } from "../core/db";
 import { config, type Env } from "../env";
 import {
   type AccountComponent,
@@ -77,6 +77,35 @@ export function normalizeLabel(value: unknown): string | undefined {
   const label = value.replace(/\p{Cc}/gu, "").trim();
   if (label === "" || [...label].length > LABEL_MAX) return undefined;
   return RESERVED_LABELS.has(label.toLowerCase()) ? undefined : label;
+}
+
+/**
+ * Why `label` cannot go on a mailbox of this owner (other than `exceptId`), or null. Labels are
+ * unique ignoring case (compared here in full Unicode; the SQL index is the ASCII backstop), and
+ * a label may not equal another mailbox's address, which the resolver would then match first.
+ */
+export async function labelClash(
+  db: D1Database,
+  ownerId: string,
+  label: string,
+  exceptId?: string,
+): Promise<string | null> {
+  const lower = label.toLowerCase();
+  const rows = await all<{ id: string; label: string; address: string }>(
+    db,
+    "SELECT id, label, address FROM accounts WHERE owner_id = ?",
+    ownerId,
+  );
+  for (const r of rows) {
+    if (r.id === exceptId) continue;
+    if (r.label.toLowerCase() === lower) {
+      return `Another mailbox already has the label "${label}" (labels are compared ignoring case).`;
+    }
+    if (r.address === lower) {
+      return `The label "${label}" is the address of another mailbox.`;
+    }
+  }
+  return null;
 }
 
 const GMAIL_SEND_AS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs";
@@ -304,21 +333,9 @@ export async function finishLink(
   }
   // A re-link of a linked address keeps its label (the Rename control changes it), so only a new
   // mailbox can clash.
-  const clash = existing
-    ? null
-    : await first<{ id: string }>(
-        env.DB,
-        "SELECT id FROM accounts WHERE owner_id = ? AND lower(label) = lower(?)",
-        session.ownerId,
-        payload.label,
-      );
+  const clash = existing ? null : await labelClash(env.DB, session.ownerId, payload.label);
   if (clash) {
-    return refused(
-      "label_in_use",
-      409,
-      "Label in use",
-      `Another mailbox already has the label "${payload.label}" (labels are compared ignoring case). Pick another label.`,
-    );
+    return refused("label_in_use", 409, "Label in use", `${clash} Pick another label.`);
   }
   if (existing?.provider_sub && existing.provider_sub !== identity.sub) {
     // Same address, new Google user id: a deleted and recreated Workspace user. Verified by
