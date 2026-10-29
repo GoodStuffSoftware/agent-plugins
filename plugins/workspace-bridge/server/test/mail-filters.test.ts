@@ -8,6 +8,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCOPES } from "../src/auth/endpoints";
 import { createSession, SESSION_COOKIE } from "../src/auth/session";
 import { type AuditLogRow, all, first, type PendingActionRow } from "../src/core/db";
+import { createRateLimiter } from "../src/core/ratelimit";
+import type { Env } from "../src/env";
+import type { AccountRef } from "../src/services/types";
 import fixture from "./fixtures/google/mail-filters.json";
 import {
   type GoogleCall,
@@ -21,6 +24,18 @@ import { ISSUER, mcpRpc, toolJson } from "./helpers/mcp";
 import { mintToken } from "./helpers/tokens";
 
 afterEach(() => vi.restoreAllMocks());
+
+const FWD_ADDRESSES = "https://gmail.googleapis.com/gmail/v1/users/me/settings/forwardingAddresses";
+const switchOff = (ownerId: string) =>
+  env.DB.prepare("UPDATE owners SET send_kill_switch = 1 WHERE id = ?").bind(ownerId).run();
+/** The forwarding addresses Gmail lists for the account. */
+const fwdRoute = (status = "accepted", email = "archive@example.net") => ({
+  url: FWD_ADDRESSES,
+  reply: () =>
+    googleJson(200, {
+      forwardingAddresses: [{ forwardingEmail: email, verificationStatus: status }],
+    }),
+});
 
 const FILTERS = "https://gmail.googleapis.com/gmail/v1/users/me/settings/filters";
 const TOOLS = ["list_filters", "create_filter", "delete_filter"];
@@ -298,7 +313,7 @@ describe("create_filter that forwards", () => {
 
   it("is held for owner approval and creates nothing", async () => {
     const { ownerId } = await setup();
-    const calls = installGoogleRoutes([]);
+    const calls = installGoogleRoutes([fwdRoute()]);
     const { isError, json } = await call(ownerId, "create_filter", forwardArgs);
     expect(isError).toBe(false);
     expect(json).toMatchObject({
@@ -309,7 +324,7 @@ describe("create_filter that forwards", () => {
     expect(json.preview.account).toBe("work@example.com");
     expect(json.preview.summary).toContain("archive@example.net");
     expect(json.preview.action.forward).toBe("archive@example.net");
-    expect(calls).toHaveLength(0);
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
     const rows = await pendingRows(ownerId);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ tool: "create_filter", status: "pending" });
@@ -318,14 +333,14 @@ describe("create_filter that forwards", () => {
 
   it("holds a forward filter that also labels, and previews bare label ids", async () => {
     const { ownerId, key } = await setup();
-    const calls = installGoogleRoutes([]);
+    const calls = installGoogleRoutes([fwdRoute()]);
     const { json } = await call(ownerId, "create_filter", {
       criteria: { query: "from:boss@example.com" },
       action: { forward: "archive@example.net", addLabelIds: [`${key}:Label_3`] },
     });
     expect(json.status).toBe("pending_approval");
     expect(json.preview.action.addLabelIds).toEqual(["Label_3"]);
-    expect(calls).toHaveLength(0);
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
   });
 
   it("an invalid forwarding address is refused before it is held", async () => {
@@ -341,17 +356,19 @@ describe("create_filter that forwards", () => {
   it("creates the filter once the owner approves, and audits the forwarding address", async () => {
     const { ownerId } = await setup();
     const calls = installGoogleRoutes([
+      fwdRoute(),
       { method: "POST", url: FILTERS, reply: () => googleJson(200, fixture.createdForward) },
     ]);
     const held = await call(ownerId, "create_filter", forwardArgs);
     const id = held.json.pendingActionId as string;
-    expect(calls).toHaveLength(0);
+    const posts = () => calls.filter((c) => c.method === "POST");
+    expect(posts()).toHaveLength(0);
 
     const res = await approve(ownerId, id);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain("The action ran");
-    expect(calls).toHaveLength(1);
-    expect(bodyOf(calls[0])).toEqual({
+    expect(posts()).toHaveLength(1);
+    expect(bodyOf(posts()[0])).toEqual({
       criteria: { from: "boss@example.com" },
       action: { forward: "archive@example.net" },
     });
@@ -372,6 +389,7 @@ describe("create_filter that forwards", () => {
   it("maps Gmail's refusal of an unverified forwarding address and audits the failure", async () => {
     const { ownerId } = await setup();
     installGoogleRoutes([
+      fwdRoute(),
       {
         method: "POST",
         url: FILTERS,
@@ -401,6 +419,148 @@ describe("create_filter that forwards", () => {
       id,
     );
     expect(stored?.status).toBe("failed");
+  });
+});
+
+describe("filter guards (M17b)", () => {
+  const forwardArgs = {
+    criteria: { from: "boss@example.com" },
+    action: { forward: "archive@example.net" },
+  };
+  const post = (calls: GoogleCall[]) => calls.filter((c) => c.method === "POST");
+  const created = {
+    method: "POST",
+    url: FILTERS,
+    reply: () => googleJson(200, fixture.createdLabelOnly),
+  };
+
+  it("holds a filter that adds TRASH or SPAM, or removes INBOX together with one", async () => {
+    const { ownerId, key } = await setup();
+    const calls = installGoogleRoutes([]);
+    for (const action of [
+      { addLabelIds: ["TRASH"] },
+      { addLabelIds: [`${key}:SPAM`] },
+      { removeLabelIds: ["INBOX", "TRASH"] },
+    ]) {
+      const { json } = await call(ownerId, "create_filter", {
+        criteria: { from: "news@example.com" },
+        action,
+      });
+      expect(json.status).toBe("pending_approval");
+    }
+    expect(calls).toHaveLength(0);
+    expect(await pendingRows(ownerId)).toHaveLength(3);
+  });
+
+  it("creates a filter that archives or adds a user label directly", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([created]);
+    for (const action of [{ removeLabelIds: ["INBOX"] }, { addLabelIds: ["Label_7"] }]) {
+      const { json } = await call(ownerId, "create_filter", {
+        criteria: { from: "news@example.com" },
+        action,
+      });
+      expect(json.id).toBeDefined();
+    }
+    expect(post(calls)).toHaveLength(2);
+    expect(await pendingRows(ownerId)).toHaveLength(0);
+  });
+
+  it("a held trash filter is created once the owner approves it", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([created]);
+    const held = await call(ownerId, "create_filter", {
+      criteria: { from: "news@example.com" },
+      action: { addLabelIds: ["TRASH"] },
+    });
+    expect(post(calls)).toHaveLength(0);
+    await approve(ownerId, held.json.pendingActionId);
+    expect(post(calls)).toHaveLength(1);
+    expect(bodyOf(post(calls)[0]).action).toEqual({ addLabelIds: ["TRASH"] });
+  });
+
+  it("refuses a forward filter while the owner has sending off, as checkSend does, queues nothing", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([fwdRoute()]);
+    await switchOff(ownerId);
+    const res = await call(ownerId, "create_filter", forwardArgs);
+    expect(res.isError).toBe(true);
+    expect(res.json.error.code).toBe("send_disabled");
+    expect(res.json.error.message).toContain("Sending is switched off");
+    expect(res.json.error.message).toContain(`${ISSUER}/accounts`);
+    expect(await pendingRows(ownerId)).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("assertSendEnabled refuses with checkSend's message when SEND_ENABLED is not true", async () => {
+    const limits = createRateLimiter({
+      env: { ...env, SEND_ENABLED: "false" } as Env,
+      grant: { clientId: "c", grantId: "g", scopes: [] },
+      now: () => 0,
+    });
+    const err = await limits.assertSendEnabled({} as AccountRef).catch((e) => e);
+    expect(err.code).toBe("send_disabled");
+    expect(err.message).toContain("SEND_ENABLED");
+  });
+
+  it("a label-only filter does not depend on the sending switch", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([created]);
+    const { isError } = await call(ownerId, "create_filter", {
+      criteria: { from: "news@example.com" },
+      action: { addLabelIds: ["Label_7"] },
+    });
+    expect(isError).toBe(false);
+  });
+
+  it("re-checks the sending switch when the owner approves, refuses and audits it", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      fwdRoute(),
+      { method: "POST", url: FILTERS, reply: () => googleJson(200, fixture.createdForward) },
+    ]);
+    const held = await call(ownerId, "create_filter", forwardArgs);
+    const id = held.json.pendingActionId as string;
+    await switchOff(ownerId);
+    const res = await approve(ownerId, id);
+    expect(res.status).toBe(200);
+    expect(post(calls)).toHaveLength(0);
+    const got = await call(ownerId, "get_pending_action", { pendingActionId: id });
+    expect(got.json.status).toBe("failed");
+    expect(got.json.result.error.code).toBe("send_disabled");
+    const rows = await auditRows(ownerId);
+    expect(rows.map((r) => [r.tool, r.result])).toEqual([
+      ["create_filter", "approved"],
+      ["create_filter", "error"],
+    ]);
+    expect(rows[1]?.detail).toContain("send_disabled");
+  });
+
+  it("refuses a forward to an address that is not an accepted forwarding address, queues nothing", async () => {
+    const { ownerId } = await setup();
+    for (const route of [
+      fwdRoute("pending"),
+      fwdRoute("accepted", "other@example.net"),
+      { url: FWD_ADDRESSES, reply: () => googleJson(200, {}) },
+    ]) {
+      const calls = installGoogleRoutes([route]);
+      const res = await call(ownerId, "create_filter", forwardArgs);
+      expect(res.isError).toBe(true);
+      expect(res.json.error.code).toBe("invalid_argument");
+      expect(res.json.error.message).toContain("verified forwarding address");
+      expect(post(calls)).toHaveLength(0);
+      expect(calls.some((c) => c.url.startsWith(FWD_ADDRESSES))).toBe(true);
+      vi.restoreAllMocks();
+    }
+    expect(await pendingRows(ownerId)).toHaveLength(0);
+  });
+
+  it("holds a forward to an accepted address and never adds a forwarding address", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([fwdRoute("accepted", "Archive@Example.net")]);
+    const { json } = await call(ownerId, "create_filter", forwardArgs);
+    expect(json.status).toBe("pending_approval");
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
   });
 });
 

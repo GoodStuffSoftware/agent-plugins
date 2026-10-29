@@ -36,6 +36,8 @@ export interface FilterService {
     filter: { criteria: FilterCriteria; action: FilterAction },
   ): Promise<FilterInfo>;
   remove(a: AccountRef, id: string): Promise<void>;
+  /** Whether `address` is a forwarding address of the account that the owner has confirmed. */
+  isForwardingVerified(a: AccountRef, address: string): Promise<boolean>;
 }
 
 export const FILTERS = capability<FilterService>("mail.filters", "mail");

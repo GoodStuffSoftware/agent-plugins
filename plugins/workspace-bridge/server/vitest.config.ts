@@ -20,6 +20,8 @@ export default defineConfig({
           COOKIE_SECRET: "test-cookie-secret-test-cookie-secret",
           GOOGLE_CLIENT_ID: "test-client",
           GOOGLE_CLIENT_SECRET: "test-secret",
+          // Sending is on for the tool tests; the owner switch (default on) is what they turn off.
+          SEND_ENABLED: "true",
         },
       },
     })),

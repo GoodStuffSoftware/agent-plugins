@@ -92,6 +92,23 @@ export const googleFilters: FilterService = {
     }
   },
 
+  async isForwardingVerified(a, address) {
+    const r = await gjson<
+      | { forwardingAddresses?: { forwardingEmail?: string; verificationStatus?: string }[] }
+      | undefined
+    >(
+      a,
+      "https://gmail.googleapis.com/gmail/v1/users/me/settings/forwardingAddresses",
+      {},
+      { fields: "forwardingAddresses(forwardingEmail,verificationStatus)" },
+    );
+    const want = address.trim().toLowerCase();
+    return (r?.forwardingAddresses ?? []).some(
+      (f) =>
+        f.verificationStatus === "accepted" && f.forwardingEmail?.trim().toLowerCase() === want,
+    );
+  },
+
   async remove(a, id) {
     const res = await gfetch(a, `${BASE}/${encodeURIComponent(id)}`, { method: "DELETE" });
     await res.body?.cancel();

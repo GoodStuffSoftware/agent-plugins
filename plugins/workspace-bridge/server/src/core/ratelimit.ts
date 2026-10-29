@@ -25,6 +25,8 @@ export interface RateLimiter {
    * and daily counters (`rate_limited`). A refused attempt that reached the counters still counts.
    */
   checkSend(a: AccountRef, recipients: readonly string[]): Promise<void>;
+  /** Only the two switches `checkSend` starts with (`send_disabled`); counts nothing. */
+  assertSendEnabled(a: AccountRef): Promise<void>;
 }
 
 export interface RateLimiterDeps {
@@ -73,6 +75,29 @@ export function createRateLimiter(deps: RateLimiterDeps): RateLimiter {
     }
   }
 
+  async function assertSendEnabled(a: AccountRef): Promise<void> {
+    const c = config(env);
+    const accountsUrl = `${c.issuer}/accounts`;
+    if (!c.sendEnabled) {
+      throw new ToolError(
+        "send_disabled",
+        "Sending is disabled on this server: the SEND_ENABLED setting is not true.",
+      );
+    }
+    const owner = await first<{ send_kill_switch: number }>(
+      env.DB,
+      "SELECT send_kill_switch FROM owners WHERE id = ?",
+      a.ownerId,
+    );
+    if (owner?.send_kill_switch !== 0) {
+      throw new ToolError(
+        "send_disabled",
+        `Sending is switched off. The owner can switch it back on at ${accountsUrl}.`,
+        { accountsUrl },
+      );
+    }
+  }
+
   return {
     async call() {
       const message = `Too many tool calls on this connection: the limit is ${CALLS_PER_MINUTE} a minute.`;
@@ -85,27 +110,10 @@ export function createRateLimiter(deps: RateLimiterDeps): RateLimiter {
       if (after !== undefined) throw limited(message, after);
     },
     send,
+    assertSendEnabled,
     async checkSend(a, recipients) {
       const c = config(env);
-      const accountsUrl = `${c.issuer}/accounts`;
-      if (!c.sendEnabled) {
-        throw new ToolError(
-          "send_disabled",
-          "Sending is disabled on this server: the SEND_ENABLED setting is not true.",
-        );
-      }
-      const owner = await first<{ send_kill_switch: number }>(
-        env.DB,
-        "SELECT send_kill_switch FROM owners WHERE id = ?",
-        a.ownerId,
-      );
-      if (owner?.send_kill_switch !== 0) {
-        throw new ToolError(
-          "send_disabled",
-          `Sending is switched off. The owner can switch it back on at ${accountsUrl}.`,
-          { accountsUrl },
-        );
-      }
+      await assertSendEnabled(a);
       const distinct = new Set(recipients.map((r) => r.trim().toLowerCase()).filter((r) => r));
       if (distinct.size > c.maxRecipients) {
         throw new ToolError(
