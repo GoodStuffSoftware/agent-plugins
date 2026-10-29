@@ -330,6 +330,32 @@ describe("send_message", () => {
     });
     expect(res.json.error.code).toBe("too_many_recipients");
     expect(calls).toHaveLength(0);
+    const rows = await auditRows(ownerId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ result: "refused", detail: "too_many_recipients" });
+  });
+
+  it("shows a held reply's real recipients and a held draft send's envelope", async () => {
+    const { ownerId, key } = await setup();
+    installGoogleRoutes([
+      originalRoute(),
+      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
+      sendRoute(),
+    ]);
+    const e = ON({ SEND_REQUIRES_CONFIRM: "true" });
+    await call(e, ownerId, "reply", { messageId: `${key}:m_orig`, body: "SECRET-BODY-TEXT" });
+    await call(e, ownerId, "send_message", { draftId: `${key}:d1` });
+    const rows = await env.DB.prepare(
+      "SELECT tool, preview FROM pending_actions WHERE owner_id = ? ORDER BY rowid",
+    )
+      .bind(ownerId)
+      .all<{ tool: string; preview: string }>();
+    const [r, d] = rows.results.map((x) => JSON.parse(x.preview));
+    expect(r.to).toEqual(["sam@example.net"]);
+    expect(r.subject).toBe("Re: Quarterly plan");
+    expect(d.to).toEqual(["dan@example.net"]);
+    expect(d.subject).toBe("Draft subject");
+    expect(JSON.stringify(rows.results)).not.toContain("SECRET-BODY-TEXT");
   });
 
   it("holds the send for approval and sends nothing", async () => {
@@ -536,7 +562,9 @@ describe("reply", () => {
       body: "x",
     });
     expect(res.json.status).toBe("pending_approval");
-    expect(calls).toHaveLength(0);
+    // Only the read of the original, for the approval summary; nothing is sent.
+    expect(calls.every((c) => c.method === "GET")).toBe(true);
+    expect(sendCalls(calls)).toHaveLength(0);
   });
 });
 

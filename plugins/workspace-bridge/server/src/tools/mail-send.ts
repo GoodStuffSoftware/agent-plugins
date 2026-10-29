@@ -125,6 +125,37 @@ async function guardedSend(
   }
 }
 
+/** The caller's own recipient lists, checked before any Google call; a refusal is audited. */
+async function givenRecipients(
+  ctx: ToolContext,
+  a: AccountRef,
+  tool: string,
+  subject: string | undefined,
+  args: Parameters<typeof checkRecipients>[1],
+): Promise<Recipients> {
+  try {
+    return checkRecipients(ctx.env, args);
+  } catch (e) {
+    try {
+      await ctx.audit.write({
+        tool,
+        account: a,
+        from: null,
+        to: [],
+        cc: [],
+        bcc: [],
+        subject: subject ?? "",
+        providerRef: null,
+        result: "refused",
+        detail: e instanceof ToolError ? e.code : "internal",
+      });
+    } catch {
+      console.error(`${tool}: the audit row could not be written`);
+    }
+    throw e;
+  }
+}
+
 /** What a send answers: the Gmail message, ids prefixed. */
 function answer(ctx: ToolContext, a: AccountRef, s: SentMessage): Record<string, unknown> {
   return {
@@ -171,6 +202,53 @@ async function preview(
   return { account: a.label, address: a.address, ...rest };
 }
 
+/** A draft's own recipients and subject for the approval summary; empty when it cannot be read. */
+async function draftSummary(
+  ctx: ToolContext,
+  selector: string | undefined,
+  draftId: string,
+): Promise<Record<string, unknown>> {
+  try {
+    const id = idOf(ctx, draftId);
+    const a = await accountFor(ctx, selector, id.shortId);
+    const d = await ctx.use(SEND, a).readDraft(a, id.providerId);
+    return { to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject };
+  } catch {
+    return {};
+  }
+}
+
+/** The recipients a reply will really have, for the approval summary; empty when unreadable. */
+async function replySummary(
+  ctx: ToolContext,
+  args: {
+    account?: string | undefined;
+    messageId: string;
+    replyAll?: boolean | undefined;
+    to?: readonly string[] | undefined;
+    cc?: readonly string[] | undefined;
+    bcc?: readonly string[] | undefined;
+  },
+): Promise<Record<string, unknown>> {
+  try {
+    const id = idOf(ctx, args.messageId);
+    const a = await accountFor(ctx, args.account, id.shortId);
+    const self = (await ctx.sendAs.list(a)).map((x) => x.email);
+    const p = await ctx.use(SEND, a).prepare(a, {
+      kind: "reply",
+      messageId: id.providerId,
+      replyAll: args.replyAll === true,
+      to: nonEmpty(args.to),
+      cc: nonEmpty(args.cc),
+      bcc: nonEmpty(args.bcc),
+      selfAddresses: self,
+    });
+    return { to: p.to, cc: p.cc, bcc: p.bcc, subject: p.subject };
+  } catch {
+    return {};
+  }
+}
+
 // ---- send_message --------------------------------------------------------------------------------
 
 const sendMessage = defineTool({
@@ -201,11 +279,11 @@ const sendMessage = defineTool({
   }),
   approval: {
     when: (_args, ctx) => sendNeedsApproval(ctx.env),
-    preview: (args, ctx) =>
+    preview: async (args, ctx) =>
       preview(ctx, args.account, args.draftId ?? args.replyToMessageId ?? args.replyThreadId, {
         from: args.from ?? null,
         ...(args.draftId
-          ? { draftId: args.draftId }
+          ? { draftId: args.draftId, ...(await draftSummary(ctx, args.account, args.draftId)) }
           : {
               to: nonEmpty(args.to),
               cc: nonEmpty(args.cc),
@@ -240,7 +318,7 @@ const sendMessage = defineTool({
     }
 
     // The caller's own lists are checked before any Google call.
-    const given = checkRecipients(ctx.env, args);
+    const given = await givenRecipients(ctx, a, "send_message", args.subject, args);
     const prepared = await sender.prepare(a, {
       kind: "send",
       ...given,
@@ -295,7 +373,7 @@ const reply = defineTool({
   }),
   approval: {
     when: (_args, ctx) => sendNeedsApproval(ctx.env),
-    preview: (args, ctx) =>
+    preview: async (args, ctx) =>
       preview(ctx, args.account, args.messageId, {
         action: "reply",
         messageId: args.messageId,
@@ -304,6 +382,7 @@ const reply = defineTool({
         to: nonEmpty(args.to),
         cc: nonEmpty(args.cc),
         bcc: nonEmpty(args.bcc),
+        ...(await replySummary(ctx, args)),
       }),
   },
   async handler(args, ctx) {
@@ -314,7 +393,7 @@ const reply = defineTool({
     const id = idOf(ctx, args.messageId);
     const a = await accountFor(ctx, args.account, id.shortId);
     const sender = ctx.use(SEND, a);
-    const given = checkRecipients(ctx.env, args);
+    const given = await givenRecipients(ctx, a, "reply", undefined, args);
     const self = (await ctx.sendAs.list(a)).map((s) => s.email);
     const prepared = await sender.prepare(a, {
       kind: "reply",
@@ -386,7 +465,7 @@ const forward = defineTool({
     const id = idOf(ctx, args.messageId);
     const a = await accountFor(ctx, args.account, id.shortId);
     const sender = ctx.use(SEND, a);
-    const given = checkRecipients(ctx.env, args);
+    const given = await givenRecipients(ctx, a, "forward", undefined, args);
     if (everyone(given).length === 0) {
       throw new ToolError(
         "invalid_argument",
