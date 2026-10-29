@@ -247,6 +247,21 @@ const createFilter = defineTool({
         },
       };
     },
+    // After the pending action exists, so a failed hold leaves no row, and with its id.
+    async onHeld(args, ctx, held) {
+      const what = args.action.forward
+        ? "filter that forwards"
+        : "filter that moves mail to trash or spam";
+      await ctx.audit.write({
+        tool: "create_filter",
+        account: held.account,
+        to: args.action.forward ? [args.action.forward] : undefined,
+        subject: args.criteria.subject ?? null,
+        providerRef: null,
+        result: "pending",
+        detail: `pending action ${held.pendingActionId}: approval requested, ${what}`,
+      });
+    },
   },
   async handler(args, ctx) {
     check(args);

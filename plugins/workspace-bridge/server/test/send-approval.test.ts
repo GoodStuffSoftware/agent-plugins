@@ -833,6 +833,118 @@ describe("the modes", () => {
   });
 });
 
+describe("a held action is audited as pending", () => {
+  const rowsOf = (ownerId: string) =>
+    all<{
+      tool: string;
+      result: string;
+      to_addrs: string | null;
+      subject: string | null;
+      detail: string | null;
+    }>(
+      env.DB,
+      "SELECT tool, result, to_addrs, subject, detail FROM audit_log WHERE owner_id = ? ORDER BY id",
+      ownerId,
+    );
+  const original = (): GoogleRoute => ({
+    url: MESSAGE,
+    reply: () =>
+      googleJson(200, {
+        id: fx.original.id,
+        threadId: fx.original.threadId,
+        payload: {
+          mimeType: "text/plain",
+          headers: Object.entries(fx.original.headers).map(([name, value]) => ({ name, value })),
+          body: { size: 1, data: "aGk" },
+        },
+      }),
+  });
+
+  it("send_message: one pending row with the pending id, then the sent row on approval", async () => {
+    const { ownerId } = await setup();
+    const e = MODE("new_recipients");
+    installGoogleRoutes([batchRoute(), ...peopleRoutes(), sendRoute()]);
+    const id = await heldWithGrant(e, ownerId, "send_message", bareArgs(["fresh@example.org"]));
+    const held = await rowsOf(ownerId);
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({
+      tool: "send_message",
+      result: "pending",
+      to_addrs: JSON.stringify(["fresh@example.org"]),
+      subject: "s",
+    });
+    expect(held[0]?.detail).toContain(id);
+
+    const page = await approvals(e, ownerId, id);
+    installGoogleRoutes([sendRoute()]);
+    await page.approve();
+    expect((await rowsOf(ownerId)).map((r) => [r.tool, r.result])).toEqual([
+      ["send_message", "pending"],
+      ["send_message", "approved"],
+      ["send_message", "ok"],
+    ]);
+  });
+
+  it("send_message with a very long subject keeps the row within bounds", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([batchRoute(), ...peopleRoutes(), sendRoute()]);
+    await heldWithGrant(
+      MODE("new_recipients"),
+      ownerId,
+      "send_message",
+      bareArgs(["fresh@example.org"], { subject: "<b>x</b>".repeat(60) }),
+    );
+    const [row] = await rowsOf(ownerId);
+    expect(row?.subject?.length).toBeLessThanOrEqual(300);
+  });
+
+  it("reply, forward and a draft send each write one pending row", async () => {
+    const { ownerId, key } = await setup();
+    const e = MODE("new_recipients");
+    installGoogleRoutes([
+      original(),
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+      batchRoute(),
+      ...peopleRoutes(),
+      sendRoute(),
+    ]);
+    const ids = [
+      await heldWithGrant(e, ownerId, "reply", { messageId: `${key}:m_orig`, body: "x" }),
+      await heldWithGrant(e, ownerId, "forward", {
+        messageId: `${key}:m_orig`,
+        to: ["new@example.org"],
+      }),
+      await heldWithGrant(e, ownerId, "send_message", { draftId: `${key}:d1` }),
+    ];
+    const rows = await rowsOf(ownerId);
+    expect(rows.map((r) => [r.tool, r.result])).toEqual([
+      ["reply", "pending"],
+      ["forward", "pending"],
+      ["send_message", "pending"],
+    ]);
+    for (const [i, id] of ids.entries()) expect(rows[i]?.detail).toContain(id);
+    expect(rows[0]?.to_addrs).toContain("sam@example.net");
+    expect(rows[1]?.to_addrs).toBe(JSON.stringify(["new@example.org"]));
+    expect(rows[1]?.subject).toMatch(/^Fwd: /);
+    expect(rows[2]?.to_addrs).toContain("dan@example.net");
+  });
+
+  it("a calendar send with notifications writes one pending row", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([batchRoute(), ...peopleRoutes()]);
+    const id = await heldWithGrant(MODE("new_recipients"), ownerId, "create_event", {
+      summary: "Planning",
+      startTime: "2030-01-07T10:00:00+01:00",
+      endTime: "2030-01-07T11:00:00+01:00",
+      attendeeEmails: ["Outsider@Example.net"],
+      notificationLevel: "ALL",
+    });
+    const rows = await rowsOf(ownerId);
+    expect(rows.map((r) => [r.tool, r.result])).toEqual([["create_event", "pending"]]);
+    expect(rows[0]?.detail).toContain(id);
+  });
+});
+
 /** The owner's approvals page for one pending action, as the owner's browser would use it. */
 async function approvals(e: Env, ownerId: string, id: string) {
   const app = new Hono<{ Bindings: Env }>().route("/", guardrailsRoutes(registry));

@@ -26,7 +26,7 @@ import {
 import type { SendAsAddress } from "../core/send-as";
 import { config } from "../env";
 import { googleSend } from "../providers/google/mail-send";
-import { defineTool, type Family, type ToolContext } from "../registry/types";
+import { defineTool, type Family, type HeldAction, type ToolContext } from "../registry/types";
 import { type AttachmentTotals, SEND, type SentMessage } from "../services/mail-send";
 import type { AccountRef } from "../services/types";
 import {
@@ -367,6 +367,36 @@ async function replySummary(
   }
 }
 
+/** The strings of a preview field that holds a list of addresses. */
+const previewList = (v: unknown): string[] =>
+  Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+
+/**
+ * The `pending` audit row of a held send, written from `approval.onHeld` with the pending action
+ * id: account, tool, recipients and subject, never a body. The same shape as the calendar and
+ * Drive holds; the approved run's own row then follows as the outcome.
+ */
+async function auditHeld(
+  ctx: ToolContext,
+  tool: string,
+  held: HeldAction,
+  subjectOverride?: string,
+): Promise<void> {
+  const p = (held.preview ?? {}) as Record<string, unknown>;
+  await ctx.audit.write({
+    tool,
+    account: held.account,
+    from: typeof p.from === "string" ? p.from : null,
+    to: previewList(p.to).map(bare),
+    cc: previewList(p.cc).map(bare),
+    bcc: previewList(p.bcc).map(bare),
+    subject: typeof p.subject === "string" ? p.subject : (subjectOverride ?? null),
+    providerRef: null,
+    result: "pending",
+    detail: `pending action ${held.pendingActionId}: approval requested`,
+  });
+}
+
 // ---- send_message --------------------------------------------------------------------------------
 
 const sendMessage = defineTool({
@@ -461,6 +491,8 @@ const sendMessage = defineTool({
               attachments: attachmentsPreview(args.attachments),
             }),
       }),
+    // After the pending action exists, so a failed hold leaves no row, and with its id.
+    onHeld: (_args, ctx, held) => auditHeld(ctx, "send_message", held),
   },
   async handler(args, ctx) {
     assertSingleLine("subject", args.subject);
@@ -605,6 +637,7 @@ const reply = defineTool({
         attachments: attachmentsPreview(args.attachments),
         ...(await replySummary(ctx, args)),
       }),
+    onHeld: (_args, ctx, held) => auditHeld(ctx, "reply", held),
   },
   async handler(args, ctx) {
     if (!args.body && !args.htmlBody) {
@@ -715,6 +748,27 @@ const forward = defineTool({
         includeOriginalAttachments: args.includeAttachments !== false,
         attachments: attachmentsPreview(args.attachments),
       }),
+    onHeld: async (args, ctx, held) => {
+      // A forward's preview has no subject; read the original's for the row, best effort.
+      let subject: string | undefined;
+      try {
+        const id = idOf(ctx, args.messageId);
+        const a = await accountFor(ctx, args.account, id.shortId);
+        const p = await ctx.use(SEND, a).prepare(a, {
+          kind: "forward",
+          messageId: id.providerId,
+          to: nonEmpty(args.to),
+          cc: nonEmpty(args.cc),
+          bcc: nonEmpty(args.bcc),
+          includeOriginalAttachments: false,
+          maxAttachmentBytes: sendCap(ctx),
+        });
+        subject = p.subject;
+      } catch {
+        // the row is still written, without a subject
+      }
+      await auditHeld(ctx, "forward", held, subject);
+    },
   },
   async handler(args, ctx) {
     const id = idOf(ctx, args.messageId);

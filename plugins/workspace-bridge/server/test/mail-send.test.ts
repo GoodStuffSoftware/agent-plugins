@@ -381,7 +381,8 @@ describe("send_message", () => {
       approvalUrl: expect.stringContaining("/approvals/"),
     });
     expect(calls).toHaveLength(0);
-    expect(await auditRows(ownerId)).toHaveLength(0);
+    const held = await auditRows(ownerId);
+    expect(held.map((r) => [r.tool, r.result])).toEqual([["send_message", "pending"]]);
     const row = await env.DB.prepare(
       "SELECT tool, status, preview FROM pending_actions WHERE owner_id = ?",
     )

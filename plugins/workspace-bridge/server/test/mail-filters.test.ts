@@ -328,7 +328,10 @@ describe("create_filter that forwards", () => {
     const rows = await pendingRows(ownerId);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ tool: "create_filter", status: "pending" });
-    expect(await auditRows(ownerId)).toHaveLength(0);
+    const held = await auditRows(ownerId);
+    expect(held.map((r) => [r.tool, r.result])).toEqual([["create_filter", "pending"]]);
+    expect(held[0]?.detail).toContain(json.pendingActionId);
+    expect(held[0]?.to_addrs).toBe(JSON.stringify(["archive@example.net"]));
   });
 
   it("holds a forward filter that also labels, and previews bare label ids", async () => {
@@ -379,11 +382,12 @@ describe("create_filter that forwards", () => {
 
     const rows = await auditRows(ownerId);
     expect(rows.map((r) => [r.tool, r.result])).toEqual([
+      ["create_filter", "pending"],
       ["create_filter", "approved"],
       ["create_filter", "ok"],
     ]);
-    expect(rows[1]?.to_addrs).toBe(JSON.stringify(["archive@example.net"]));
-    expect(rows[1]?.provider_ref).toBe("ANe1BmgCreated2");
+    expect(rows[2]?.to_addrs).toBe(JSON.stringify(["archive@example.net"]));
+    expect(rows[2]?.provider_ref).toBe("ANe1BmgCreated2");
   });
 
   it("maps Gmail's refusal of an unverified forwarding address and audits the failure", async () => {
@@ -410,6 +414,7 @@ describe("create_filter that forwards", () => {
 
     const rows = await auditRows(ownerId);
     expect(rows.map((r) => [r.tool, r.result])).toEqual([
+      ["create_filter", "pending"],
       ["create_filter", "approved"],
       ["create_filter", "error"],
     ]);
@@ -450,6 +455,11 @@ describe("filter guards (M17b)", () => {
     }
     expect(calls).toHaveLength(0);
     expect(await pendingRows(ownerId)).toHaveLength(3);
+    expect((await auditRows(ownerId)).map((r) => [r.tool, r.result])).toEqual([
+      ["create_filter", "pending"],
+      ["create_filter", "pending"],
+      ["create_filter", "pending"],
+    ]);
   });
 
   it("creates a filter that archives or adds a user label directly", async () => {
@@ -530,10 +540,11 @@ describe("filter guards (M17b)", () => {
     expect(got.json.result.error.code).toBe("send_disabled");
     const rows = await auditRows(ownerId);
     expect(rows.map((r) => [r.tool, r.result])).toEqual([
+      ["create_filter", "pending"],
       ["create_filter", "approved"],
       ["create_filter", "error"],
     ]);
-    expect(rows[1]?.detail).toContain("send_disabled");
+    expect(rows[2]?.detail).toContain("send_disabled");
   });
 
   it("refuses a forward to an address that is not an accepted forwarding address, queues nothing", async () => {

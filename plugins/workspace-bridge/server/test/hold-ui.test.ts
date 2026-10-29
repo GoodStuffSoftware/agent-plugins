@@ -362,6 +362,12 @@ describe("the approval buttons", () => {
     expect(res.status).toBe(200);
     expect((await pending(id))?.status).toBe("rejected");
     expect(sendCalls(calls)).toHaveLength(0);
+    const log = await all<{ result: string }>(
+      env.DB,
+      "SELECT result FROM audit_log WHERE account_id = ? AND tool = 'send_message' ORDER BY id",
+      accountId,
+    );
+    expect(log.map((r) => r.result)).toEqual(["pending", "rejected"]);
     expect(await allowOf(ownerId, accountId)).toEqual([]);
   });
 
