@@ -259,18 +259,18 @@ describe("create_draft", () => {
     expect(header(calls[0]?.body ?? "", "From")).toBe("work@example.com");
   });
 
-  it("refuses attachments until M16, and accepts an empty list", async () => {
+  it("refuses inline attachments and accepts an empty list", async () => {
     const { ownerId } = await setup();
     const calls = installGoogleRoutes([
       { method: "POST", url: UPLOAD, reply: () => draftAnswer() },
     ]);
     const res = await call(ownerId, "create_draft", {
       to: ["a@example.com"],
-      attachments: [{ content: "aGk=", filename: "a.txt" }],
+      attachments: [{ content: "aGk=", filename: "a.txt", inline: true }],
     });
     expect(res.isError).toBe(true);
     expect(res.json.error.code).toBe("invalid_argument");
-    expect(res.json.error.message).toMatch(/not supported yet/);
+    expect(res.json.error.message).toMatch(/inline/);
     expect(calls).toHaveLength(0);
     const empty = await call(ownerId, "create_draft", { to: ["a@example.com"], attachments: [] });
     expect(empty.isError).toBe(false);
@@ -842,7 +842,7 @@ describe("update_draft", () => {
     expect(bodies(raw)).toEqual(["edited"]);
   });
 
-  it("refuses to rewrite a draft that carries attachments instead of dropping them", async () => {
+  it("keeps the draft's attachments when it is rewritten", async () => {
     const { ownerId } = await setup();
     const withFile = {
       id: "d1",
@@ -857,7 +857,7 @@ describe("update_draft", () => {
             {
               mimeType: "application/pdf",
               filename: "a.pdf",
-              body: { attachmentId: "att1", size: 10 },
+              body: { attachmentId: "att1", size: 2 },
             },
           ],
         },
@@ -865,10 +865,46 @@ describe("update_draft", () => {
     };
     const calls = installGoogleRoutes([
       { url: `${BASE}/drafts/d1`, reply: () => googleJson(200, withFile) },
+      {
+        url: `${BASE}/messages/m1/attachments/att1`,
+        reply: () => googleJson(200, { size: 2, data: "aGk" }),
+      },
+      { method: "PUT", url: `${UPLOAD}/d1`, reply: () => draftAnswer() },
     ]);
     const res = await call(ownerId, "update_draft", { draftId: "d1", subject: "new" });
-    expect(res.json.error.code).toBe("invalid_argument");
-    expect(res.json.error.message).toMatch(/attachments/);
+    expect(res.isError).toBe(false);
+    const raw = calls[2]?.body ?? "";
+    expect(header(raw, "Content-Type")).toMatch(/^multipart\/mixed; boundary=/);
+    expect(raw).toContain('filename="a.pdf"');
+    expect(raw).toContain("aGk=");
+  });
+
+  it("refuses to keep a draft's attachments that are over the send cap", async () => {
+    const { ownerId } = await setup();
+    const big = {
+      id: "d1",
+      message: {
+        id: "m1",
+        threadId: "t1",
+        payload: {
+          mimeType: "multipart/mixed",
+          headers: [{ name: "To", value: "bob@example.com" }],
+          parts: [
+            { mimeType: "text/plain", body: { data: b64u("hi") } },
+            {
+              mimeType: "application/pdf",
+              filename: "big.pdf",
+              body: { attachmentId: "att1", size: 600000 },
+            },
+          ],
+        },
+      },
+    };
+    const calls = installGoogleRoutes([
+      { url: `${BASE}/drafts/d1`, reply: () => googleJson(200, big) },
+    ]);
+    const res = await call(ownerId, "update_draft", { draftId: "d1", subject: "new" });
+    expect(res.json.error.code).toBe("too_large");
     expect(calls).toHaveLength(1);
   });
 
@@ -884,9 +920,9 @@ describe("update_draft", () => {
     expect(inject.json.error.code).toBe("invalid_argument");
     const files = await call(ownerId, "update_draft", {
       draftId: "d1",
-      attachments: [{ content: "aGk=" }],
+      attachments: [{ content: "aGk=", inline: true }],
     });
-    expect(files.json.error.message).toMatch(/not supported yet/);
+    expect(files.json.error.message).toMatch(/inline/);
     expect(calls).toHaveLength(0);
   });
 

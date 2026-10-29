@@ -398,7 +398,11 @@ describe("send_message", () => {
       ],
       [{ to: ["a@example.com\r\nBcc: evil@example.net"], body: "b" }, "invalid_argument"],
       [
-        { to: ["a@example.com"], body: "b", attachments: [{ content: "aGk=", filename: "a.txt" }] },
+        {
+          to: ["a@example.com"],
+          body: "b",
+          attachments: [{ content: "aGk=", filename: "a.txt", inline: true }],
+        },
         "invalid_argument",
       ],
       [{ subject: "s", body: "b" }, "invalid_argument"],
@@ -428,7 +432,7 @@ describe("send_message", () => {
     expect(res.isError).toBe(false);
     expect(res.json.id).toBe(`${key}:m_sent`);
     expect(JSON.parse(sentBody)).toEqual({ id: "d1" });
-    expect(query(calls[0]).get("format")).toBe("metadata");
+    expect(query(calls[0]).get("format")).toBe("full");
     const rows = await auditRows(ownerId);
     expect(rows[0]).toMatchObject({
       tool: "send_message",
@@ -536,7 +540,7 @@ describe("reply", () => {
     expect(header(raw, "Cc")).toBe("only@example.com");
   });
 
-  it("needs a body, refuses attachments, and maps a missing original to not_found", async () => {
+  it("needs a body, refuses inline attachments, and maps a missing original to not_found", async () => {
     const { ownerId, key } = await setup();
     installGoogleRoutes([
       { url: MESSAGE, reply: () => googleJson(404, { error: { code: 404, message: "SECRET-X" } }) },
@@ -546,7 +550,7 @@ describe("reply", () => {
     const withFile = await call(ON(), ownerId, "reply", {
       messageId: `${key}:m_orig`,
       body: "x",
-      attachments: [{ content: "aGk=" }],
+      attachments: [{ content: "aGk=", inline: true }],
     });
     expect(withFile.json.error.code).toBe("invalid_argument");
     const missing = await call(ON(), ownerId, "reply", { messageId: `${key}:m_orig`, body: "x" });
@@ -612,41 +616,7 @@ describe("forward", () => {
     expect(bodies(raw)[1]).toContain("Forwarded message");
   });
 
-  it("says how many original attachments were left out", async () => {
-    const { ownerId, key } = await setup();
-    const route: GoogleRoute = {
-      url: MESSAGE,
-      reply: () =>
-        googleJson(200, {
-          id: "m_orig",
-          threadId: "t_orig",
-          payload: {
-            mimeType: "multipart/mixed",
-            headers: [
-              { name: "Subject", value: "Files" },
-              { name: "From", value: "sam@example.net" },
-            ],
-            parts: [
-              { mimeType: "text/plain", body: { size: 2, data: b64u("hi") } },
-              {
-                mimeType: "application/pdf",
-                filename: "a.pdf",
-                body: { attachmentId: "att1", size: 5 },
-              },
-            ],
-          },
-        }),
-    };
-    installGoogleRoutes([route, sendRoute()]);
-    const res = await call(ON(), ownerId, "forward", {
-      messageId: `${key}:m_orig`,
-      to: ["dan@example.com"],
-    });
-    expect(res.json.omittedAttachments).toBe(1);
-    expect(res.json.note).toContain("not forwarded");
-  });
-
-  it("needs a recipient and refuses new attachments", async () => {
+  it("needs a recipient and refuses inline attachments", async () => {
     const { ownerId, key } = await setup();
     const calls = installGoogleRoutes([originalRoute(), sendRoute()]);
     const none = await call(ON(), ownerId, "forward", { messageId: `${key}:m_orig` });
@@ -654,7 +624,7 @@ describe("forward", () => {
     const file = await call(ON(), ownerId, "forward", {
       messageId: `${key}:m_orig`,
       to: ["dan@example.com"],
-      attachments: [{ content: "aGk=" }],
+      attachments: [{ content: "aGk=", inline: true }],
     });
     expect(file.json.error.code).toBe("invalid_argument");
     expect(calls).toHaveLength(0);

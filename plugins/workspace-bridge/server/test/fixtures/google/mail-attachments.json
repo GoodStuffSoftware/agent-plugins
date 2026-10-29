@@ -1,0 +1,29 @@
+{
+  "sent": {
+    "id": "m_sent",
+    "threadId": "t_sent",
+    "labelIds": [
+      "SENT"
+    ]
+  },
+  "file": {
+    "filename": "plan.pdf",
+    "mimeType": "application/pdf",
+    "bytes": 200,
+    "base64": "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dzj6vH4/wYNFBsiKTA3PkVMU1phaG92fYSLkpmgp661vMPK0djf5u30+wIJEBceJSwzOkFIT1ZdZGtyeYCHjpWco6qxuL/GzdTb4unw9/4FDBMaISgvNj1ES1JZYGdudXyDipGYn6attLvCydDX3uXs8/oBCA8WHSQrMjlAR05VXGNqcXh/ho2Um6KpsLe+xczT2uHo7/b9BAsSGSAnLjU8Q0pRWF9mbXQ=",
+    "base64url": "AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dzj6vH4_wYNFBsiKTA3PkVMU1phaG92fYSLkpmgp661vMPK0djf5u30-wIJEBceJSwzOkFIT1ZdZGtyeYCHjpWco6qxuL_GzdTb4unw9_4FDBMaISgvNj1ES1JZYGdudXyDipGYn6attLvCydDX3uXs8_oBCA8WHSQrMjlAR05VXGNqcXh_ho2Um6KpsLe-xczT2uHo7_b9BAsSGSAnLjU8Q0pRWF9mbXQ"
+  },
+  "original": {
+    "id": "m_att",
+    "threadId": "t_att",
+    "headers": {
+      "Message-ID": "<att-1@mail.example.net>",
+      "Subject": "Files attached",
+      "From": "Sam Sender <sam@example.net>",
+      "To": "work@example.com",
+      "Date": "Mon, 26 Oct 2026 09:00:00 +0000"
+    },
+    "text": "See the attached plan.",
+    "attachmentId": "att1"
+  }
+}
