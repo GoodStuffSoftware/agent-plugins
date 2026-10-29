@@ -296,8 +296,9 @@ export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
   annotations: ToolAnnotations;      // readOnlyHint, destructiveHint, idempotentHint, openWorldHint
   input: S;                          // zod v4 object, camelCase keys
   untrusted?: boolean;               // output carries third-party text
-  approval?: { when(args: z.output<S>, ctx: ToolContext): boolean | Promise<boolean>;
-               preview(args: z.output<S>, ctx: ToolContext): unknown };
+  approval?: { when(args: z.output<S>, ctx: ToolContext): boolean | Promise<boolean>;   // also the cheap, Google-free checks: a throw refuses before anything is queued
+               preview(args: z.output<S>, ctx: ToolContext): unknown;
+               onHeld?(args: z.output<S>, ctx: ToolContext, held: HeldAction): void | Promise<void> };   // after the pending action exists (held audit row)
   handler(args: z.output<S>, ctx: ToolContext): Promise<unknown>;   // JSON-serialisable
 }
 
@@ -325,7 +326,7 @@ export const REGISTRY: Registry;                                        // compi
 
 Endpoint rule (plan s.10.6): `ro` gets read tools plus `create_draft` and `update_draft`, and no send, reply, forward, share, filter, trash or label-write tool. `admin` gets admin tools. Account and meta tools are on all three. Server names per endpoint: `workspace-bridge`, `workspace-bridge-readonly`, `workspace-bridge-admin` (plan s.4.1).
 
-`register.ts` wraps every handler in this order: per-grant rate check, `approval.when` (if true, store a pending action and return its preview), handler, error mapping. An approved pending action later runs the same handler from `/approvals/:id` with a context built from the stored grant. `checkRate` calls `ctx.limits.call(tool)`; `gateApproval` builds `approval.preview` and returns `ctx.pending.create(...)`. Until M14 fills the stubs, the limit never trips and `create` throws `internal`, so a call that needs approval fails closed. An exception that is not a `ToolError` is logged as one redacted line before it becomes `internal` (s.3.3).
+`register.ts` wraps every handler in this order: per-grant rate check, `approval.when` (if true, store a pending action and return its preview), handler, error mapping. An approved pending action later runs the same handler from `/approvals/:id` with a context built from the stored grant. `checkRate` calls `ctx.limits.call(tool)`; `gateApproval` builds `approval.preview`, calls `ctx.pending.create(...)` and then `approval.onHeld` with the new `pendingActionId` (the place for a held audit row: a failed create leaves none; a failing hook is logged and the hold stands), and returns the pending answer. Until M14 fills the stubs, the limit never trips and `create` throws `internal`, so a call that needs approval fails closed. An exception that is not a `ToolError` is logged as one redacted line before it becomes `internal` (s.3.3).
 
 **Deviation from plan (parameter names).** Plan s.8 writes params in snake_case; the captured official tools (`test/fixtures/parity/*.json`) use camelCase (`messageId`, `labelIds`, `pageToken`, `startTime`, `fileId`). Plan s.8.7 says captured names win, so tools use the official names and additions follow the same style (`account`, `maxBodyChars`, `messageOffset`). Where the official required set differs from plan s.8, the official one wins: `create_label(displayName)`, `respond_to_event(eventId, responseStatus)`, `suggest_time(attendeeEmails, startTime, endTime)`, `create_file(title)`, `share_file(fileId, role)`, and `update_message_labels(messageId)` with one message, not a list.
 
