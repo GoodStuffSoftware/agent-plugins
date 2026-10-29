@@ -80,6 +80,57 @@ color-scheme:light dark;
 }}
 `;
 
+/**
+ * Below its own width a table becomes a stack of cards. The switch follows the width of the
+ * table's wrapper (a container query on `.table-wrap`), not the viewport, so a theme that widens
+ * the content area gets tables for as long as they fit. `atRem` is the container width under which
+ * the table is no longer comfortable or starts to clip. Measured with the sample data of
+ * `npm run snapshots`: a theme with no-wrap buttons and tracked headings clips below 70rem
+ * (accounts), 64rem (audit) and 33rem (allowed). Accounts and audit carry free text (addresses,
+ * subjects) in seven and nine columns, so they get a wide margin: long values push them past it.
+ */
+function cardLayout(table: string, atRem: number, labels: readonly string[]): string {
+  const t = `.${table}`;
+  const rules = [
+    `${t} thead{position:absolute;left:-9999px}`,
+    `${t},${t} tbody,${t} tr,${t} td{display:block;width:100%}`,
+    `${t} tr{background:var(--wb-surface);border:1px solid var(--wb-border);border-radius:var(--wb-radius);box-shadow:var(--wb-shadow-card);padding:var(--wb-space-s) var(--wb-space-m);margin:0 0 var(--wb-space-m)}`,
+    `${t} td{border:0;padding:.35rem 0}`,
+    `${t} td:empty{display:none}`,
+    `${t} td::before{display:block;font-size:.75rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--wb-text-muted)}`,
+    `${t} td:first-child{font-weight:600}`,
+    `${t} td:first-child input{width:100%;margin:var(--wb-space-xs) 0}`,
+    ...labels.map((l, i) => `${t} td:nth-child(${i + 1})::before{content:"${l}"}`),
+  ];
+  return `@container (max-width:${atRem}rem){
+${rules.join("\n")}
+}`;
+}
+
+const CARD_LAYOUTS = [
+  cardLayout("accounts-table", 72, [
+    "Label",
+    "Address",
+    "Provider",
+    "Components",
+    "Status",
+    "Default",
+    "Actions",
+  ]),
+  cardLayout("allow-table", 34, ["Type", "Allowed", "Added (UTC)"]),
+  cardLayout("audit-table", 72, [
+    "Time (UTC)",
+    "Account",
+    "Tool",
+    "Result",
+    "From",
+    "To, cc, bcc",
+    "Subject",
+    "Detail",
+    "Client",
+  ]),
+].join("\n");
+
 const RULES = `
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -159,13 +210,20 @@ button.danger:hover{background:var(--wb-reject-soft)}
 .pill{display:inline-block;padding:.05rem .6rem;border-radius:999px;background:var(--wb-surface-2);border:1px solid var(--wb-border);font-size:.9rem}
 details.card>summary{cursor:pointer;font-weight:600;min-height:var(--wb-tap);display:flex;align-items:center}
 details.card[open]>summary{margin-bottom:var(--wb-space-s)}
-.table-wrap{overflow-x:auto}
+.table-wrap{overflow-x:auto;container-type:inline-size}
 table{border-collapse:collapse;width:100%}
 th{text-align:left;font-size:.78rem;letter-spacing:.05em;text-transform:uppercase;color:var(--wb-text-muted)}
 th,td{padding:.6rem .7rem;border-bottom:1px solid var(--wb-border);vertical-align:top;overflow-wrap:anywhere}
 td ul{list-style:none;padding:0;margin:0}
 td li{margin:0 0 var(--wb-space-xs)}
 td form.inline-form{margin:.25rem .75rem .25rem 0}
+.components{display:grid;grid-template-columns:minmax(0,1fr) auto auto;column-gap:var(--wb-space-s);align-items:center;margin:0;min-width:15rem}
+td .components li{display:grid;grid-template-columns:subgrid;grid-column:1/-1;align-items:center;margin:0;padding:.15rem 0;border-top:1px solid var(--wb-border)}
+td .components li:first-child{border-top:0}
+.comp-state{min-width:2rem;font-size:.85rem;font-weight:700;text-align:center;color:var(--wb-text-muted)}
+.comp-state.is-on{color:var(--wb-approve)}
+td .components form.inline-form{display:block;margin:0}
+.components button{width:100%;padding:0 .9rem;white-space:nowrap}
 td input{min-height:var(--wb-tap)}
 .audit-table{font-size:.9rem}
 .actions-row{display:flex;flex-wrap:wrap;gap:var(--wb-space-s);align-items:center}
@@ -175,35 +233,7 @@ td input{min-height:var(--wb-tap)}
 .field-row>*{margin:0}
 .field-row input[name=value]{flex:1 1 14rem}
 .page-intro{color:var(--wb-text-muted);margin:calc(var(--wb-space-s) * -1) 0 var(--wb-space-m)}
-@media (max-width:44rem){
-.cards-table thead{position:absolute;left:-9999px}
-.cards-table,.cards-table tbody,.cards-table tr,.cards-table td{display:block;width:100%}
-.cards-table tr{background:var(--wb-surface);border:1px solid var(--wb-border);border-radius:var(--wb-radius);box-shadow:var(--wb-shadow-card);padding:var(--wb-space-s) var(--wb-space-m);margin:0 0 var(--wb-space-m)}
-.cards-table td{border:0;padding:.35rem 0}
-.cards-table td:empty{display:none}
-.cards-table td::before{display:block;font-size:.75rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--wb-text-muted)}
-.cards-table td:first-child{font-weight:600}
-.cards-table td:first-child input{width:100%;margin:var(--wb-space-xs) 0}
-.accounts-table td:nth-child(1)::before{content:"Label"}
-.accounts-table td:nth-child(2)::before{content:"Address"}
-.accounts-table td:nth-child(3)::before{content:"Provider"}
-.accounts-table td:nth-child(4)::before{content:"Components"}
-.accounts-table td:nth-child(5)::before{content:"Status"}
-.accounts-table td:nth-child(6)::before{content:"Default"}
-.accounts-table td:nth-child(7)::before{content:"Actions"}
-.allow-table td:nth-child(1)::before{content:"Type"}
-.allow-table td:nth-child(2)::before{content:"Allowed"}
-.allow-table td:nth-child(3)::before{content:"Added (UTC)"}
-.audit-table td:nth-child(1)::before{content:"Time (UTC)"}
-.audit-table td:nth-child(2)::before{content:"Account"}
-.audit-table td:nth-child(3)::before{content:"Tool"}
-.audit-table td:nth-child(4)::before{content:"Result"}
-.audit-table td:nth-child(5)::before{content:"From"}
-.audit-table td:nth-child(6)::before{content:"To, cc, bcc"}
-.audit-table td:nth-child(7)::before{content:"Subject"}
-.audit-table td:nth-child(8)::before{content:"Detail"}
-.audit-table td:nth-child(9)::before{content:"Client"}
-}
+${CARD_LAYOUTS}
 @media (min-width:34rem){
 .facts{grid-template-columns:7.5rem 1fr;column-gap:var(--wb-space-m)}
 .facts dt{margin:0;padding:.3rem 0 0}

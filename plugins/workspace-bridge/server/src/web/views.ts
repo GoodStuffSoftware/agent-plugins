@@ -158,9 +158,9 @@ function accountRow(
 </form></td>
 <td>${account.address}</td>
 <td>${account.provider}</td>
-<td><ul>${ACCOUNT_COMPONENTS.map((c) => {
+<td><ul class="components">${ACCOUNT_COMPONENTS.map((c) => {
     const isOn = on.includes(c);
-    return html`<li>${COMPONENT_LABELS[c]}: ${isOn ? "on" : "off"} ${postForm(
+    return html`<li><span class="comp-name">${COMPONENT_LABELS[c]}</span><span class="comp-state${isOn ? " is-on" : ""}">${isOn ? "on" : "off"}</span>${postForm(
       "/accounts/component",
       csrf,
       [id, ["component", c], ["on", isOn ? "0" : "1"]],

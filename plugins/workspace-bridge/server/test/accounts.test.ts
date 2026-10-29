@@ -776,7 +776,9 @@ describe("component toggles", () => {
     );
     expect(google.issued).toHaveLength(before + 1);
     expect(await opened(rows[0] as AccountRow, "refresh")).toBe(google.issued.at(-1)?.refresh);
-    expect((await accountsPage(browser)).html).toContain("Drive files: on");
+    expect((await accountsPage(browser)).html).toContain(
+      'Drive files</span><span class="comp-state is-on">on',
+    );
   });
 
   it("turning a component on needs no consent when Google already granted its scopes", async () => {
@@ -808,8 +810,10 @@ describe("component toggles", () => {
     expect(calls()).toBe(before);
     expect(google.issued).toHaveLength(issued);
     expect(google.revoked).toEqual([]);
-    expect(page.html).toContain("Mail: send: on");
-    expect((await accountsPage(browser)).html).toContain("Mail: send: off");
+    expect(page.html).toContain('Mail: send</span><span class="comp-state is-on">on');
+    expect((await accountsPage(browser)).html).toContain(
+      'Mail: send</span><span class="comp-state">off',
+    );
     // A repeat is harmless.
     expect((await toggle(browser, account, "mail.send", false)).status).toBe(303);
     expect(await componentsOf()).not.toContain("mail.send");
