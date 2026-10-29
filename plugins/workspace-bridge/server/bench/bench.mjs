@@ -390,6 +390,64 @@ const threadFull = (count, opts) =>
     messages: Array.from({ length: count }, (_, i) => messageJson(i, opts)),
   });
 
+// Google as get_thread reads it: the thread at the index mask (part tree and sizes, no data), then
+// a batch of messages.get per message. The canned texts are built once, and the fakes' time is
+// subtracted like everywhere else.
+const indexPart = (p) => ({
+  mimeType: p.mimeType,
+  filename: p.filename,
+  body: p.body ? { size: p.body.size, attachmentId: p.body.attachmentId } : undefined,
+  parts: p.parts?.map(indexPart),
+});
+const gmailThreadRoutes = (threadText) => {
+  const thread = JSON.parse(threadText);
+  const indexText = JSON.stringify({
+    id: thread.id,
+    messages: thread.messages.map((m) => ({
+      id: m.id,
+      labelIds: m.labelIds,
+      payload: indexPart(m.payload),
+    })),
+  });
+  const full = new Map(thread.messages.map((m) => [m.id, JSON.stringify(m)]));
+  const meta = new Map(
+    thread.messages.map((m) => [
+      m.id,
+      JSON.stringify({ ...m, payload: { headers: m.payload.headers } }),
+    ]),
+  );
+  return [
+    {
+      url: `${GMAIL}/threads/${thread.id}`,
+      reply: ({ url }) =>
+        json(
+          200,
+          url.searchParams.get("fields")?.includes("payload(mimeType,filename")
+            ? indexText
+            : threadText,
+        ),
+    },
+    {
+      method: "POST",
+      url: "https://gmail.googleapis.com/batch/gmail/v1",
+      reply: ({ body }) => {
+        let out = "";
+        for (const m of body.matchAll(/Content-ID: <([^>]+)>\r\n\r\nGET (\S+)/g)) {
+          const u = new URL(`https://x${m[2]}`);
+          const id = decodeURIComponent(/\/messages\/([^/?]+)/.exec(u.pathname)?.[1] ?? "");
+          const text = (u.searchParams.get("format") === "full" ? full : meta).get(id);
+          out += `--batch_resp\r\nContent-Type: application/http\r\nContent-ID: <response-${m[1]}>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${text}\r\n`;
+        }
+        return {
+          status: 200,
+          headers: { "Content-Type": "multipart/mixed; boundary=batch_resp" },
+          body: `${out}--batch_resp--\r\n`,
+        };
+      },
+    },
+  ];
+};
+
 const threadMeta = (id) => ({
   id,
   messages: Array.from({ length: 4 }, (_, i) => ({
@@ -806,7 +864,7 @@ await bench("tools/call list_accounts (1 account)", () =>
     ["worst, 20 msgs, 300 KB html only", { htmlBytes: 300_000, plain: false }],
   ]) {
     const body = threadFull(20, opts);
-    setRoutes([GOOGLE_TOKEN, { url: `${GMAIL}/threads/t1`, reply: () => json(200, body) }]);
+    setRoutes([GOOGLE_TOKEN, ...gmailThreadRoutes(body)]);
     await bench(`get_thread ${label} (${(body.length / 1e6).toFixed(1)} MB)`, () =>
       mcpRequest(t, "full", "tools/call", { name: "get_thread", arguments: { threadId: "t1" } }),
     );
