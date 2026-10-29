@@ -34,6 +34,11 @@
     "OWNER_CONTACT": "",
     "SEND_ENABLED": "false",
     "SETUP_MODE": "true",
+    // Which sends wait for your approval: "new_recipients" (default) holds a send when at least one
+    // recipient is new to the sending account (not yours, not allow-listed, not sent to before, not
+    // in its contacts); "all" holds every send; "off" holds none. Caps, rate limits, SEND_ENABLED
+    // and the owner switch apply in every mode. Unset, SEND_REQUIRES_CONFIRM=true means "all".
+    "SEND_APPROVAL_MODE": "new_recipients",
     "SEND_REQUIRES_CONFIRM": "false",
     "SEND_PER_HOUR": "20",
     "SEND_PER_DAY": "100",

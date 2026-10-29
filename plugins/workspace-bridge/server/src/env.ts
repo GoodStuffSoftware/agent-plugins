@@ -16,6 +16,7 @@ export interface Env {
   SEND_ENABLED?: string;
   SETUP_MODE?: string;
   SEND_REQUIRES_CONFIRM?: string;
+  SEND_APPROVAL_MODE?: string;
   SEND_PER_HOUR?: string;
   SEND_PER_DAY?: string;
   MAX_RECIPIENTS?: string;
@@ -53,6 +54,12 @@ export interface Config {
   setupMode: boolean;
   sendEnabled: boolean;
   sendRequiresConfirm: boolean;
+  /**
+   * Which sends wait for the owner: `new_recipients` (default) holds a send with at least one
+   * recipient new to the sending account, `all` holds every send, `off` holds none. When
+   * `SEND_APPROVAL_MODE` is unset, `SEND_REQUIRES_CONFIRM=true` means `all` (the old switch).
+   */
+  sendApprovalMode: SendApprovalMode;
   sendPerHour: number;
   sendPerDay: number;
   maxRecipients: number;
@@ -67,6 +74,9 @@ export interface Config {
   linkableEmails: readonly string[];
 }
 
+export const SEND_APPROVAL_MODES = ["new_recipients", "all", "off"] as const;
+export type SendApprovalMode = (typeof SEND_APPROVAL_MODES)[number];
+
 const parsed = new WeakMap<object, Config>();
 
 /** Parses and validates the configuration once per `env` object; throws on a bad value. */
@@ -79,15 +89,23 @@ export function config(env: Env): Config {
   return c;
 }
 
+function approvalMode(value: string | undefined, requiresConfirm: boolean): SendApprovalMode {
+  if (value === undefined || value === "") return requiresConfirm ? "all" : "new_recipients";
+  if ((SEND_APPROVAL_MODES as readonly string[]).includes(value)) return value as SendApprovalMode;
+  throw new Error(`SEND_APPROVAL_MODE must be one of ${SEND_APPROVAL_MODES.join(", ")}`);
+}
+
 function parse(env: Env): Config {
   const ownerEmails = emails("OWNER_EMAILS", env.OWNER_EMAILS);
   const linkable = emails("LINKABLE_EMAILS", env.LINKABLE_EMAILS);
+  const requiresConfirm = flag("SEND_REQUIRES_CONFIRM", env.SEND_REQUIRES_CONFIRM, false);
   return Object.freeze({
     issuer: issuer(env.PUBLIC_URL),
     ownerContact: (env.OWNER_CONTACT ?? "").trim(),
     setupMode: flag("SETUP_MODE", env.SETUP_MODE, false),
     sendEnabled: flag("SEND_ENABLED", env.SEND_ENABLED, false),
-    sendRequiresConfirm: flag("SEND_REQUIRES_CONFIRM", env.SEND_REQUIRES_CONFIRM, false),
+    sendRequiresConfirm: requiresConfirm,
+    sendApprovalMode: approvalMode(env.SEND_APPROVAL_MODE, requiresConfirm),
     sendPerHour: count("SEND_PER_HOUR", env.SEND_PER_HOUR, 20),
     sendPerDay: count("SEND_PER_DAY", env.SEND_PER_DAY, 100),
     maxRecipients: count("MAX_RECIPIENTS", env.MAX_RECIPIENTS, 20),

@@ -22,6 +22,9 @@ export default defineConfig({
           GOOGLE_CLIENT_SECRET: "test-secret",
           // Sending is on for the tool tests; the owner switch (default on) is what they turn off.
           SEND_ENABLED: "true",
+          // The older tests exercise the guardrails of a send, not the new-recipient hold
+          // (test/send-approval.test.ts sets its own mode); their helpers unset it for back-compat tests.
+          SEND_APPROVAL_MODE: "off",
         },
       },
     })),

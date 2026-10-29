@@ -2,7 +2,8 @@
 // Full endpoint only: a send tool is never registered on /mcp/ro.
 //
 // Every send passes the same guardrails, in this order: the approval rule (the registry runs
-// `approval` before the handler; a held send stores {kind, args} and sends nothing), then in the
+// `approval` before the handler; a held send stores {kind, args} and sends nothing; by default a
+// send is held only when a recipient is new to the account, see core/recipients.ts), then in the
 // handler the sending switch and rate limit (`checkSend`), the From check (`assertFrom`), the
 // send itself and one audit row. The audit row never holds a body. A send that is refused or
 // fails writes a row too (`refused` before Google was called, `error` after).
@@ -16,7 +17,12 @@ import { z } from "zod";
 import { ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
 import { parseAddresses } from "../core/mime";
-import { sendNeedsApproval } from "../core/pending";
+import {
+  findNewRecipients,
+  heldBecause,
+  normalizeRecipients,
+  rememberSent,
+} from "../core/recipients";
 import type { SendAsAddress } from "../core/send-as";
 import { config } from "../env";
 import { googleSend } from "../providers/google/mail-send";
@@ -65,7 +71,8 @@ async function accountFor(
 }
 
 const bare = (entry: string): string => parseAddresses(entry)[0] ?? entry.trim().toLowerCase();
-const everyone = (r: Recipients): string[] => [...r.to, ...r.cc, ...r.bcc].map(bare);
+const entriesOf = (r: Recipients): string[] => [...r.to, ...r.cc, ...r.bcc];
+const everyone = (r: Recipients): string[] => entriesOf(r).map(bare);
 const nonEmpty = (xs: readonly string[] | undefined): string[] => (xs ? [...xs] : []);
 
 /**
@@ -126,6 +133,7 @@ async function guardedSend(
     stage = "error";
     const sent = await deliver(meta.from ? allowed : undefined);
     await audit("ok", sent.id);
+    await rememberSent(ctx, a, entriesOf(recipients));
     return { sent, from: allowed, recipients };
   } catch (e) {
     await audit(stage, undefined, e instanceof ToolError ? e.code : "internal");
@@ -209,6 +217,37 @@ const attachmentsPreview = (
     mimeType: f.mimeType ?? null,
     approxBytes: Math.floor((f.content.length * 3) / 4),
   }));
+
+/** The recipients a hold found new, by the call's arguments: `when` writes, `preview` reads. */
+const newOnes = new WeakMap<object, string[]>();
+/** A draft's recipients as checked when the call was decided not to be held (see the handler). */
+const checkedDraft = new WeakMap<object, Set<string>>();
+
+const mode = (ctx: ToolContext) => config(ctx.env).sendApprovalMode;
+
+/**
+ * Whether a send is held under `new_recipients`: true when at least one recipient is new to the
+ * account (they are kept for the preview). `entries` must be the recipients the message will
+ * really have.
+ */
+async function holdsForNew(
+  ctx: ToolContext,
+  args: object,
+  a: AccountRef,
+  entries: readonly string[],
+): Promise<boolean> {
+  if (entries.length === 0) return false; // the handler refuses a send with no recipient
+  const found = await findNewRecipients(ctx, a, entries);
+  if (found.length === 0) return false;
+  newOnes.set(args, found);
+  return true;
+}
+
+/** What the approval summary adds when a send was held for new recipients. */
+const heldNote = (args: object): Record<string, unknown> => {
+  const found = newOnes.get(args);
+  return found ? { newRecipients: found, heldBecause: heldBecause(found) } : {};
+};
 
 const sendCap = (ctx: ToolContext): number => config(ctx.env).maxSendAttachmentBytes;
 
@@ -360,11 +399,39 @@ const sendMessage = defineTool({
   }),
   approval: {
     async when(args, ctx) {
-      if (!sendNeedsApproval(ctx.env)) return false;
+      if (mode(ctx) === "off") return false;
       assertSingleLine("subject", args.subject);
-      // A draft is sent as it is: its own recipients and files are read at send time.
-      if (!args.draftId) {
-        const ref = args.replyToMessageId ?? args.replyThreadId;
+      const ref = args.draftId ?? args.replyToMessageId ?? args.replyThreadId;
+      if (mode(ctx) === "all") {
+        // A draft is sent as it is: its own recipients and files are read at send time.
+        if (!args.draftId) {
+          await checkBeforeHold(ctx, "send_message", args.account, ref, args.subject, args, true);
+        }
+        return true;
+      }
+      const a = await accountFor(ctx, args.account, ref ? idOf(ctx, ref).shortId : undefined);
+      let entries: string[];
+      if (args.draftId) {
+        // The draft's real To, Cc and Bcc; a failing read is the caller's error, never a free pass.
+        const draft = await ctx.use(SEND, a).readDraft(a, idOf(ctx, args.draftId).providerId);
+        entries = entriesOf(draft);
+      } else {
+        try {
+          entries = entriesOf(checkRecipients(ctx.env, args));
+        } catch {
+          return false; // the handler repeats this check and refuses
+        }
+      }
+      if (!(await holdsForNew(ctx, args, a, entries))) {
+        if (args.draftId) checkedDraft.set(args, new Set(normalizeRecipients(entries)));
+        return false;
+      }
+      // Held: refuse at once what could never go out.
+      if (args.draftId) {
+        await refusing(ctx, a, "send_message", undefined, async () => {
+          await ctx.limits.assertSendEnabled(a);
+        });
+      } else {
         await checkBeforeHold(ctx, "send_message", args.account, ref, args.subject, args, true);
       }
       return true;
@@ -372,6 +439,7 @@ const sendMessage = defineTool({
     preview: async (args, ctx) =>
       preview(ctx, args.account, args.draftId ?? args.replyToMessageId ?? args.replyThreadId, {
         from: args.from ?? null,
+        ...heldNote(args),
         ...(args.draftId
           ? { draftId: args.draftId, ...(await draftSummary(ctx, args.account, args.draftId)) }
           : {
@@ -400,7 +468,18 @@ const sendMessage = defineTool({
           tool: "send_message",
           from: fromHeader,
           subject: draft.subject,
-          recipients: () => checkRecipients(ctx.env, draft),
+          recipients: () => {
+            // Decided not to be held on the draft as it was a moment ago: if it gained a
+            // recipient since, nothing is sent (the caller can try again and be held).
+            const before = checkedDraft.get(args);
+            if (before && normalizeRecipients(entriesOf(draft)).some((x) => !before.has(x))) {
+              throw new ToolError(
+                "invalid_argument",
+                "The draft's recipients changed while the send was being checked. Nothing was sent; try again.",
+              );
+            }
+            return checkRecipients(ctx.env, draft);
+          },
           attachments: draft.attachmentTotals,
         },
         () => sender.sendDraft(a, draftId),
@@ -471,16 +550,41 @@ const reply = defineTool({
   }),
   approval: {
     async when(args, ctx) {
-      if (!sendNeedsApproval(ctx.env)) return false;
+      if (mode(ctx) === "off") return false;
       if (!args.body && !args.htmlBody) {
         throw new ToolError("invalid_argument", "A reply needs `body` or `htmlBody`.");
       }
+      if (mode(ctx) === "all") {
+        await checkBeforeHold(ctx, "reply", args.account, args.messageId, undefined, args, false);
+        return true;
+      }
+      try {
+        checkRecipients(ctx.env, args);
+      } catch {
+        return false; // the handler repeats this check and refuses
+      }
+      // The recipients the reply will really have (the original's Reply-To or sender, and with
+      // replyAll the rest): a stranger who wrote in is new. A failing read is an error, not a pass.
+      const id = idOf(ctx, args.messageId);
+      const a = await accountFor(ctx, args.account, id.shortId);
+      const self = (await ctx.sendAs.list(a)).map((x) => x.email);
+      const p = await ctx.use(SEND, a).prepare(a, {
+        kind: "reply",
+        messageId: id.providerId,
+        replyAll: args.replyAll === true,
+        to: nonEmpty(args.to),
+        cc: nonEmpty(args.cc),
+        bcc: nonEmpty(args.bcc),
+        selfAddresses: self,
+      });
+      if (!(await holdsForNew(ctx, args, a, entriesOf(p)))) return false;
       await checkBeforeHold(ctx, "reply", args.account, args.messageId, undefined, args, false);
       return true;
     },
     preview: async (args, ctx) =>
       preview(ctx, args.account, args.messageId, {
         action: "reply",
+        ...heldNote(args),
         messageId: args.messageId,
         replyAll: args.replyAll === true,
         from: args.from ?? null,
@@ -572,13 +676,26 @@ const forward = defineTool({
   }),
   approval: {
     async when(args, ctx) {
-      if (!sendNeedsApproval(ctx.env)) return false;
+      if (mode(ctx) === "off") return false;
+      if (mode(ctx) === "all") {
+        await checkBeforeHold(ctx, "forward", args.account, args.messageId, undefined, args, true);
+        return true;
+      }
+      let entries: string[];
+      try {
+        entries = entriesOf(checkRecipients(ctx.env, args));
+      } catch {
+        return false; // the handler repeats this check and refuses
+      }
+      const a = await accountFor(ctx, args.account, idOf(ctx, args.messageId).shortId);
+      if (!(await holdsForNew(ctx, args, a, entries))) return false;
       await checkBeforeHold(ctx, "forward", args.account, args.messageId, undefined, args, true);
       return true;
     },
     preview: (args, ctx) =>
       preview(ctx, args.account, args.messageId, {
         action: "forward",
+        ...heldNote(args),
         messageId: args.messageId,
         from: args.from ?? null,
         to: nonEmpty(args.to),

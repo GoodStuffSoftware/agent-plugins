@@ -39,7 +39,14 @@ afterEach(() => {
 // biome-ignore lint/suspicious/noExplicitAny: the JSON a tool answered, read loosely by the tests
 type Json = any;
 
-const withEnv = (overrides: Partial<Env>): Env => ({ ...env, ...overrides }) as Env;
+// These suites test the guardrails of a send, not the new-recipient rule (test/send-approval.test.ts):
+// approval is off unless a test asks for SEND_REQUIRES_CONFIRM, which with the mode unset means `all`.
+const withEnv = (overrides: Partial<Env>): Env =>
+  ({
+    ...env,
+    SEND_APPROVAL_MODE: "SEND_REQUIRES_CONFIRM" in overrides ? undefined : "off",
+    ...overrides,
+  }) as Env;
 const ON = (extra: Partial<Env> = {}): Env => withEnv({ SEND_ENABLED: "true", ...extra });
 
 async function setup() {

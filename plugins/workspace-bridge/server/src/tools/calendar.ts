@@ -9,7 +9,7 @@ import { loadAccountRefs } from "../core/accounts";
 import { mergePages, startFromCursor } from "../core/cursor";
 import { ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
-import { sendNeedsApproval } from "../core/pending";
+import { findNewRecipients, heldBecause, rememberSent } from "../core/recipients";
 import { config } from "../env";
 import { googleCalendar } from "../providers/google/calendar";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
@@ -787,7 +787,7 @@ function refuseMeetUrl(url: string | undefined): void {
 // A calendar change can make Google email people with text the caller chose (title, description,
 // a response comment), so it is a send: it obeys SEND_ENABLED and the owner switch, counts against
 // the account's send limits and recipient cap, writes an audit row (addresses, never the event
-// text) and, with SEND_REQUIRES_CONFIRM, is held for the owner. A change that notifies nobody
+// text) and, by default (`SEND_APPROVAL_MODE`) is held for the owner when a recipient is new. A change that notifies nobody
 // outside the owner's own accounts is not a send and is unchanged. With no `notificationLevel`
 // the level is none, which is also Google's own default for `sendUpdates`, so nobody is mailed.
 
@@ -934,6 +934,7 @@ async function guardedNotify<T>(
   try {
     const r = await run();
     await auditSend(ctx, tool, a, recipients, "ok", detail, refOf(r));
+    await rememberSent(ctx, a, recipients);
     return r;
   } catch (e) {
     await auditSend(ctx, tool, a, recipients, "error", `${errorCode(e)}; ${detail}`);
@@ -965,11 +966,23 @@ function heldPlan(ctx: ToolContext, tool: CalendarSendTool, args: NotifyArgs): P
   return p;
 }
 
+/** The recipients a hold found new, by the call's arguments: `when` writes, `preview` reads. */
+const newOnes = new WeakMap<object, string[]>();
+
 /**
- * Whether a calendar send is held for the owner: with SEND_REQUIRES_CONFIRM, as for mail sends.
- * The place a rule about new recipients can plug in: it gets the whole plan.
+ * Whether a calendar send is held for the owner, as for mail sends: in mode `all` always, in mode
+ * `new_recipients` (the default) when at least one outside recipient is new to the account, in
+ * mode `off` never. It gets the whole plan.
  */
-const holdsSend = (ctx: ToolContext, _plan: SendPlan): boolean => sendNeedsApproval(ctx.env);
+async function holdsSend(ctx: ToolContext, plan: SendPlan, args: object): Promise<boolean> {
+  const mode = config(ctx.env).sendApprovalMode;
+  if (mode === "off") return false;
+  if (mode === "all") return true;
+  const found = await findNewRecipients(ctx, plan.a, plan.recipients);
+  if (found.length === 0) return false;
+  newOnes.set(args, found);
+  return true;
+}
 
 /**
  * `approval` of the four writing tools. Like a mail send it holds only a call that is a send, and
@@ -979,11 +992,10 @@ const holdsSend = (ctx: ToolContext, _plan: SendPlan): boolean => sendNeedsAppro
 function sendApproval(tool: CalendarSendTool) {
   return {
     async when(args: NotifyArgs, ctx: ToolContext): Promise<boolean> {
-      // Cheap exit for the default setup: no event read for a call that cannot be held. A rule that
-      // holds without SEND_REQUIRES_CONFIRM drops this line and decides in `holdsSend`.
-      if (!sendNeedsApproval(ctx.env)) return false;
+      // Cheap exit: no event read for a call that cannot be held.
+      if (config(ctx.env).sendApprovalMode === "off") return false;
       const plan = await heldPlan(ctx, tool, args);
-      if (plan.recipients.length === 0 || !holdsSend(ctx, plan)) return false;
+      if (plan.recipients.length === 0 || !(await holdsSend(ctx, plan, args))) return false;
       try {
         await ctx.limits.assertSendEnabled(plan.a);
         const max = config(ctx.env).maxRecipients;
@@ -1010,6 +1022,12 @@ function sendApproval(tool: CalendarSendTool) {
         ...(plan.event === undefined ? {} : { eventId: ctx.ids.encode(plan.a, plan.event) }),
         notify: plan.sendUpdates,
         to: plan.recipients,
+        ...(newOnes.get(args)
+          ? {
+              newRecipients: newOnes.get(args),
+              heldBecause: heldBecause(newOnes.get(args) ?? []),
+            }
+          : {}),
         ...(args.responseComment ? { withComment: true } : {}),
       };
     },

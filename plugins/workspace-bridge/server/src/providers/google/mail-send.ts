@@ -40,6 +40,7 @@ import {
   singleLine,
   truncate,
 } from "../../core/mime";
+import { isQueryableAddress } from "../../core/recipients";
 import type { SendAsAddress } from "../../core/send-as";
 import { provide } from "../../services/capability";
 import {
@@ -52,6 +53,7 @@ import {
   type SentMessage,
 } from "../../services/mail-send";
 import type { AccountRef } from "../../services/types";
+import { type BatchRequest, gmailBatch, MAX_BATCH_ITEMS } from "./batch";
 import { gjson } from "./http";
 import { downloadAttachment, listMessageAttachments } from "./mail-attachments";
 
@@ -432,6 +434,33 @@ async function sendDraft(a: AccountRef, draftId: string): Promise<SentMessage> {
   );
 }
 
-const service: SendService = { prepare, deliver, readDraft, sendDraft };
+/** Addresses the account has sent to, by one batch of `in:sent to:<address>` (`maxResults=1`). */
+async function sentTo(a: AccountRef, addresses: readonly string[]): Promise<string[]> {
+  // Only a plain address ever goes into a query; anything else is simply not found.
+  const plain = addresses.filter((x) => isQueryableAddress(x)).slice(0, MAX_BATCH_ITEMS);
+  const requests: BatchRequest[] = plain.map((address, i) => ({
+    id: `s${i}`,
+    path: `/gmail/v1/users/me/messages?${new URLSearchParams({
+      q: `in:sent to:${address}`,
+      maxResults: "1",
+      fields: "messages/id",
+    }).toString()}`,
+  }));
+  const parts = await gmailBatch(a, requests);
+  const found: string[] = [];
+  for (const part of parts) {
+    if (part.status < 200 || part.status > 299) continue;
+    try {
+      const body = JSON.parse(part.body) as { messages?: { id?: string }[] };
+      const address = plain[Number(part.id.slice(1))];
+      if (address && (body.messages?.length ?? 0) > 0) found.push(address);
+    } catch {
+      // An unreadable answer is "not found".
+    }
+  }
+  return found;
+}
+
+const service: SendService = { prepare, deliver, readDraft, sendDraft, sentTo };
 
 export const googleSend = provide(SEND, service);

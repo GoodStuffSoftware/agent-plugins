@@ -854,7 +854,14 @@ describe("respond_to_event", () => {
 // SEND_REQUIRES_CONFIRM, a hold.
 
 const registry = compileRegistry(FAMILIES);
-const withEnv = (overrides: Partial<Env>): Env => ({ ...env, ...overrides }) as Env;
+// These suites test the guardrails of a send, not the new-recipient rule (test/send-approval.test.ts):
+// approval is off unless a test asks for SEND_REQUIRES_CONFIRM, which with the mode unset means `all`.
+const withEnv = (overrides: Partial<Env>): Env =>
+  ({
+    ...env,
+    SEND_APPROVAL_MODE: "SEND_REQUIRES_CONFIRM" in overrides ? undefined : "off",
+    ...overrides,
+  }) as Env;
 
 /** One tool call with `e` as the Worker's settings. */
 async function callWith(e: Env, ownerId: string, name: string, args: Record<string, unknown>) {
