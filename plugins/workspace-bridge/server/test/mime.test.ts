@@ -306,11 +306,11 @@ describe("reading a Gmail payload", () => {
 
 describe("base64 hot paths", () => {
   const allBytes = Uint8Array.from({ length: 256 }, (_, i) => i);
-  // Larger than one 8192-byte chunk and not a multiple of 3, so the chunk seams and padding are hit.
+  // Larger than one 8192-byte chunk, so the chunk seams are hit (524,289 is a multiple of 3: no padding).
   const big = Uint8Array.from({ length: 524_289 }, (_, i) => (i * 31 + 7) & 0xff);
 
   it("bytesToB64 matches Buffer on every byte value and on a body spanning many chunks", () => {
-    for (const bytes of [new Uint8Array(0), allBytes, big]) {
+    for (const bytes of [new Uint8Array(0), new Uint8Array([1, 2]), allBytes, big]) {
       expect(bytesToB64(bytes)).toBe(Buffer.from(bytes).toString("base64"));
     }
   });
