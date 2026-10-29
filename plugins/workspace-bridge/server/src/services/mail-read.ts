@@ -12,9 +12,9 @@ export const MAX_BODY_CHARS = 32_768;
 
 /**
  * Limits on one `get_thread` answer (plan s.3.4: CPU on the free tier is about 5 ms per MB of Gmail
- * JSON). Messages are read in full newest first while their `sizeEstimate`s add up to at most
- * `MAX_RESPONSE_FETCH_BYTES` (the newest always is); the others of the window return their headers
- * and a note to call get_message. The bodies kept in one answer total at most
+ * JSON). Messages are read in full newest first while their inline text (plain and HTML part
+ * sizes, attachments not counted) adds up to at most `MAX_RESPONSE_FETCH_BYTES` (the newest always
+ * is); the others of the window return their headers, attachment list and a note to call get_message. The bodies kept in one answer total at most
  * `MAX_RESPONSE_BODY_CHARS`; a body cut by that limit ends with `RESPONSE_CAP_NOTE`.
  */
 export const MAX_RESPONSE_FETCH_BYTES = 640 * 1024;

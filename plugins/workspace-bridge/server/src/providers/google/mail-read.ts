@@ -60,8 +60,13 @@ const partFields = (depth: number): string =>
 const META_MESSAGE_FIELDS =
   "id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(headers(name,value))";
 const FULL_MESSAGE_FIELDS = `id,threadId,labelIds,snippet,internalDate,sizeEstimate,payload(${partFields(PART_DEPTH)})`;
-/** What `get_thread` asks of the whole thread when it reads bodies: ids, order, drafts and sizes. */
-const THREAD_INDEX_FIELDS = "id,messages(id,labelIds,sizeEstimate)";
+/**
+ * What `get_thread` asks of the whole thread when it reads bodies: ids, order, drafts and the part
+ * tree with sizes but no data, so the answer stays small whatever the messages weigh.
+ */
+const indexPartFields = (depth: number): string =>
+  `mimeType,filename,body(size,attachmentId)${depth > 0 ? `,parts(${indexPartFields(depth - 1)})` : ""}`;
+const THREAD_INDEX_FIELDS = `id,messages(id,labelIds,payload(${indexPartFields(PART_DEPTH)}))`;
 /** Below this many characters left in the response budget, another body is not started. */
 const MIN_BODY_CHARS = 256;
 const SUMMARY_FIELDS = "id,messages(labelIds,snippet,internalDate,payload(headers(name,value)))";
@@ -135,6 +140,16 @@ function collect(part: GPart | undefined, into: Found): void {
   }
   if (type === "text/plain") into.plain.push(part);
   else if (type === "text/html") into.html.push(part);
+}
+
+/** Bytes of inline text (plain and HTML) in a message: what reading it in full costs. */
+function inlineBytes(m: GMessage): number {
+  const found: Found = { plain: [], html: [], attachments: [] };
+  collect(m.payload, found);
+  let n = 0;
+  for (const p of found.plain) n += p.body?.size ?? 0;
+  for (const p of found.html) n += p.body?.size ?? 0;
+  return n;
 }
 
 /** The joined text of inline parts, decoded as far as `maxBytes` of each. */
@@ -234,10 +249,15 @@ function summarize(t: GThread): ThreadSummary | null {
   };
 }
 
+/** `text` with its trailing truncation marker (see `truncateBody`) swapped for the cap note. */
+function swapMarker(text: string): string {
+  const at = text.lastIndexOf("\n[truncated after ");
+  return at < 0 ? text : `${text.slice(0, at)}\n${RESPONSE_CAP_NOTE}`;
+}
+
 /** Swaps the "pass maxBodyChars" marker for one that says the response limit cut this body. */
 function capNote(m: MailMessage): void {
-  const swap = (t: string | undefined): string | undefined =>
-    t?.replace(/\n\[truncated after \d+ characters[^\]]*\]$/, `\n${RESPONSE_CAP_NOTE}`);
+  const swap = (t: string | undefined): string | undefined => (t === undefined ? t : swapMarker(t));
   m.text = swap(m.text);
   if (m.html !== undefined) m.html = swap(m.html);
 }
@@ -315,12 +335,12 @@ export const googleMailRead: MailReader = {
       };
     }
 
-    // Bodies: the thread comes back as an index (ids, order, sizes), then only the window is read.
+    // Bodies: the thread comes back as an index (ids, order, part sizes), then only the window is read.
     const t = await gjson<GThread>(
       a,
       url,
       {},
-      { fields: THREAD_INDEX_FIELDS, query: { format: "minimal" } },
+      { fields: THREAD_INDEX_FIELDS, query: { format: "full" } },
     );
     const { total, offset, window } = windowOf(t?.messages ?? []);
     const thread: ThreadDetail = {
@@ -331,12 +351,13 @@ export const googleMailRead: MailReader = {
     };
     if (window.length === 0) return thread;
 
-    // The newest messages are read in full while their sizes fit the budget (the newest always
-    // is); the rest of the window comes back at the metadata format.
+    // The newest messages are read in full while their inline text fits the budget (the newest
+    // always is); the rest of the window comes back at the metadata format. Attachments weigh
+    // nothing here: the full format only names them.
     const full = new Set<number>();
     let bytes = 0;
     for (let i = window.length - 1; i >= 0; i--) {
-      bytes += (window[i] as GMessage).sizeEstimate ?? 0;
+      bytes += inlineBytes(window[i] as GMessage);
       if (full.size > 0 && bytes > MAX_RESPONSE_FETCH_BYTES) break;
       full.add(i);
     }
@@ -367,14 +388,22 @@ export const googleMailRead: MailReader = {
       const f = fetched[i];
       if (!f) continue;
       if (!full.has(i) || left < MIN_BODY_CHARS) {
+        // The index names the attachments of every message of the window.
+        const found: Found = { plain: [], html: [], attachments: [] };
+        collect((window[i] as GMessage).payload, found);
         built[i] = {
           ...toMessage(f, { ...opts, format: "METADATA_ONLY" }),
           text: OMITTED_NOTE,
           truncated: true,
+          attachments: found.attachments,
         };
         continue;
       }
-      const maxBodyChars = Math.min(opts.maxBodyChars, left);
+      // The text and the HTML (includeHtml) share the character budget.
+      const maxBodyChars = Math.min(
+        opts.maxBodyChars,
+        Math.floor(left / (opts.includeHtml ? 2 : 1)),
+      );
       // Markup runs about 12 bytes to a character of text, so a thread decodes only what the cut needs
       // (get_message keeps the full budget).
       const htmlBytes = Math.min(HTML_DECODE_BYTES, Math.max(32 * 1024, maxBodyChars * 12));

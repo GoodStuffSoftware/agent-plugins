@@ -484,8 +484,16 @@ interface Fetched {
   format: string;
 }
 
+/** A part tree as the index mask returns it: types, names and sizes, no data and no headers. */
+const indexPart = (p: Json): Json => ({
+  mimeType: p.mimeType,
+  filename: p.filename,
+  body: p.body ? { size: p.body.size, attachmentId: p.body.attachmentId } : undefined,
+  parts: p.parts?.map(indexPart),
+});
+
 /**
- * A thread as get_thread reads it: `threads.get` answers the index (minimal) or the metadata, and
+ * A thread as get_thread reads it: `threads.get` answers the index (full, masked to sizes) or the metadata, and
  * a batch answers `messages.get` per message at the format asked. `fetched` lists those reads.
  */
 function threadRoutes(threadId: string, messages: Json[], missing: string[] = []) {
@@ -494,14 +502,14 @@ function threadRoutes(threadId: string, messages: Json[], missing: string[] = []
     {
       url: `${GMAIL}/threads/${threadId}`,
       reply: (req) => {
-        const format = new URL(req.url).searchParams.get("format");
-        if (format === "minimal") {
+        const fields = new URL(req.url).searchParams.get("fields") ?? "";
+        if (fields.startsWith("id,messages(id,labelIds,payload(")) {
           return googleJson(200, {
             id: threadId,
             messages: messages.map((m) => ({
               id: m.id,
               labelIds: m.labelIds,
-              sizeEstimate: m.sizeEstimate,
+              payload: indexPart(m.payload),
             })),
           });
         }
@@ -561,8 +569,12 @@ describe("get_thread", () => {
     expect(ms[0]).not.toHaveProperty("html");
     // One thread read for the index (no bodies), one batch for the window.
     const url = new URL(calls[0]?.url ?? "");
-    expect(url.searchParams.get("format")).toBe("minimal");
-    expect(url.searchParams.get("fields")).toBe("id,messages(id,labelIds,sizeEstimate)");
+    expect(url.searchParams.get("format")).toBe("full");
+    expect(url.searchParams.get("fields")).toMatch(
+      /^id,messages\(id,labelIds,payload\(mimeType,filename,body\(size,attachmentId\),parts\(/,
+    );
+    expect(url.searchParams.get("fields")).not.toContain("data");
+    expect(url.searchParams.get("fields")).not.toContain("headers");
     expect(calls).toHaveLength(2);
     expect(calls[1]?.method).toBe("POST");
     expect(calls[1]?.body).toContain("payload%28mimeType%2Cfilename%2Cheaders");
@@ -657,11 +669,12 @@ describe("get_thread", () => {
   });
 
   describe("windowed reads", () => {
+    // `size` is what the text part claims to weigh (the index reports it); the data stays small.
     const thread = (n: number, size = 100, text = (i: number) => `body ${i}`) =>
-      Array.from({ length: n }, (_, i) => ({
-        ...fullMessage(`m${i}`, 1000 + i, text(i)),
-        sizeEstimate: size,
-      }));
+      Array.from({ length: n }, (_, i) => {
+        const m = fullMessage(`m${i}`, 1000 + i, text(i));
+        return { ...m, payload: { ...m.payload, body: { ...m.payload.body, size } } };
+      });
     const ids = (r: { json: Json }) => (r.json.messages as Json[]).map((m) => m.id);
 
     it("reads only the first page of a long thread in full", async () => {
@@ -722,7 +735,7 @@ describe("get_thread", () => {
       const formats = new Map<string, number>();
       for (const f of fetched) formats.set(f.format, (formats.get(f.format) ?? 0) + 1);
       expect(Object.fromEntries(formats)).toEqual({ full: 10 });
-      // One thread read at the minimal format and one batch: two subrequests however long it is.
+      // One thread read for the index and one batch: two subrequests however long it is.
       expect(calls.map((c) => c.method)).toEqual(["GET", "POST"]);
     });
 
@@ -821,6 +834,120 @@ describe("get_thread", () => {
       expect(m.truncated).toBe(true);
       expect(m.text).toContain("start");
       expect(m.text).not.toContain("tail marker");
+    });
+
+    const withPdf = (id: string, i: number, pdfSize: number) => ({
+      ...fullMessage(id, 1000 + i, `body ${i}`),
+      sizeEstimate: pdfSize,
+      payload: {
+        mimeType: "multipart/mixed",
+        headers: hdr({ From: "Ann <ann@example.com>", Subject: `S ${id}` }),
+        parts: [
+          { mimeType: "text/plain", filename: "", body: { size: 12, data: b64(`body ${i}`) } },
+          {
+            mimeType: "application/pdf",
+            filename: "scan.pdf",
+            body: { size: pdfSize, attachmentId: `ATT-${id}` },
+          },
+        ],
+      },
+    });
+
+    it("does not charge attachments against the fetch budget", async () => {
+      const { token } = await setup();
+      const messages = Array.from({ length: 10 }, (_, i) => withPdf(`m${i}`, i, 2 * 1024 * 1024));
+      const { routes, fetched } = threadRoutes("t9", messages);
+      installGoogleRoutes(routes);
+      const r = await call(token, "get_thread", { threadId: "t9" });
+      expect(new Set(fetched.map((f) => f.format))).toEqual(new Set(["full"]));
+      for (const m of r.json.messages as Json[]) {
+        expect(m.truncated).toBe(false);
+        expect(m.text).toContain("body");
+        expect(m.attachments).toHaveLength(1);
+      }
+    });
+
+    it("lists the attachments of a message left out of the full read", async () => {
+      const { token } = await setup();
+      const big = "word ".repeat(70_000);
+      const messages = [0, 1, 2, 3].map((i) => {
+        const m = withPdf(`m${i}`, i, 5000);
+        const text = {
+          mimeType: "text/plain",
+          filename: "",
+          body: { size: big.length, data: b64(`m${i} ${big}`) },
+        };
+        return { ...m, payload: { ...m.payload, parts: [text, ...m.payload.parts.slice(1)] } };
+      });
+      const { routes, fetched } = threadRoutes("t9", messages);
+      installGoogleRoutes(routes);
+      const r = await call(token, "get_thread", { threadId: "t9" });
+      const byId = new Map(fetched.map((f) => [f.id, f.format]));
+      expect(byId.get("m0")).toBe("metadata");
+      const ms = r.json.messages as Json[];
+      const left = ms[0] as Json;
+      expect(left.truncated).toBe(true);
+      expect(left.text).toContain("call get_message");
+      expect(left.attachments).toHaveLength(1);
+      expect(left.attachments[0]).toMatchObject({ attachmentId: "ATT-m0", size: 5000 });
+    });
+
+    it("shares the character cap between text and html with includeHtml", async () => {
+      const { token } = await setup();
+      const plain = "word ".repeat(8000);
+      const html = `<p>${"word ".repeat(8000)}</p>`;
+      const messages = Array.from({ length: 8 }, (_, i) => ({
+        ...fullMessage(`m${i}`, 1000 + i, ""),
+        payload: {
+          mimeType: "multipart/alternative",
+          headers: hdr({ From: "Ann <ann@example.com>", Subject: `S ${i}` }),
+          parts: [
+            {
+              mimeType: "text/plain",
+              filename: "",
+              body: { size: plain.length, data: b64(plain) },
+            },
+            { mimeType: "text/html", filename: "", body: { size: html.length, data: b64(html) } },
+          ],
+        },
+      }));
+      installGoogleRoutes(threadRoutes("t9", messages).routes);
+      const r = await call(token, "get_thread", {
+        threadId: "t9",
+        messageLimit: 8,
+        includeHtml: true,
+        maxBodyChars: 32_768,
+      });
+      const ms = r.json.messages as Json[];
+      const total = ms.reduce(
+        (n, m) =>
+          n +
+          ((m.text as string | undefined)?.length ?? 0) +
+          ((m.html as string | undefined)?.length ?? 0),
+        0,
+      );
+      expect(total).toBeLessThan(110_000);
+    });
+
+    it("does not blow up on a body full of marker look-alikes when the cap cuts it", async () => {
+      const { token } = await setup();
+      const evil = "\n[truncated after 1 characters ".repeat(1500);
+      // Newest first, three bodies take about 98000 characters, so the oldest is cut by the cap.
+      const messages = [
+        fullMessage("m0", 1000, evil),
+        fullMessage("m1", 1001, "x ".repeat(35_000)),
+        fullMessage("m2", 1002, "x ".repeat(35_000)),
+        fullMessage("m3", 1003, "x ".repeat(35_000)),
+      ];
+      installGoogleRoutes(threadRoutes("t9", messages).routes);
+      const t0 = performance.now();
+      const r = await call(token, "get_thread", { threadId: "t9", maxBodyChars: 32_768 });
+      expect(performance.now() - t0).toBeLessThan(2000);
+      expect(r.isError).toBe(false);
+      const cut = (r.json.messages as Json[]).find((m) =>
+        (m.text as string).includes("response size limit"),
+      );
+      expect(cut).toBeDefined();
     });
 
     it("skips a message deleted since the index was read", async () => {

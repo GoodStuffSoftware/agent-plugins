@@ -249,7 +249,7 @@ const getThread = defineTool({
   name: "get_thread",
   title: "Read a mail thread",
   description:
-    "Reads a Gmail thread: its messages with sender, recipients, subject, date, labels, text body and attachment details. Returns the newest messageLimit messages (default 10, at most 25) unless messageOffset (counted from the oldest message, starting at 0) says otherwise; totalMessages tells whether to page. Bodies are cut to maxBodyChars (default 8192, at most 32768) with a marker; the text/plain part is used when there is one, else the HTML is converted to text. One answer holds at most about 100000 characters of bodies and reads at most about 640 KB of messages in full, newest first: a message left out or cut by that limit says so in its text and has truncated true; read it with get_message. Drafts are left out.",
+    "Reads a Gmail thread: its messages with sender, recipients, subject, date, labels, text body and attachment details. Returns the newest messageLimit messages (default 10, at most 25) unless messageOffset (counted from the oldest message, starting at 0) says otherwise; totalMessages tells whether to page. Bodies are cut to maxBodyChars (default 8192, at most 32768) with a marker; the text/plain part is used when there is one, else the HTML is converted to text. One answer holds at most about 100000 characters of bodies and reads at most about 640 KB of message text in full, newest first, and decodes less HTML per message than get_message: a message left out or cut by those limits says so in its text and has truncated true; read it with get_message. Drafts are left out.",
   component: "mail",
   scopes: ["mail.read"],
   endpoints: ["full", "ro"],
