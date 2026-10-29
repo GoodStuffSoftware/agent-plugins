@@ -13,6 +13,7 @@ import {
 import { createAuditLog } from "../core/audit";
 import { cursors } from "../core/cursor";
 import { internalErrorLine, ToolError } from "../core/errors";
+import { sendHeldNotice } from "../core/held-notice";
 import { accountKey, ids } from "../core/ids";
 import { createPendingActions } from "../core/pending";
 import { createRateLimiter } from "../core/ratelimit";
@@ -182,6 +183,23 @@ export async function gateApproval(
     } catch (e) {
       console.error(internalErrorLine(`${def.name} onHeld`, e, args));
     }
+  }
+  // The fast notice to the owner: after the row exists and the hold's own hook ran, and never
+  // able to fail the hold.
+  try {
+    await sendHeldNotice(
+      ctx,
+      {
+        tool: def.name,
+        account,
+        preview: held.preview,
+        approvalUrl: held.approvalUrl,
+        expiresAt: held.expiresAt,
+      },
+      held.pendingActionId,
+    );
+  } catch (e) {
+    console.error(internalErrorLine(`${def.name} held notice`, e, {}));
   }
   return held;
 }

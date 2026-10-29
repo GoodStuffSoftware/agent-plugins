@@ -53,6 +53,7 @@ Plain reads and draft create and update are also on `/mcp/ro`, a separate read-o
 - **OAuth, no static bearer.** MCP clients authorize with OAuth 2.1 and PKCE. Tokens are bound to one endpoint and carry only the capabilities you ticked. There is no shared secret to leak.
 - **Encrypted tokens.** Google refresh tokens are encrypted at rest (AES-256-GCM, key held as a Worker secret) and never reach a client.
 - **Approvals.** Risky actions are stored, not run. The owner approves them on the server's own page, which an agent cannot do. `get_pending_action` reports the outcome.
+- **New recipients wait for you.** A send to anyone who is not yours, not on that mailbox's allow list, never written to from it and not in its contacts is held. You get an email with a link; the approval page offers Approve once, Approve and always allow the address (or its domain, never a public mail provider), and Reject. The allow list is edited on `/accounts`. The email never carries the message, and approving needs your own sign-in.
 - **Audit log.** Sends, filter changes and shares are logged without message bodies. A kill switch disables all sending at once.
 - **Untrusted content.** Mail, event and file text is wrapped in per-response tagged blocks, and the skill tells agents to treat it as data.
 - **No permanent delete of mail or files.** Messages, threads and Drive files go to the trash only, and the server never asks Google for full-mailbox scope. Only drafts (`delete_draft`), labels, filters and calendar events are removed outright.

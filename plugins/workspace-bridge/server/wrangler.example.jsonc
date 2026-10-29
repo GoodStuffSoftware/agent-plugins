@@ -32,6 +32,11 @@
   "vars": {
     "PUBLIC_URL": "https://mcp.example.com",
     "OWNER_CONTACT": "",
+    // Where the "an action is waiting for your approval" email goes: one address. Empty falls back
+    // to OWNER_CONTACT when that is a plain address; with neither, no notice is sent. The notice is
+    // sent from the holding mailbox, holds a link and no message content, and approving still needs
+    // your sign-in on the bridge.
+    "NOTIFY_EMAIL": "",
     "SEND_ENABLED": "false",
     "SETUP_MODE": "true",
     // Which sends wait for your approval: "new_recipients" (default) holds a send when at least one

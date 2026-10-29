@@ -37,7 +37,7 @@ describe("pages", () => {
       expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
       expect(res.headers.get("X-Frame-Options")).toBe("DENY");
       expect(res.headers.get("Strict-Transport-Security")).toContain("max-age=");
-      expect(await res.text()).toContain("Contact: privacy@example.com");
+      expect(await res.text()).toContain("Contact: https://example.com/contact");
     }
   });
 

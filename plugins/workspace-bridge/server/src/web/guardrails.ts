@@ -26,6 +26,8 @@ import {
   parseStoredCall,
   pendingInfo,
 } from "../core/pending";
+import { isQueryableAddress } from "../core/recipients";
+import { type AllowKind, addSendAllow, isFreemailDomain, normalizeAllow } from "../core/send-allow";
 import { config, type Env } from "../env";
 import { REGISTRY, type Registry } from "../registry/compile";
 import { type RequestScope, toolContext } from "../registry/context";
@@ -169,18 +171,112 @@ async function runApproved(
   }
 }
 
+/** The new recipients a held send's stored preview names (normalized addresses), or none. */
+function newRecipientsOf(preview: string): string[] {
+  try {
+    const found = (JSON.parse(preview) as { newRecipients?: unknown } | null)?.newRecipients;
+    return Array.isArray(found)
+      ? found.filter((x): x is string => typeof x === "string" && x !== "")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+const domainOf = (address: string): string => address.slice(address.lastIndexOf("@") + 1);
+
+/**
+ * The decision form of a send held because of new recipients: approve once, approve and allow the
+ * checked addresses (or the one address), approve and allow a whole domain (never a public mail
+ * provider), reject. One POST, one CSRF token.
+ */
+function newRecipientForm(
+  id: string,
+  csrf: string,
+  fresh: readonly string[],
+  mailbox: string,
+): SafeHtml {
+  const plain = fresh.filter(isQueryableAddress);
+  const domains = [...new Set(plain.map(domainOf))].filter((d) => !isFreemailDomain(d));
+  const hidden = html`<input type="hidden" name="csrf" value="${csrf}">`;
+  const only = plain.length === 1 ? plain[0] : undefined;
+  return html`<h2>New recipients</h2>
+<p>${fresh.length === 1 ? "This recipient is" : "These recipients are"} new to ${mailbox}: never written to from it, not in its contacts and not on its allow list. The send waits until you decide.</p>
+<form method="post" action="/approvals/${id}">
+${hidden}
+<ul>${fresh.map((a) =>
+    isQueryableAddress(a) && only === undefined
+      ? html`<li><label><input type="checkbox" name="allow" value="${a}"> ${a}</label></li>`
+      : html`<li>${a}</li>`,
+  )}</ul>
+${only === undefined ? "" : html`<input type="hidden" name="allow" value="${only}">`}
+<p><button name="decision" value="approve">Approve once</button></p>
+${
+  only === undefined
+    ? plain.length > 1
+      ? html`<p><button name="decision" value="approve_allow">Approve and always allow the checked addresses</button></p>`
+      : ""
+    : html`<p><button name="decision" value="approve_allow">Approve and always allow ${only}</button></p>`
+}
+${domains.map(
+  (d) =>
+    html`<p><button name="decision" value="approve_domain:${d}">Approve and always allow @${d}</button></p>`,
+)}
+<p><button name="decision" value="reject">Reject</button></p>
+</form>
+<p>"Always allow" adds to the allow list of ${mailbox} only; you can remove entries on <a href="/accounts">Accounts</a>. Approving once adds nothing, but the recipients count as known after the send goes out.</p>`;
+}
+
+/** What an approval writes to the allow list of the held send's account; refused as a whole. */
+type AllowRequest = { entries: { kind: AllowKind; value: string }[] } | { refusal: string };
+
+/**
+ * The allow-list entries a decision asks for, checked before the action is decided: only the held
+ * send's own new recipients (or their domains) can be allowed, and a public mail provider's
+ * domain is refused here as it is in the store.
+ */
+function allowRequest(decision: string, form: FormData, fresh: readonly string[]): AllowRequest {
+  const known = new Set(fresh);
+  try {
+    if (decision === "approve_allow") {
+      const picked = [...new Set(form.getAll("allow").map((v) => String(v).trim().toLowerCase()))];
+      if (picked.length === 0) return { refusal: "Check at least one address to allow." };
+      if (picked.some((a) => !known.has(a))) {
+        return { refusal: "Only the new recipients of this send can be allowed here." };
+      }
+      return {
+        entries: picked.map((a) => ({
+          kind: "address" as const,
+          value: normalizeAllow("address", a),
+        })),
+      };
+    }
+    const domain = decision.slice("approve_domain:".length).trim().toLowerCase();
+    if (![...known].some((a) => isQueryableAddress(a) && domainOf(a) === domain)) {
+      return { refusal: "That domain is not one of this send's new recipients." };
+    }
+    return { entries: [{ kind: "domain", value: normalizeAllow("domain", domain) }] };
+  } catch (e) {
+    if (e instanceof ToolError) return { refusal: e.message };
+    throw e;
+  }
+}
+
 async function approvalBody(env: Env, row: PendingActionRow, csrf: string): Promise<SafeHtml> {
   const info = pendingInfo(row, nowSeconds());
   const account = row.account_id ? await getAccount(env.DB, row.owner_id, row.account_id) : null;
   const where = account ? html` on <strong>${account.label}</strong> (${account.address})` : "";
+  const fresh = newRecipientsOf(row.preview);
   const decide =
-    info.status === "pending"
-      ? html`<form method="post" action="/approvals/${row.id}">
+    info.status !== "pending"
+      ? ""
+      : fresh.length > 0 && row.account_id !== null
+        ? newRecipientForm(row.id, csrf, fresh, account?.address ?? "this mailbox")
+        : html`<form method="post" action="/approvals/${row.id}">
 <input type="hidden" name="csrf" value="${csrf}">
 <button name="decision" value="approve">Approve</button>
 <button name="decision" value="reject">Reject</button>
-</form>`
-      : "";
+</form>`;
   const result =
     info.result === null
       ? ""
@@ -241,12 +337,29 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     const auth = await authorize(c.req.raw, env);
     if (auth instanceof Response) return auth;
     const { session, form } = auth;
-    const decision = form.get("decision");
-    if (decision !== "approve" && decision !== "reject") {
+    const choice = form.get("decision");
+    const isAllow =
+      typeof choice === "string" &&
+      (choice === "approve_allow" || choice.startsWith("approve_domain:"));
+    if (choice !== "approve" && choice !== "reject" && !isAllow) {
       return message(400, "Request refused", "Choose Approve or Reject.");
     }
+    // An allow-list approval is checked in full before anything is decided, so a refusal (a public
+    // mail provider's domain, an address that is not one of the new recipients) leaves the action
+    // waiting, and nothing is written for an action that is expired or already decided.
+    let allow: { kind: AllowKind; value: string }[] = [];
+    if (isAllow) {
+      const held = PENDING_ID.test(id) ? await loadPending(env.DB, session.ownerId, id) : null;
+      if (!held) return message(404, "Not found", "No pending action has that id.");
+      if (held.account_id === null || newRecipientsOf(held.preview).length === 0) {
+        return message(400, "Request refused", "This action has no new recipients to allow.");
+      }
+      const wanted = allowRequest(choice, form, newRecipientsOf(held.preview));
+      if ("refusal" in wanted) return message(400, "Not allowed", wanted.refusal);
+      allow = wanted.entries;
+    }
     const now = nowSeconds();
-    const status = decision === "approve" ? "approved" : "rejected";
+    const status = choice === "reject" ? "rejected" : "approved";
     const row = PENDING_ID.test(id)
       ? await decidePending(env.DB, session.ownerId, id, status, now)
       : null;
@@ -277,6 +390,35 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     }
     if (status === "rejected") {
       return message(200, "Rejected", "The action was rejected and will not run.");
+    }
+    // The allow list of the held send's own account, before the approved run, which repeats every
+    // check on its own.
+    if (allow.length > 0 && row.account_id !== null) {
+      try {
+        for (const entry of allow) {
+          await addSendAllow(env.DB, session.ownerId, row.account_id, entry.kind, entry.value);
+          await writeAudit(env.DB, {
+            at: now,
+            ownerId: session.ownerId,
+            accountId: row.account_id,
+            tool: "send_allow",
+            clientId: row.client_id,
+            grantId: row.grant_id,
+            result: "added",
+            detail: `${entry.kind} ${entry.value}; from approving pending action ${row.id}`,
+          });
+        }
+      } catch (e) {
+        console.error(internalErrorLine("approval allow list", e, {}));
+        await finishPending(env.DB, row.id, "failed", {
+          error: { code: "internal", message: INTERNAL_MESSAGE },
+        });
+        return message(
+          200,
+          "Approved, but it failed",
+          "The allow list could not be updated, so the action did not run.",
+        );
+      }
     }
     let outcome: Outcome;
     try {

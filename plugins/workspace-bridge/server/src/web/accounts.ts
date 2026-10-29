@@ -29,6 +29,8 @@ import {
   listOwnerTokens,
   nowSeconds,
 } from "../core/db";
+import { ToolError } from "../core/errors";
+import { type AllowKind, addSendAllow, listSendAllow, removeSendAllow } from "../core/send-allow";
 import { config, type Env } from "../env";
 import {
   ACCOUNT_COMPONENTS,
@@ -140,6 +142,55 @@ function accountsTable(accounts: AccountRow[], defaultId: string | null, csrf: s
 <p>A component switched off stops working at once. Google keeps the old access until you press "Re-link minimal", which revokes it and asks again for only the components that are on.</p>`;
 }
 
+const iso = (seconds: number): string => new Date(seconds * 1000).toISOString();
+
+const isAllowKind = (v: unknown): v is AllowKind => v === "address" || v === "domain";
+
+/** The allow list of each linked mailbox: what it may send to without approval, add and remove. */
+async function allowLists(
+  env: Env,
+  ownerId: string,
+  accounts: AccountRow[],
+  csrf: string,
+): Promise<SafeHtml> {
+  if (accounts.length === 0) return html``;
+  const sections: SafeHtml[] = [];
+  for (const a of accounts) {
+    const entries = await listSendAllow(env.DB, ownerId, a.id);
+    sections.push(html`<h3>${a.label} (${a.address})</h3>
+${
+  entries.length === 0
+    ? html`<p>Nothing is allowed yet.</p>`
+    : html`<table>
+<thead><tr><th>Type</th><th>Allowed</th><th>Added (UTC)</th><th></th></tr></thead>
+<tbody>${entries.map(
+        (e) =>
+          html`<tr><td>${e.kind}</td><td>${e.kind === "domain" ? `@${e.value}` : e.value}</td><td>${iso(e.createdAt)}</td><td>${postForm(
+            "/accounts/allow/remove",
+            csrf,
+            [
+              ["account", a.id],
+              ["kind", e.kind],
+              ["value", e.value],
+            ],
+            "Remove",
+          )}</td></tr>`,
+      )}</tbody>
+</table>`
+}
+<form method="post" action="/accounts/allow">
+<input type="hidden" name="csrf" value="${csrf}">
+<input type="hidden" name="account" value="${a.id}">
+<p><label>Add <select name="kind"><option value="address">an address</option><option value="domain">a whole domain</option></select></label>
+<input name="value" required maxlength="254" placeholder="name@example.com or example.com" aria-label="Address or domain to allow for ${a.address}">
+<button type="submit">Add</button></p>
+</form>`);
+  }
+  return html`<h2>Allowed recipients</h2>
+<p>A send to anyone who is not yours, not on a mailbox's list, never sent to and not in its contacts waits for your approval. Addresses and domains listed here go out without approval. A domain covers only that exact domain, not its subdomains, and public mail providers such as gmail.com cannot be allowed as a whole domain.</p>
+${sections}`;
+}
+
 function defaultForm(accounts: AccountRow[], defaultId: string | null, csrf: string): SafeHtml {
   if (accounts.length === 0) return html``;
   return html`<h2>Default mailbox</h2>
@@ -224,6 +275,7 @@ ${
     : ""
 }
 ${accountsTable(accounts, defaultId, csrf)}
+${await allowLists(env, session.ownerId, accounts, csrf)}
 ${defaultForm(accounts, defaultId, csrf)}
 ${linkForm(csrf)}
 ${accounts.length > 0 ? await encryptionForm(env, session.ownerId, csrf) : ""}`;
@@ -271,6 +323,62 @@ async function authorizeAccountPost(
   if (!account) return result(404, "Not found", "That mailbox is not linked.");
   return { ...posted, account };
 }
+
+/** Adds an address or a domain to a mailbox's allow list (the same checks as the approval page). */
+accountsRoutes.post("/allow", async (c) => {
+  const env = c.env;
+  const posted = await authorizeAccountPost(c.req.raw, env);
+  if (posted instanceof Response) return posted;
+  const { session, form, account } = posted;
+  const kind = form.get("kind");
+  const value = form.get("value");
+  if (!isAllowKind(kind) || typeof value !== "string" || value.length > 254) {
+    return result(400, "Request refused", "Choose an address or a domain and give its value.");
+  }
+  try {
+    const added = await addSendAllow(env.DB, session.ownerId, account.id, kind, value);
+    if (added) {
+      await writeAudit(env.DB, {
+        at: nowSeconds(),
+        ownerId: session.ownerId,
+        accountId: account.id,
+        tool: "send_allow",
+        result: "added",
+        detail: `${kind} ${value.trim().replace(/^@/, "").toLowerCase()}`,
+      });
+    }
+  } catch (e) {
+    if (e instanceof ToolError && e.code === "invalid_argument") {
+      return result(400, "Not added", e.message);
+    }
+    throw e;
+  }
+  return backToAccounts(env);
+});
+
+/** Removes an address or a domain from a mailbox's allow list. */
+accountsRoutes.post("/allow/remove", async (c) => {
+  const env = c.env;
+  const posted = await authorizeAccountPost(c.req.raw, env);
+  if (posted instanceof Response) return posted;
+  const { session, form, account } = posted;
+  const kind = form.get("kind");
+  const value = form.get("value");
+  if (!isAllowKind(kind) || typeof value !== "string" || value.length > 254) {
+    return result(400, "Request refused", "Name the entry to remove.");
+  }
+  if (await removeSendAllow(env.DB, session.ownerId, account.id, kind, value)) {
+    await writeAudit(env.DB, {
+      at: nowSeconds(),
+      ownerId: session.ownerId,
+      accountId: account.id,
+      tool: "send_allow",
+      result: "removed",
+      detail: `${kind} ${value.trim().replace(/^@/, "").toLowerCase()}`,
+    });
+  }
+  return backToAccounts(env);
+});
 
 accountsRoutes.post("/link", async (c) => {
   const env = c.env;

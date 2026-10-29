@@ -13,6 +13,7 @@ export interface Env {
   // Vars (wrangler.example.jsonc).
   PUBLIC_URL: string;
   OWNER_CONTACT?: string;
+  NOTIFY_EMAIL?: string;
   SEND_ENABLED?: string;
   SETUP_MODE?: string;
   SEND_REQUIRES_CONFIRM?: string;
@@ -51,6 +52,11 @@ export interface Config {
   issuer: string;
   /** Contact line for `/` and `/privacy`; empty hides it. */
   ownerContact: string;
+  /**
+   * Where the fast notice of a held action goes: `NOTIFY_EMAIL`, else `OWNER_CONTACT` when that is
+   * a single plain address. Empty means no notice is sent.
+   */
+  notifyEmail: string;
   setupMode: boolean;
   sendEnabled: boolean;
   sendRequiresConfirm: boolean;
@@ -102,6 +108,7 @@ function parse(env: Env): Config {
   return Object.freeze({
     issuer: issuer(env.PUBLIC_URL),
     ownerContact: (env.OWNER_CONTACT ?? "").trim(),
+    notifyEmail: notifyAddress(env),
     setupMode: flag("SETUP_MODE", env.SETUP_MODE, false),
     sendEnabled: flag("SEND_ENABLED", env.SEND_ENABLED, false),
     sendRequiresConfirm: requiresConfirm,
@@ -137,6 +144,19 @@ function issuer(value: string | undefined): string {
     throw new Error("PUBLIC_URL must be an https origin with no path or trailing slash");
   }
   return url.origin;
+}
+
+const PLAIN_ADDRESS =
+  /^[a-z0-9][a-z0-9._+-]{0,63}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+
+function notifyAddress(env: Env): string {
+  const given = (env.NOTIFY_EMAIL ?? "").trim().toLowerCase();
+  if (given !== "") {
+    if (!PLAIN_ADDRESS.test(given)) throw new Error("NOTIFY_EMAIL must be one plain email address");
+    return given;
+  }
+  const contact = (env.OWNER_CONTACT ?? "").trim().toLowerCase();
+  return PLAIN_ADDRESS.test(contact) ? contact : "";
 }
 
 function flag(name: string, value: string | undefined, fallback: boolean): boolean {
