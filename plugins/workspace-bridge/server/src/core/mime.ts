@@ -3,7 +3,8 @@
 // 9aa1b1a3baed8508adfc66c036ae7d019deff5c6), MIT License, Copyright (c) 2026 mkpoli. The full
 // notice is in plugins/workspace-bridge/THIRD-PARTY.md. Changes: our `ToolError` replaces `Error`,
 // recipients are lists, a message may have no recipient (drafts), bodies are normalised to CRLF,
-// and file attachments and inline images are left out (M16 adds them from the same upstream file).
+// file attachments take the client's base64 as it is (re-wrapped to 76 columns, never decoded) and
+// inline images are not built.
 //
 // Rules this module enforces, whatever the caller passes:
 // - CR, LF or NUL in any header value is refused (`invalid_argument`), so a header can never be
@@ -203,9 +204,13 @@ function foldSegment(line: string, limit: number): string {
 
 // ---- Body parts and the message -----------------------------------------------------------------
 
-// RFC 2045 requires encoded body lines within 76 characters.
+// RFC 2045 requires encoded body lines within 76 characters. A slice loop, not a regex: this runs
+// over the whole of an attachment on the Worker's 10 ms CPU budget.
 function wrap76(s: string): string {
-  return s.replace(/(.{76})/g, "$1\r\n").replace(/\r\n$/, "");
+  if (s.length <= 76) return s;
+  const lines: string[] = [];
+  for (let i = 0; i < s.length; i += 76) lines.push(s.slice(i, i + 76));
+  return lines.join("\r\n");
 }
 
 // Text goes out with CRLF line ends, base64 encoded.
@@ -217,6 +222,105 @@ function textPart(mimeType: string, content: string): string[] {
     "Content-Transfer-Encoding: base64",
     "",
     wrap76(bytesToB64(new TextEncoder().encode(crlf(content)))),
+  ];
+}
+
+// ---- File attachments ----------------------------------------------------------------------------
+
+/**
+ * A file to enclose. `content` is standard base64 without whitespace, as `cleanBase64` returns
+ * it: the message carries it as it is, so a file is never decoded and encoded again.
+ */
+export interface MimeAttachment {
+  /** Left out of the part headers when absent. */
+  filename?: string | undefined;
+  /** A bare `type/subtype`. */
+  mimeType: string;
+  content: string;
+}
+
+/**
+ * Most files one message may hold. Each file a forward carries is one Google subrequest, against
+ * the free tier's 50 per request.
+ */
+export const MAX_ATTACHMENTS = 10;
+
+/** The bytes a clean base64 string stands for, counted from its length and padding. */
+export function base64Bytes(content: string): number {
+  const pad = content.endsWith("==") ? 2 : content.endsWith("=") ? 1 : 0;
+  return (content.length / 4) * 3 - pad;
+}
+
+/** Whitespace removed and the rest checked to be standard base64: no decoding takes place. */
+export function cleanBase64(name: string, content: string): string {
+  const cleaned = content.replace(/\s+/g, "");
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(cleaned) || cleaned.length % 4 !== 0) {
+    throw bad(`${name}: content must be standard base64.`);
+  }
+  return cleaned;
+}
+
+/** True for a bare `type/subtype`. */
+export const isMediaType = (value: string): boolean => /^[\w.+-]+\/[\w.+-]+$/.test(value);
+
+// A media type reaches the header as a bare `type/subtype`; anything past a semicolon would add
+// parameters of the caller's choosing, such as a second name= that parsers resolve differently
+// from the real filename.
+function assertMediaType(value: string): string {
+  if (!isMediaType(value)) {
+    throw bad("An attachment mimeType must be a plain type/subtype such as application/pdf.");
+  }
+  return value;
+}
+
+// A non-ASCII filename belongs in an RFC 2231 extended parameter. The legacy `name=` parameter
+// keeps an RFC 2047 word beside it, which is what mail clients predating RFC 2231 read.
+function filenameParams(filename: string): { name: string; disposition: string } {
+  const quoted = filename.replace(/["\\]/g, "_");
+  if (/^[\x20-\x7e]*$/.test(filename)) {
+    return { name: `name="${quoted}"`, disposition: `filename="${quoted}"` };
+  }
+  const encoded = [...new TextEncoder().encode(filename)]
+    .map((b) =>
+      // attribute-char per RFC 2231: token characters minus * ' %
+      (b >= 0x30 && b <= 0x39) ||
+      (b >= 0x41 && b <= 0x5a) ||
+      (b >= 0x61 && b <= 0x7a) ||
+      [0x21, 0x23, 0x24, 0x26, 0x2b, 0x2d, 0x2e, 0x5e, 0x5f, 0x60, 0x7c, 0x7e].includes(b)
+        ? String.fromCharCode(b)
+        : `%${b.toString(16).toUpperCase().padStart(2, "0")}`,
+    )
+    .join("");
+  return {
+    name: `name="${encodeHeader(filename).replace(/"/g, "'")}"`,
+    disposition: `filename*=UTF-8''${encoded}`,
+  };
+}
+
+// A part's own headers never reach foldHeader; an over-long filename would sit on one line past
+// the limit. Refusing is right here because the name has to travel literally.
+function assertPartHeaderFits(value: string): string {
+  if (value.length > MAX_HEADER_RUN) throw bad("An attachment filename is too long.");
+  return value;
+}
+
+function filePart(f: MimeAttachment): string[] {
+  const type = assertMediaType(f.mimeType);
+  const encoding = "Content-Transfer-Encoding: base64";
+  const body = wrap76(f.content);
+  if (f.filename === undefined || f.filename === "") {
+    return [`Content-Type: ${type}`, encoding, "Content-Disposition: attachment", "", body];
+  }
+  assertHeaderSafe("attachment filename", f.filename);
+  const params = filenameParams(f.filename);
+  // The two parameters land on separate lines, so each is measured on its own: a name outside
+  // ASCII is percent-encoded into three characters a byte.
+  return [
+    assertPartHeaderFits(`Content-Type: ${type}; ${params.name}`),
+    encoding,
+    assertPartHeaderFits(`Content-Disposition: attachment; ${params.disposition}`),
+    "",
+    body,
   ];
 }
 
@@ -245,6 +349,8 @@ export interface MimeMessage {
   inReplyTo?: string;
   /** Space-separated msg-ids. */
   references?: string;
+  /** Files to enclose: the message becomes a multipart/mixed around the body. */
+  attachments?: readonly MimeAttachment[];
 }
 
 /** Raw message text (CRLF lines) for Gmail's `message/rfc822` upload. */
@@ -292,9 +398,13 @@ export function buildRfc822(m: MimeMessage, opts: { requireRecipient?: boolean }
     "MIME-Version: 1.0",
   ].map(foldHeader);
 
-  const core = m.htmlBody
+  let core = m.htmlBody
     ? multipart("alternative", [textPart("text/plain", body), textPart("text/html", m.htmlBody)])
     : textPart("text/plain", body);
+  // Files wrap the readable body in a mixed container.
+  if (m.attachments && m.attachments.length > 0) {
+    core = multipart("mixed", [core, ...m.attachments.map(filePart)]);
+  }
   return [...headers, ...core].join("\r\n");
 }
 

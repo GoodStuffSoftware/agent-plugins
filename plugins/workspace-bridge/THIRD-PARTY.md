@@ -10,8 +10,9 @@
   quoting helpers, and the Gmail payload body readers).
 
 Changes from upstream: errors are this server's `ToolError`, recipients are lists, a message may
-have no recipient (drafts), body text is normalised to CRLF, and attachment and inline image
-builders are left out for now.
+have no recipient (drafts), body text is normalised to CRLF, and the upstream attachment and
+inline image builders are not used: this server's attachment support (M16: the multipart/mixed
+wrapping, base64 line wrapping, filename parameter encoding) is its own code.
 
 ```
 MIT License

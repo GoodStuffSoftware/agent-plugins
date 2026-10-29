@@ -22,6 +22,7 @@ import {
   headerOf,
   htmlToText,
   listAttachments,
+  type MimeAttachment,
   normalizeMessageId,
   parseAddresses,
   quoteHtml,
@@ -44,6 +45,7 @@ import {
 } from "../../services/mail-drafts";
 import type { AccountRef } from "../../services/types";
 import { gfetch, gjson, googleError } from "./http";
+import { downloadAttachment, tooLarge } from "./mail-attachments";
 
 const BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me";
@@ -334,8 +336,43 @@ async function create(a: AccountRef, input: CreateDraftInput): Promise<Draft> {
     ...text,
     ...(inReplyTo ? { inReplyTo } : {}),
     ...(references ? { references } : {}),
+    ...(input.attachments?.length ? { attachments: input.attachments } : {}),
   });
   return summary(a, await upload(a, "POST", null, raw, threadId));
+}
+
+/**
+ * The files an update keeps: Gmail rewrites the whole draft, so the files it has are downloaded
+ * and put back (within the cap, and refused before any download when their sizes already exceed
+ * it). The ids come from the read made a moment before, so none has gone stale.
+ */
+async function keptAttachments(
+  a: AccountRef,
+  messageId: string,
+  p: GmailPart | undefined,
+  cap: number,
+): Promise<MimeAttachment[]> {
+  const files = listAttachments(p);
+  if (files.length === 0) return [];
+  if (files.reduce((n, f) => n + f.size, 0) > cap) {
+    throw new ToolError(
+      "too_large",
+      `This draft's attachments are larger than the ${cap} byte send limit, so update_draft cannot keep them. Replace them with \`attachments\` or create a new draft.`,
+      { maxBytes: cap },
+    );
+  }
+  const out: MimeAttachment[] = [];
+  let used = 0;
+  for (const f of files) {
+    const got = await downloadAttachment(a, messageId, f.attachmentId, cap - used).catch(
+      (e: unknown) => {
+        throw e instanceof ToolError && e.code === "too_large" ? tooLarge(cap) : e;
+      },
+    );
+    used += got.bytes;
+    out.push({ filename: f.filename, mimeType: f.mimeType, content: got.content });
+  }
+  return out;
 }
 
 async function update(a: AccountRef, draftId: string, input: UpdateDraftInput): Promise<Draft> {
@@ -343,20 +380,17 @@ async function update(a: AccountRef, draftId: string, input: UpdateDraftInput): 
   const m = current.message;
   if (!m?.id) throw malformed();
   const p = m.payload;
-  // Gmail rewrites the whole draft, and files cannot be given back until M16: refuse rather than
-  // drop them without a word.
-  if (listAttachments(p).length > 0) {
-    throw new ToolError(
-      "invalid_argument",
-      "This draft has attachments, which update_draft cannot keep yet. Create a new draft instead.",
-    );
-  }
+  // Gmail rewrites the whole draft, so its files are given back: the new ones when the caller
+  // gave some (they replace the old), else the ones the draft has.
+  const attachments = input.attachments?.length
+    ? input.attachments
+    : await keptAttachments(a, m.id, p, input.maxAttachmentBytes);
   const h = (name: string) => headerOf(p, name);
   const inReplyTo = normalizeMessageId(h("In-Reply-To") ?? "") ?? undefined;
   const references = sanitizeReferences(h("References"));
 
   // Fields left out keep what the draft has. Text without HTML drops the HTML and the other way
-  // round, as the official tool does; attachments are not carried over.
+  // round, as the official tool does.
   let body: string;
   let htmlBody: string | undefined;
   if (input.body === undefined && input.htmlBody === undefined) {
@@ -380,6 +414,7 @@ async function update(a: AccountRef, draftId: string, input: UpdateDraftInput): 
     ...(htmlBody ? { htmlBody } : {}),
     ...(inReplyTo ? { inReplyTo } : {}),
     ...(references ? { references } : {}),
+    ...(attachments.length ? { attachments } : {}),
   });
   const threadId = inReplyTo ? m.threadId : undefined;
   return summary(a, await upload(a, "PUT", draftId, raw, threadId));
