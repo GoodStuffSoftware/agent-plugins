@@ -22,11 +22,11 @@
 //    request is slower; `coldFirstRequestMs` records the very first request of the process.
 //  - Counters (subrequests, KV and D1 operations) are exact for the code paths run.
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
-import { fileURLToPath, pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { build } from "esbuild";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -304,7 +304,8 @@ globalThis.fetch = (input, init = {}) => {
       console.error(`bench: unrouted ${method} ${input}`);
       throw new Error(`bench: unrouted ${method} ${input}`);
     }
-    const n = (counters.google[route.url] = (counters.google[route.url] ?? 0) + 1);
+    const n = (counters.google[route.url] ?? 0) + 1;
+    counters.google[route.url] = n;
     const body =
       typeof init.body === "string"
         ? init.body
@@ -671,7 +672,10 @@ async function bench(name, makeReq, { tool = true, prepare, onResult } = {}) {
     check(name, r, tool);
     if (onResult) onResult(r);
     if (i === 0) first = r;
-    if (i >= WARMUP) (bench.cur ??= []).push(r);
+    if (i >= WARMUP) {
+      bench.cur ??= [];
+      bench.cur.push(r);
+    }
   }
   const rs = bench.cur;
   bench.cur = undefined;
@@ -725,7 +729,7 @@ console.log(
 setRoutes([GOOGLE_TOKEN]);
 
 const owner = await newOwner();
-const one = await linkAccount(owner, { label: "work" });
+await linkAccount(owner, { label: "work" });
 const tokenFull = await mint("full", owner);
 const tokenRo = await mint("ro", owner);
 

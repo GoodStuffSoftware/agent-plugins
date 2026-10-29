@@ -64,7 +64,7 @@ async function registrationLimited(req: Request, env: Env): Promise<Response | u
 /** Rate counter windows are at most a day long; older rows only take space. */
 const COUNTER_KEEP_SECONDS = 2 * 86400;
 /** OAuth purge rounds per run, 50 grants and 50 tokens each. */
-const PURGE_ROUNDS = 5;
+const PURGE_ROUNDS = 3;
 
 /**
  * The daily cleanup (cron in wrangler.example.jsonc): pending actions past their expiry become
