@@ -4,6 +4,7 @@
 // will really have; the tool then runs the send checks; `deliver` builds the message and sends it.
 // Values are raw provider data: the tools prefix ids and wrap third-party text.
 
+import type { MimeAttachment } from "../core/mime";
 import type { SendAsAddress } from "../core/send-as";
 import { capability } from "./capability";
 import type { AccountRef } from "./types";
@@ -22,6 +23,8 @@ export type PrepareInput =
       replyThreadId?: string;
       /** The provider id of the message this one answers: sets In-Reply-To and References. */
       replyToMessageId?: string;
+      /** Files the caller gave, already checked and within the cap. */
+      attachments?: MimeAttachment[];
     }
   | {
       kind: "reply";
@@ -35,6 +38,8 @@ export type PrepareInput =
       htmlBody?: string;
       /** Every address the account sends as: a reply leaves them out of its recipients. */
       selfAddresses: string[];
+      /** Files the caller gave, already checked and within the cap. */
+      attachments?: MimeAttachment[];
     }
   | {
       kind: "forward";
@@ -44,7 +49,19 @@ export type PrepareInput =
       bcc: string[];
       forwardText?: string;
       htmlBody?: string;
+      /** Files the caller gave, already checked and within the cap. */
+      attachments?: MimeAttachment[];
+      /** Carry the original's files along (they are fetched only once the send is allowed). */
+      includeOriginalAttachments: boolean;
+      /** Cap on the files of the whole message, the caller's and the original's together. */
+      maxAttachmentBytes: number;
     };
+
+/** The original's files a forward carries. Fetched by `deliver`, never by `prepare`. */
+export type CarriedAttachments = {
+  messageId: string;
+  files: { attachmentId: string; filename: string; mimeType: string; size: number }[];
+};
 
 /** A message ready to send once the From address is known. */
 export type PreparedMessage = {
@@ -60,9 +77,16 @@ export type PreparedMessage = {
   inReplyTo?: string;
   references?: string;
   threadId?: string;
-  /** Files on the original that are not carried along yet (forward only). */
-  omittedAttachments: number;
+  /** Files the caller gave. */
+  attachments: MimeAttachment[];
+  /** The original's files a forward carries; fetched at delivery. */
+  carried?: CarriedAttachments;
+  /** Every file the message will hold (the caller's and the carried ones), for the audit row. */
+  attachmentTotals: AttachmentTotals;
 };
+
+/** How many files a message holds and their size in bytes. Never their content. */
+export type AttachmentTotals = { count: number; bytes: number };
 
 /** A draft's header fields, enough to check recipients and From before sending it. */
 export type DraftEnvelope = {
@@ -72,6 +96,8 @@ export type DraftEnvelope = {
   cc: string[];
   bcc: string[];
   subject: string;
+  /** The files the draft holds, for the audit row. */
+  attachmentTotals: AttachmentTotals;
 };
 
 export type SentMessage = { id: string; threadId: string; labelIds?: string[] };
@@ -82,7 +108,12 @@ export interface SendService {
   deliver(
     a: AccountRef,
     m: PreparedMessage,
-    opts: { from?: SendAsAddress | undefined; includeSignature: boolean },
+    opts: {
+      from?: SendAsAddress | undefined;
+      includeSignature: boolean;
+      /** Cap on the files of the message; checked again against what was really fetched. */
+      maxAttachmentBytes: number;
+    },
   ): Promise<SentMessage>;
   readDraft(a: AccountRef, draftId: string): Promise<DraftEnvelope>;
   sendDraft(a: AccountRef, draftId: string): Promise<SentMessage>;

@@ -1,24 +1,25 @@
 // The mail.drafts family (ARCHITECTURE s.2, s.5): create, read, list, change and delete drafts.
-// Bodies and headers read back are third-party text, so they are wrapped. Attachments arrive with
-// M16; the `attachments` parameter is accepted so the official call shape works, and refused when
-// it is not empty.
+// Bodies and headers read back are third-party text, so they are wrapped. `create_draft` and
+// `update_draft` take `attachments` in the official shape; they are checked (and the total capped)
+// before any Google call.
 
 import { z } from "zod";
 import { startFromCursor } from "../core/cursor";
 import { ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
+import { config } from "../env";
 import { googleDrafts } from "../providers/google/mail-drafts";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
 import { DRAFTS, type Draft, type DraftDepth } from "../services/mail-drafts";
 import type { AccountRef } from "../services/types";
 import {
   accountParam,
-  assertNoAttachments,
   assertSingleLine,
   attachmentsParam,
   bccParam,
   bodyParam,
   ccParam,
+  checkAttachments,
   checkRecipients,
   fromParam,
   htmlBodyParam,
@@ -100,7 +101,7 @@ const createDraft = defineTool({
   name: "create_draft",
   title: "Create a draft",
   description:
-    "Creates a draft email in the account. Nothing is sent. With `replyToMessageId` the draft is a reply: it is threaded under that message, the subject and To default from it (the original sender, minus the account's own addresses) and the original is quoted below your text. `includeSignature` appends the account's Gmail signature. The body is plain text (`body`), HTML (`htmlBody`) or both; HTML alone gets a text alternative made from it. `attachments` is not supported yet.",
+    "Creates a draft email in the account. Nothing is sent. With `replyToMessageId` the draft is a reply: it is threaded under that message, the subject and To default from it (the original sender, minus the account's own addresses) and the original is quoted below your text. `includeSignature` appends the account's Gmail signature. The body is plain text (`body`), HTML (`htmlBody`) or both; HTML alone gets a text alternative made from it. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit).",
   component: "mail",
   scopes: ["mail.write"],
   endpoints: ["full", "ro"],
@@ -127,7 +128,7 @@ const createDraft = defineTool({
     attachments: attachmentsParam,
   }),
   async handler(args, ctx) {
-    assertNoAttachments(args.attachments);
+    const attached = checkAttachments(ctx.env, args.attachments);
     assertSingleLine("subject", args.subject);
     const reply = args.replyToMessageId ? idOf(ctx, args.replyToMessageId) : undefined;
     const a = await accountFor(ctx, args.account, reply?.shortId);
@@ -144,6 +145,7 @@ const createDraft = defineTool({
       ...(args.includeSignature ? { includeSignature: true } : {}),
       ...(reply ? { replyToMessageId: reply.providerId } : {}),
       selfAddresses: self,
+      ...(attached.files.length ? { attachments: attached.files } : {}),
     });
     return written(ctx, a, draft);
   },
@@ -258,7 +260,7 @@ const updateDraft = defineTool({
   name: "update_draft",
   title: "Update a draft",
   description:
-    "Changes a draft. Fields you leave out or pass empty keep their value. Sending `body` alone replaces the text and removes the HTML; sending `htmlBody` alone replaces the HTML and rebuilds the text from it. The draft's attachments are not kept: Gmail rewrites the whole draft, and attachments are not supported yet. A reply draft stays in its thread.",
+    "Changes a draft. Fields you leave out or pass empty keep their value. Sending `body` alone replaces the text and removes the HTML; sending `htmlBody` alone replaces the HTML and rebuilds the text from it. The draft's attachments are kept unless you pass `attachments`, which replaces all of them (an empty list keeps them). A reply draft stays in its thread.",
   component: "mail",
   scopes: ["mail.write"],
   endpoints: ["full", "ro"],
@@ -281,7 +283,7 @@ const updateDraft = defineTool({
     attachments: attachmentsParam,
   }),
   async handler(args, ctx) {
-    assertNoAttachments(args.attachments);
+    const attached = checkAttachments(ctx.env, args.attachments);
     assertSingleLine("subject", args.subject);
     const id = idOf(ctx, args.draftId);
     const a = await accountFor(ctx, args.account, id.shortId);
@@ -300,6 +302,8 @@ const updateDraft = defineTool({
       ...(args.body ? { body: args.body } : {}),
       ...(args.htmlBody ? { htmlBody: args.htmlBody } : {}),
       ...(from ? { from } : {}),
+      ...(attached.files.length ? { attachments: attached.files } : {}),
+      maxAttachmentBytes: config(ctx.env).maxSendAttachmentBytes,
     });
     return written(ctx, a, draft);
   },
