@@ -12,7 +12,7 @@ import {
 } from "../core/accounts";
 import { createAuditLog } from "../core/audit";
 import { cursors } from "../core/cursor";
-import { ToolError } from "../core/errors";
+import { internalErrorLine, ToolError } from "../core/errors";
 import { accountKey, ids } from "../core/ids";
 import { createPendingActions } from "../core/pending";
 import { createRateLimiter } from "../core/ratelimit";
@@ -170,5 +170,18 @@ export async function gateApproval(
   if (seen.size !== 1 || !account) {
     throw new Error(`${def.name}: an action held for approval must address exactly one account`);
   }
-  return ctx.pending.create({ tool: def.name, account, params: args, preview });
+  const held = await ctx.pending.create({ tool: def.name, account, params: args, preview });
+  if (def.approval.onHeld) {
+    // The action is queued and the caller must learn its id, so a failing hook is logged only.
+    try {
+      await def.approval.onHeld(args as never, ctx, {
+        pendingActionId: held.pendingActionId,
+        account,
+        preview: held.preview,
+      });
+    } catch (e) {
+      console.error(internalErrorLine(`${def.name} onHeld`, e, args));
+    }
+  }
+  return held;
 }
