@@ -5,9 +5,12 @@
 // when the caller asks (`notificationLevel`); the default here is none.
 
 import { z } from "zod";
+import { loadAccountRefs } from "../core/accounts";
 import { mergePages, startFromCursor } from "../core/cursor";
 import { ToolError } from "../core/errors";
 import { accountKey } from "../core/ids";
+import { sendNeedsApproval } from "../core/pending";
+import { config } from "../env";
 import { googleCalendar } from "../providers/google/calendar";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
 import {
@@ -780,11 +783,247 @@ function refuseMeetUrl(url: string | undefined): void {
   }
 }
 
+// ---- Notifications are sends ------------------------------------------------------------------
+// A calendar change can make Google email people with text the caller chose (title, description,
+// a response comment), so it is a send: it obeys SEND_ENABLED and the owner switch, counts against
+// the account's send limits and recipient cap, writes an audit row (addresses, never the event
+// text) and, with SEND_REQUIRES_CONFIRM, is held for the owner. A change that notifies nobody
+// outside the owner's own accounts is not a send and is unchanged. With no `notificationLevel`
+// the level is none, which is also Google's own default for `sendUpdates`, so nobody is mailed.
+
+type CalendarSendTool = "create_event" | "update_event" | "delete_event" | "respond_to_event";
+
+/** What the four writing tools share, as far as notifications go. */
+interface NotifyArgs {
+  calendarId?: string | undefined;
+  eventId?: string | undefined;
+  account?: string | undefined;
+  notificationLevel?: (typeof NOTIFICATION)[number] | undefined;
+  attendees?: readonly AttendeeIn[] | undefined;
+  attendeeEmails?: readonly string[] | undefined;
+  addedAttendees?: readonly AttendeeIn[] | undefined;
+  addedAttendeeEmails?: readonly string[] | undefined;
+  responseComment?: string | undefined;
+}
+
+interface SendPlan {
+  a: AccountRef;
+  cal: string;
+  event: string | undefined;
+  sendUpdates: SendUpdates;
+  /** Distinct lowercase addresses outside the owner's own accounts that Google will email. */
+  recipients: string[];
+}
+
+/**
+ * The one place that decides whom a calendar call emails: the addresses outside the owner's own
+ * linked accounts. The caller's `notificationLevel` decides whether Google mails anyone. With it
+ * on, create mails the attendees it names; update mails the event's current guests (removed ones
+ * too) and the ones it adds; delete mails the current guests; respond mails the organizer only. A
+ * respond with a comment counts as a send even with notifications off, because the comment is text
+ * for the organizer. `externalOnly` is treated like `all`: Google skips guests it can reach inside
+ * Calendar, which is not known here. Rooms and other resources are never mailed. `known` is the
+ * event when the caller has already read it. A "hold sends to new recipients" rule belongs on the
+ * list this returns (see `holdsSend`).
+ */
+async function notifiedRecipients(
+  ctx: ToolContext,
+  t: { a: AccountRef; cal: string; event: string | undefined },
+  tool: CalendarSendTool,
+  args: NotifyArgs,
+  known?: EventInfo,
+): Promise<string[]> {
+  const level = sendUpdatesOf(args.notificationLevel);
+  const comment = tool === "respond_to_event" && (args.responseComment ?? "").trim() !== "";
+  if (level === "none" && !comment) return [];
+  const candidates: EventAttendee[] = [];
+  if (tool === "create_event") candidates.push(...attendeesOf(args.attendees, args.attendeeEmails));
+  if (tool === "update_event") {
+    candidates.push(...attendeesOf(args.addedAttendees, args.addedAttendeeEmails));
+  }
+  if (tool !== "create_event") {
+    let event = known;
+    if (!event) {
+      try {
+        event = await ctx.use(CALENDAR, t.a).getEvent(t.a, t.cal, t.event as string);
+      } catch (e) {
+        // Deleting an event that is already gone mails nobody; the delete then answers as before.
+        if (!(tool === "delete_event" && e instanceof ToolError && e.code === "not_found")) throw e;
+      }
+    }
+    if (tool === "respond_to_event") {
+      if (event?.organizer?.email) candidates.push({ email: event.organizer.email });
+    } else {
+      candidates.push(...(event?.attendees ?? []));
+    }
+  }
+  const own = new Set(
+    (await loadAccountRefs(ctx.env.DB, ctx.ownerId)).map((x) => x.address.toLowerCase()),
+  );
+  const out = new Set<string>();
+  for (const c of candidates) {
+    const email = c.email.trim().toLowerCase();
+    if (c.resource === true || !email.includes("@") || own.has(email)) continue;
+    out.add(email);
+  }
+  return [...out];
+}
+
+/** Writes an audit row for a calendar send; a failing log never changes the answer. */
+async function auditSend(
+  ctx: ToolContext,
+  tool: CalendarSendTool,
+  a: AccountRef,
+  recipients: readonly string[],
+  result: "ok" | "refused" | "error" | "pending",
+  detail: string,
+  providerRef?: string,
+): Promise<void> {
+  try {
+    await ctx.audit.write({
+      tool,
+      account: a,
+      to: recipients,
+      subject: "",
+      providerRef: providerRef ?? null,
+      result,
+      detail,
+    });
+  } catch {
+    console.error(`${tool}: the audit row could not be written`);
+  }
+}
+
+const errorCode = (e: unknown): string => (e instanceof ToolError ? e.code : "internal");
+
+/**
+ * Runs `run`, the provider call. When the call notifies someone it first passes `checkSend`
+ * (sending on, the recipient cap, the rate limits), and it is audited whatever happens; a refused
+ * call never reaches the provider. With no outside recipient it just runs.
+ */
+async function guardedNotify<T>(
+  ctx: ToolContext,
+  tool: CalendarSendTool,
+  plan: SendPlan,
+  run: () => Promise<T>,
+  refOf: (r: T) => string | undefined,
+): Promise<T> {
+  const { a, recipients } = plan;
+  if (recipients.length === 0) return run();
+  const detail = `notify=${plan.sendUpdates}`;
+  try {
+    await ctx.limits.checkSend(a, recipients);
+  } catch (e) {
+    await auditSend(ctx, tool, a, recipients, "refused", `${errorCode(e)}; ${detail}`);
+    throw e;
+  }
+  try {
+    const r = await run();
+    await auditSend(ctx, tool, a, recipients, "ok", detail, refOf(r));
+    return r;
+  } catch (e) {
+    await auditSend(ctx, tool, a, recipients, "error", `${errorCode(e)}; ${detail}`);
+    throw e;
+  }
+}
+
+/** The plan of a call, from its arguments and the event as it is now. */
+async function planOf(
+  ctx: ToolContext,
+  tool: CalendarSendTool,
+  args: NotifyArgs,
+  known?: { t?: Awaited<ReturnType<typeof target>>; event?: EventInfo },
+): Promise<SendPlan> {
+  const t = known?.t ?? (await target(ctx, args.account, args.calendarId, args.eventId));
+  const recipients = await notifiedRecipients(ctx, t, tool, args, known?.event);
+  return { ...t, sendUpdates: sendUpdatesOf(args.notificationLevel), recipients };
+}
+
+const heldPlans = new WeakMap<object, Promise<SendPlan>>();
+
+/** The plan of a call being held or previewed, worked out once for `when`, `preview` and `onHeld`. */
+function heldPlan(ctx: ToolContext, tool: CalendarSendTool, args: NotifyArgs): Promise<SendPlan> {
+  let p = heldPlans.get(args);
+  if (!p) {
+    p = planOf(ctx, tool, args);
+    heldPlans.set(args, p);
+  }
+  return p;
+}
+
+/**
+ * Whether a calendar send is held for the owner: with SEND_REQUIRES_CONFIRM, as for mail sends.
+ * The place a rule about new recipients can plug in: it gets the whole plan.
+ */
+const holdsSend = (ctx: ToolContext, _plan: SendPlan): boolean => sendNeedsApproval(ctx.env);
+
+/**
+ * `approval` of the four writing tools. Like a mail send it holds only a call that is a send, and
+ * refuses at once (audited, nothing queued) one that could never go out: sending off, or over the
+ * recipient cap. The approved run repeats every check in the handler.
+ */
+function sendApproval(tool: CalendarSendTool) {
+  return {
+    async when(args: NotifyArgs, ctx: ToolContext): Promise<boolean> {
+      // Cheap exit for the default setup: no event read for a call that cannot be held. A rule that
+      // holds without SEND_REQUIRES_CONFIRM drops this line and decides in `holdsSend`.
+      if (!sendNeedsApproval(ctx.env)) return false;
+      const plan = await heldPlan(ctx, tool, args);
+      if (plan.recipients.length === 0 || !holdsSend(ctx, plan)) return false;
+      try {
+        await ctx.limits.assertSendEnabled(plan.a);
+        const max = config(ctx.env).maxRecipients;
+        if (plan.recipients.length > max) {
+          throw new ToolError(
+            "too_many_recipients",
+            `A message may have at most ${max} recipients across to, cc and bcc; this one has ${plan.recipients.length}.`,
+            { maxRecipients: max },
+          );
+        }
+      } catch (e) {
+        await auditSend(ctx, tool, plan.a, plan.recipients, "refused", errorCode(e));
+        throw e;
+      }
+      return true;
+    },
+    async preview(args: NotifyArgs, ctx: ToolContext): Promise<unknown> {
+      const plan = await heldPlan(ctx, tool, args);
+      return {
+        action: "Calendar change that makes Google email people",
+        tool,
+        account: plan.a.label,
+        calendarId: ctx.ids.encode(plan.a, plan.cal),
+        ...(plan.event === undefined ? {} : { eventId: ctx.ids.encode(plan.a, plan.event) }),
+        notify: plan.sendUpdates,
+        to: plan.recipients,
+        ...(args.responseComment ? { withComment: true } : {}),
+      };
+    },
+    // After the pending action exists, so a failed hold leaves no row, and with its id.
+    async onHeld(
+      args: NotifyArgs,
+      ctx: ToolContext,
+      held: { pendingActionId: string },
+    ): Promise<void> {
+      const plan = await heldPlan(ctx, tool, args);
+      await auditSend(
+        ctx,
+        tool,
+        plan.a,
+        plan.recipients,
+        "pending",
+        `pending action ${held.pendingActionId}: approval requested, notify=${plan.sendUpdates}`,
+        plan.event,
+      );
+    },
+  };
+}
+
 const createEvent = defineTool({
   name: "create_event",
   title: "Create an event",
   description:
-    "Creates an event. Attendees are not emailed unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE). Pass startTime and endTime as local times with no offset; give timeZone only when the user named one.",
+    "Creates an event. Attendees are not emailed unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE). Emailing anyone outside your linked accounts counts as a send: it needs sending switched on, counts against the send limits and is audited (and held for approval when the server requires it). Pass startTime and endTime as local times with no offset; give timeZone only when the user named one.",
   component: "calendar",
   scopes: ["calendar"],
   endpoints: ["full"],
@@ -845,6 +1084,7 @@ const createEvent = defineTool({
     notificationLevel,
     account,
   }),
+  approval: sendApproval("create_event"),
   async handler(args, ctx) {
     refuseMeetUrl(args.googleMeetUrl);
     if (args.eventType === "FROM_GMAIL") {
@@ -906,8 +1146,15 @@ const createEvent = defineTool({
             }),
     });
     if (input.attendees?.length === 0) delete input.attendees;
-    const sendUpdates = sendUpdatesOf(args.notificationLevel);
-    const e = await svc.createEvent(t.a, t.cal, input, sendUpdates);
+    const plan = await planOf(ctx, "create_event", args, { t });
+    const { sendUpdates } = plan;
+    const e = await guardedNotify(
+      ctx,
+      "create_event",
+      plan,
+      () => svc.createEvent(t.a, t.cal, input, sendUpdates),
+      (r) => r.id,
+    );
     return { event: view(ctx, t.a, e, t.cal), notified: sendUpdates };
   },
 });
@@ -916,7 +1163,7 @@ const updateEvent = defineTool({
   name: "update_event",
   title: "Update an event",
   description:
-    "Changes an event; fields left out stay as they are. Changing only startTime keeps the event's length. Attendees are not emailed unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE).",
+    "Changes an event; fields left out stay as they are. Changing only startTime keeps the event's length. Attendees are not emailed unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE). Emailing anyone outside your linked accounts counts as a send: it needs sending switched on, counts against the send limits and is audited (and held for approval when the server requires it).",
   component: "calendar",
   scopes: ["calendar"],
   endpoints: ["full"],
@@ -956,6 +1203,7 @@ const updateEvent = defineTool({
     notificationLevel,
     account,
   }),
+  approval: sendApproval("update_event"),
   async handler(args, ctx) {
     refuseMeetUrl(args.googleMeetUrl);
     const t = await target(ctx, args.account, args.calendarId, args.eventId);
@@ -1070,8 +1318,18 @@ const updateEvent = defineTool({
         "Nothing to change: give at least one field to update.",
       );
     }
-    const sendUpdates = sendUpdatesOf(args.notificationLevel);
-    const e = await svc.updateEvent(t.a, t.cal, eventId, patch, sendUpdates);
+    const plan = await planOf(ctx, "update_event", args, {
+      t,
+      ...(current ? { event: current } : {}),
+    });
+    const { sendUpdates } = plan;
+    const e = await guardedNotify(
+      ctx,
+      "update_event",
+      plan,
+      () => svc.updateEvent(t.a, t.cal, eventId, patch, sendUpdates),
+      (r) => r.id,
+    );
     return { event: view(ctx, t.a, e, t.cal), notified: sendUpdates };
   },
 });
@@ -1080,7 +1338,7 @@ const deleteEvent = defineTool({
   name: "delete_event",
   title: "Delete an event",
   description:
-    "Deletes an event. Attendees are not emailed about the cancellation unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE).",
+    "Deletes an event. Attendees are not emailed about the cancellation unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE). Emailing anyone outside your linked accounts counts as a send: it needs sending switched on, counts against the send limits and is audited (and held for approval when the server requires it).",
   component: "calendar",
   scopes: ["calendar"],
   endpoints: ["full"],
@@ -1096,10 +1354,18 @@ const deleteEvent = defineTool({
     notificationLevel,
     account,
   }),
+  approval: sendApproval("delete_event"),
   async handler(args, ctx) {
     const t = await target(ctx, args.account, args.calendarId, args.eventId);
-    const sendUpdates = sendUpdatesOf(args.notificationLevel);
-    await ctx.use(CALENDAR, t.a).deleteEvent(t.a, t.cal, t.event as string, sendUpdates);
+    const plan = await planOf(ctx, "delete_event", args, { t });
+    const { sendUpdates } = plan;
+    await guardedNotify(
+      ctx,
+      "delete_event",
+      plan,
+      () => ctx.use(CALENDAR, t.a).deleteEvent(t.a, t.cal, t.event as string, sendUpdates),
+      () => t.event,
+    );
     return { deleted: ctx.ids.encode(t.a, t.event as string), notified: sendUpdates };
   },
 });
@@ -1108,7 +1374,7 @@ const respondToEvent = defineTool({
   name: "respond_to_event",
   title: "Respond to an event",
   description:
-    "Sets this account's own response to an event invitation. Only the account's own attendee entry changes. The organizer is not emailed unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE).",
+    "Sets this account's own response to an event invitation. Only the account's own attendee entry changes. The organizer is not emailed unless notificationLevel is EXTERNAL_ONLY or ALL (default NONE). A responseComment, or notifications on, counts as a send to the organizer: it needs sending switched on, counts against the send limits and is audited (and held for approval when the server requires it).",
   component: "calendar",
   scopes: ["calendar"],
   endpoints: ["full"],
@@ -1129,18 +1395,27 @@ const respondToEvent = defineTool({
     notificationLevel,
     account,
   }),
+  approval: sendApproval("respond_to_event"),
   async handler(args, ctx) {
     const t = await target(ctx, args.account, args.calendarId, args.eventId);
-    const sendUpdates = sendUpdatesOf(args.notificationLevel);
-    const e = await ctx
-      .use(CALENDAR, t.a)
-      .respond(
-        t.a,
-        t.cal,
-        t.event as string,
-        defined({ status: args.responseStatus, comment: args.responseComment }),
-        sendUpdates,
-      );
+    const plan = await planOf(ctx, "respond_to_event", args, { t });
+    const { sendUpdates } = plan;
+    const e = await guardedNotify(
+      ctx,
+      "respond_to_event",
+      plan,
+      () =>
+        ctx
+          .use(CALENDAR, t.a)
+          .respond(
+            t.a,
+            t.cal,
+            t.event as string,
+            defined({ status: args.responseStatus, comment: args.responseComment }),
+            sendUpdates,
+          ),
+      (r) => r.id,
+    );
     return { event: view(ctx, t.a, e, t.cal), notified: sendUpdates };
   },
 });

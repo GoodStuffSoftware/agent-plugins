@@ -1,6 +1,13 @@
+import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SCOPES } from "../src/auth/endpoints";
+import { mcpHandler } from "../src/auth/mcp-factory";
+import { type AuditLogRow, all } from "../src/core/db";
+import type { Env } from "../src/env";
+import { compileRegistry } from "../src/registry/compile";
 import { formatInTz, parseTimeInput, toInstantMs, zonedToMs } from "../src/services/calendar";
+import { FAMILIES } from "../src/tools";
 import fixture from "./fixtures/google/calendar.json";
 import {
   type GoogleRoute,
@@ -10,7 +17,7 @@ import {
   newOwner,
   tokenRoute,
 } from "./helpers/google";
-import { mcpRpc, toolJson } from "./helpers/mcp";
+import { ISSUER, mcpRequest, mcpRpc, parseMcp, toolJson } from "./helpers/mcp";
 import { mintToken } from "./helpers/tokens";
 
 afterEach(() => vi.restoreAllMocks());
@@ -19,7 +26,8 @@ const C = "https://www.googleapis.com/calendar/v3";
 const WRITE_TOOLS = ["create_event", "update_event", "delete_event", "respond_to_event"];
 const READ_TOOLS = ["list_calendars", "list_events", "search_events", "get_event", "suggest_time"];
 
-type Json = Record<string, unknown> & { error?: { code: string } };
+// biome-ignore lint/suspicious/noExplicitAny: the JSON a tool answered, read loosely by the tests
+type Json = any;
 
 async function call(
   ownerId: string,
@@ -837,5 +845,317 @@ describe("respond_to_event", () => {
       arguments: { eventId: "evt1", responseStatus: "needsAction" },
     });
     expect((result as { isError?: boolean }).isError).toBe(true);
+  });
+});
+
+// ---- Notifications are sends -----------------------------------------------------------------
+// A calendar change that makes Google email someone outside the owner's own accounts is a send:
+// SEND_ENABLED and the owner switch, the send counters, the recipient cap, an audit row and, with
+// SEND_REQUIRES_CONFIRM, a hold.
+
+const registry = compileRegistry(FAMILIES);
+const withEnv = (overrides: Partial<Env>): Env => ({ ...env, ...overrides }) as Env;
+
+/** One tool call with `e` as the Worker's settings. */
+async function callWith(e: Env, ownerId: string, name: string, args: Record<string, unknown>) {
+  const exec = Object.assign(createExecutionContext(), {
+    props: { ownerId },
+    auth: {
+      token: `${ownerId}:g_test:secret`,
+      audience: `${ISSUER}/mcp`,
+      scope: [...SCOPES.full],
+      clientId: "client_test",
+      userId: ownerId,
+    },
+  });
+  const res = await mcpHandler("full", ISSUER, registry)(
+    mcpRequest(undefined, "full", "tools/call", { name, arguments: args }),
+    e,
+    exec,
+  );
+  await waitOnExecutionContext(exec);
+  const { result } = await parseMcp(res);
+  return { isError: result?.isError === true, json: toolJson(result) as Json };
+}
+
+const auditRows = (ownerId: string) =>
+  all<AuditLogRow>(env.DB, "SELECT * FROM audit_log WHERE owner_id = ? ORDER BY id", ownerId);
+
+const sendCount = async (accountId: string): Promise<number> =>
+  (
+    await env.DB.prepare("SELECT COALESCE(SUM(count), 0) AS n FROM rate_counters WHERE bucket = ?")
+      .bind(`send:h:${accountId}`)
+      .first<{ n: number }>()
+  )?.n ?? 0;
+
+describe("calendar notifications are sends", () => {
+  const events = `${C}/calendars/primary/events`;
+  const evt = `${events}/evt1`;
+  const OFF = withEnv({ SEND_ENABLED: "false" });
+  const create = {
+    summary: "Planning",
+    description: "SECRET-DESCRIPTION",
+    startTime: "2030-01-07T10:00:00+01:00",
+    endTime: "2030-01-07T11:00:00+01:00",
+    attendeeEmails: ["Outsider@Example.net", "friend@example.net"],
+  };
+  const createRoute = (): GoogleRoute => ({
+    method: "POST",
+    url: events,
+    reply: () => googleJson(200, fixture.event),
+  });
+  const getRoute = (): GoogleRoute => ({ url: evt, reply: () => googleJson(200, fixture.event) });
+  const patchRoute = (): GoogleRoute => ({
+    method: "PATCH",
+    url: evt,
+    reply: () => googleJson(200, fixture.event),
+  });
+  const deleteRoute = (): GoogleRoute => ({
+    method: "DELETE",
+    url: evt,
+    reply: () => new Response(null, { status: 204 }),
+  });
+
+  it("refuses an invitation to outsiders when sending is off, with the mail error, and calls nothing", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([createRoute()]);
+    const res = await callWith(OFF, ownerId, "create_event", {
+      ...create,
+      notificationLevel: "ALL",
+    });
+    expect(res.json.error.code).toBe("send_disabled");
+    expect(res.json.error.message).toContain("SEND_ENABLED");
+    expect(calls).toHaveLength(0);
+    expect(await sendCount(row.id)).toBe(0);
+    const [a, ...rest] = await auditRows(ownerId);
+    expect(rest).toHaveLength(0);
+    expect(a).toMatchObject({ tool: "create_event", result: "refused" });
+    expect(a?.detail).toContain("send_disabled");
+  });
+
+  it("refuses it when the owner's sending switch is off", async () => {
+    const { ownerId } = await setup();
+    await env.DB.prepare("UPDATE owners SET send_kill_switch = 1 WHERE id = ?").bind(ownerId).run();
+    const calls = installGoogleRoutes([createRoute()]);
+    const res = await callWith(env, ownerId, "create_event", {
+      ...create,
+      notificationLevel: "EXTERNAL_ONLY",
+    });
+    expect(res.json.error.code).toBe("send_disabled");
+    expect(res.json.error.message).toContain("switched off");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("with sending on, counts it and audits the recipients without the description", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([createRoute()]);
+    const res = await callWith(env, ownerId, "create_event", {
+      ...create,
+      notificationLevel: "ALL",
+    });
+    expect(res.isError).toBe(false);
+    expect(q(calls[0]?.url).get("sendUpdates")).toBe("all");
+    expect(await sendCount(row.id)).toBe(1);
+    const [a, ...rest] = await auditRows(ownerId);
+    expect(rest).toHaveLength(0);
+    expect(a).toMatchObject({ tool: "create_event", result: "ok", provider_ref: "evt1" });
+    expect(JSON.parse(a?.to_addrs ?? "[]")).toEqual(["outsider@example.net", "friend@example.net"]);
+    expect(JSON.stringify(a)).not.toContain("SECRET-DESCRIPTION");
+    expect(JSON.stringify(a)).not.toContain("Planning");
+  });
+
+  it("does not count or audit a change with notifications off, even with sending off", async () => {
+    const { ownerId, row } = await setup();
+    installGoogleRoutes([createRoute()]);
+    for (const level of [undefined, "NONE", "NOTIFICATION_LEVEL_UNSPECIFIED"]) {
+      const res = await callWith(OFF, ownerId, "create_event", {
+        ...create,
+        ...(level ? { notificationLevel: level } : {}),
+      });
+      expect(res.isError).toBe(false);
+      expect(res.json.notified).toBe("none");
+    }
+    expect(await sendCount(row.id)).toBe(0);
+    expect(await auditRows(ownerId)).toHaveLength(0);
+  });
+
+  it("does not count a change that notifies only the owner's own accounts", async () => {
+    const { ownerId, row } = await setup();
+    await linkGoogleAccount(ownerId, { label: "home" });
+    const calls = installGoogleRoutes([createRoute()]);
+    const res = await callWith(OFF, ownerId, "create_event", {
+      ...create,
+      account: "work",
+      attendeeEmails: ["home@example.com", "WORK@example.com"],
+      notificationLevel: "ALL",
+    });
+    expect(res.isError).toBe(false);
+    expect(q(calls[0]?.url).get("sendUpdates")).toBe("all");
+    expect(await sendCount(row.id)).toBe(0);
+    expect(await auditRows(ownerId)).toHaveLength(0);
+  });
+
+  it("counts an update that adds an outsider, mailing the current guests too", async () => {
+    const { ownerId, row } = await setup();
+    installGoogleRoutes([getRoute(), patchRoute()]);
+    const res = await callWith(env, ownerId, "update_event", {
+      eventId: "evt1",
+      summary: "Renamed",
+      addedAttendeeEmails: ["new@example.net"],
+      notificationLevel: "ALL",
+    });
+    expect(res.isError).toBe(false);
+    expect(await sendCount(row.id)).toBe(1);
+    const [a] = await auditRows(ownerId);
+    expect(a?.tool).toBe("update_event");
+    expect(JSON.parse(a?.to_addrs ?? "[]").sort()).toEqual([
+      "boss@example.com",
+      "guest@example.com",
+      "new@example.net",
+    ]);
+    const refused = await callWith(OFF, ownerId, "update_event", {
+      eventId: "evt1",
+      summary: "Again",
+      notificationLevel: "ALL",
+    });
+    expect(refused.json.error.code).toBe("send_disabled");
+  });
+
+  it("treats a response comment as a send to the organizer, even with notifications off", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([getRoute(), patchRoute()]);
+    const off = await callWith(OFF, ownerId, "respond_to_event", {
+      eventId: "evt1",
+      responseStatus: "declined",
+      responseComment: "SECRET-COMMENT",
+    });
+    expect(off.json.error.code).toBe("send_disabled");
+    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
+    const ok = await callWith(env, ownerId, "respond_to_event", {
+      eventId: "evt1",
+      responseStatus: "declined",
+      responseComment: "SECRET-COMMENT",
+    });
+    expect(ok.isError).toBe(false);
+    expect(await sendCount(row.id)).toBe(1);
+    const rows = await auditRows(ownerId);
+    expect(rows.map((r) => r.result)).toEqual(["refused", "ok"]);
+    expect(JSON.parse(rows[1]?.to_addrs ?? "[]")).toEqual(["boss@example.com"]);
+    expect(JSON.stringify(rows)).not.toContain("SECRET-COMMENT");
+  });
+
+  it("does not count a response without a comment and with notifications off", async () => {
+    const { ownerId, row } = await setup();
+    installGoogleRoutes([getRoute(), patchRoute()]);
+    const res = await callWith(OFF, ownerId, "respond_to_event", {
+      eventId: "evt1",
+      responseStatus: "accepted",
+    });
+    expect(res.isError).toBe(false);
+    expect(await sendCount(row.id)).toBe(0);
+    expect(await auditRows(ownerId)).toHaveLength(0);
+  });
+
+  it("counts a delete that sends cancellations, and leaves a quiet delete alone", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([getRoute(), deleteRoute()]);
+    const off = await callWith(OFF, ownerId, "delete_event", {
+      eventId: "evt1",
+      notificationLevel: "ALL",
+    });
+    expect(off.json.error.code).toBe("send_disabled");
+    expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+    const ok = await callWith(env, ownerId, "delete_event", {
+      eventId: "evt1",
+      notificationLevel: "ALL",
+    });
+    expect(ok.isError).toBe(false);
+    expect(q(calls.find((c) => c.method === "DELETE")?.url).get("sendUpdates")).toBe("all");
+    expect(await sendCount(row.id)).toBe(1);
+    const rows = await auditRows(ownerId);
+    expect(rows.map((r) => r.result)).toEqual(["refused", "ok"]);
+    expect(JSON.parse(rows[1]?.to_addrs ?? "[]").sort()).toEqual([
+      "boss@example.com",
+      "guest@example.com",
+    ]);
+    const quiet = await callWith(OFF, ownerId, "delete_event", { eventId: "evt1" });
+    expect(quiet.isError).toBe(false);
+    expect(await sendCount(row.id)).toBe(1);
+  });
+
+  it("holds a notifying change for approval when SEND_REQUIRES_CONFIRM is on, calling nothing", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([createRoute()]);
+    const e = withEnv({ SEND_REQUIRES_CONFIRM: "true" });
+    const held = await callWith(e, ownerId, "create_event", {
+      ...create,
+      notificationLevel: "ALL",
+    });
+    expect(held.json).toMatchObject({
+      status: "pending_approval",
+      pendingActionId: expect.stringMatching(/^pa_/),
+    });
+    expect(held.json.preview).toMatchObject({
+      tool: "create_event",
+      to: ["outsider@example.net", "friend@example.net"],
+    });
+    expect(JSON.stringify(held.json.preview)).not.toContain("SECRET-DESCRIPTION");
+    expect(calls).toHaveLength(0);
+    expect(await sendCount(row.id)).toBe(0);
+    const [a, ...rest] = await auditRows(ownerId);
+    expect(rest).toHaveLength(0);
+    expect(a).toMatchObject({ tool: "create_event", result: "pending" });
+    expect(a?.detail).toContain(held.json.pendingActionId);
+
+    // A quiet change, and one that notifies only the owner, are not held.
+    const quiet = await callWith(e, ownerId, "create_event", create);
+    expect(quiet.isError).toBe(false);
+    expect(quiet.json.status).toBeUndefined();
+    const own = await callWith(e, ownerId, "create_event", {
+      ...create,
+      attendeeEmails: ["work@example.com"],
+      notificationLevel: "ALL",
+    });
+    expect(own.json.status).toBeUndefined();
+    // Sending off: refused at once, nothing queued.
+    const off = await callWith(
+      withEnv({ SEND_ENABLED: "false", SEND_REQUIRES_CONFIRM: "true" }),
+      ownerId,
+      "create_event",
+      { ...create, notificationLevel: "ALL" },
+    );
+    expect(off.json.error.code).toBe("send_disabled");
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM pending_actions WHERE owner_id = ?")
+      .bind(ownerId)
+      .first<{ n: number }>();
+    expect(n?.n).toBe(1);
+  });
+
+  it("refuses when the send rate limit is reached, before calling Google", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([createRoute()]);
+    const e = withEnv({ SEND_PER_HOUR: "1" });
+    const args = { ...create, notificationLevel: "ALL" };
+    expect((await callWith(e, ownerId, "create_event", args)).isError).toBe(false);
+    const second = await callWith(e, ownerId, "create_event", args);
+    expect(second.json.error.code).toBe("rate_limited");
+    expect(second.json.error.message).toContain("sends per hour");
+    expect(calls).toHaveLength(1);
+    expect((await auditRows(ownerId)).map((r) => r.result)).toEqual(["ok", "refused"]);
+    // A change that notifies nobody is not limited.
+    const quiet = await callWith(e, ownerId, "create_event", create);
+    expect(quiet.isError).toBe(false);
+  });
+
+  it("refuses more outside recipients than MAX_RECIPIENTS", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([createRoute()]);
+    const res = await callWith(withEnv({ MAX_RECIPIENTS: "1" }), ownerId, "create_event", {
+      ...create,
+      notificationLevel: "ALL",
+    });
+    expect(res.json.error.code).toBe("too_many_recipients");
+    expect(calls).toHaveLength(0);
+    expect(await sendCount(row.id)).toBe(0);
   });
 });
