@@ -1158,4 +1158,96 @@ describe("calendar notifications are sends", () => {
     expect(calls).toHaveLength(0);
     expect(await sendCount(row.id)).toBe(0);
   });
+
+  it("ignores a caller's own resource flag, but not a room address", async () => {
+    const { ownerId, row } = await setup();
+    const calls = installGoogleRoutes([createRoute()]);
+    const sneaky = await callWith(OFF, ownerId, "create_event", {
+      ...create,
+      attendeeEmails: undefined,
+      attendees: [{ email: "evil@example.net", resource: true }],
+      notificationLevel: "ALL",
+    });
+    expect(sneaky.json.error.code).toBe("send_disabled");
+    expect(calls).toHaveLength(0);
+    const room = await callWith(OFF, ownerId, "create_event", {
+      ...create,
+      attendeeEmails: ["room@resource.calendar.google.com"],
+      notificationLevel: "ALL",
+    });
+    expect(room.isError).toBe(false);
+    expect(await sendCount(row.id)).toBe(0);
+  });
+
+  it("counts an outsider organizer that the guest list does not show, on update and delete", async () => {
+    const { ownerId } = await setup();
+    const hidden = {
+      ...fixture.event,
+      organizer: { email: "attacker@example.net" },
+      attendees: [{ email: "work@example.com", self: true }],
+    };
+    const calls = installGoogleRoutes([
+      { url: evt, reply: () => googleJson(200, hidden) },
+      patchRoute(),
+      deleteRoute(),
+    ]);
+    const upd = await callWith(OFF, ownerId, "update_event", {
+      eventId: "evt1",
+      summary: "x",
+      notificationLevel: "ALL",
+    });
+    expect(upd.json.error.code).toBe("send_disabled");
+    const del = await callWith(OFF, ownerId, "delete_event", {
+      eventId: "evt1",
+      notificationLevel: "ALL",
+    });
+    expect(del.json.error.code).toBe("send_disabled");
+    expect(calls.some((c) => c.method === "PATCH" || c.method === "DELETE")).toBe(false);
+  });
+
+  it("a notifying delete of an event Google reports as gone (410) still succeeds, uncounted", async () => {
+    const { ownerId, row } = await setup();
+    installGoogleRoutes([
+      {
+        method: "GET",
+        url: evt,
+        reply: () =>
+          googleJson(410, { error: { code: 410, message: "Resource has been deleted" } }),
+      },
+      {
+        method: "DELETE",
+        url: evt,
+        reply: () =>
+          googleJson(410, { error: { code: 410, message: "Resource has been deleted" } }),
+      },
+    ]);
+    const res = await callWith(env, ownerId, "delete_event", {
+      eventId: "evt1",
+      notificationLevel: "ALL",
+    });
+    expect(res.isError).toBe(false);
+    expect(await sendCount(row.id)).toBe(0);
+  });
+
+  it("does not spend a send on a response by an account that is not a guest", async () => {
+    const { ownerId, row } = await setup();
+    installGoogleRoutes([
+      {
+        url: evt,
+        reply: () =>
+          googleJson(200, {
+            ...fixture.event,
+            attendees: [{ email: "boss@example.com", responseStatus: "accepted" }],
+          }),
+      },
+    ]);
+    const res = await callWith(env, ownerId, "respond_to_event", {
+      eventId: "evt1",
+      responseStatus: "declined",
+      responseComment: "hi",
+    });
+    expect(res.json.error.code).toBe("invalid_argument");
+    expect(await sendCount(row.id)).toBe(0);
+    expect(await auditRows(ownerId)).toHaveLength(0);
+  });
 });

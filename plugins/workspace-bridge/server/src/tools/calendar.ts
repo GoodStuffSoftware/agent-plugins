@@ -791,6 +791,8 @@ function refuseMeetUrl(url: string | undefined): void {
 // outside the owner's own accounts is not a send and is unchanged. With no `notificationLevel`
 // the level is none, which is also Google's own default for `sendUpdates`, so nobody is mailed.
 
+const ROOM_DOMAIN = "@resource.calendar.google.com";
+
 type CalendarSendTool = "create_event" | "update_event" | "delete_event" | "respond_to_event";
 
 /** What the four writing tools share, as far as notifications go. */
@@ -822,7 +824,7 @@ interface SendPlan {
  * too) and the ones it adds; delete mails the current guests; respond mails the organizer only. A
  * respond with a comment counts as a send even with notifications off, because the comment is text
  * for the organizer. `externalOnly` is treated like `all`: Google skips guests it can reach inside
- * Calendar, which is not known here. Rooms and other resources are never mailed. `known` is the
+ * Calendar, which is not known here. Rooms (Google's resource addresses, or guests Google itself marks as resources) are never mailed; the caller's own `resource` flag is ignored. `known` is the
  * event when the caller has already read it. A "hold sends to new recipients" rule belongs on the
  * list this returns (see `holdsSend`).
  */
@@ -836,24 +838,35 @@ async function notifiedRecipients(
   const level = sendUpdatesOf(args.notificationLevel);
   const comment = tool === "respond_to_event" && (args.responseComment ?? "").trim() !== "";
   if (level === "none" && !comment) return [];
+  // The caller's own `resource` flag is never trusted (it would let a prompt-injected caller take
+  // an outside address out of the count); only what Google returned, and room addresses, are skipped.
   const candidates: EventAttendee[] = [];
-  if (tool === "create_event") candidates.push(...attendeesOf(args.attendees, args.attendeeEmails));
-  if (tool === "update_event") {
-    candidates.push(...attendeesOf(args.addedAttendees, args.addedAttendeeEmails));
-  }
+  const named = (list: readonly AttendeeIn[] | undefined, emails: readonly string[] | undefined) =>
+    attendeesOf(list, emails).map((x) => ({ ...x, resource: false }));
+  if (tool === "create_event") candidates.push(...named(args.attendees, args.attendeeEmails));
+  if (tool === "update_event")
+    candidates.push(...named(args.addedAttendees, args.addedAttendeeEmails));
   if (tool !== "create_event") {
     let event = known;
     if (!event) {
       try {
         event = await ctx.use(CALENDAR, t.a).getEvent(t.a, t.cal, t.event as string);
       } catch (e) {
-        // Deleting an event that is already gone mails nobody; the delete then answers as before.
-        if (!(tool === "delete_event" && e instanceof ToolError && e.code === "not_found")) throw e;
+        // Deleting an event that is already gone (404, or 410 Gone) mails nobody; the delete then
+        // answers as before.
+        const gone =
+          e instanceof ToolError && (e.code === "not_found" || e.details?.status === 410);
+        if (!(tool === "delete_event" && gone)) throw e;
       }
     }
     if (tool === "respond_to_event") {
+      // An account that is not a guest has no response to set: the provider refuses it, so nothing
+      // is mailed and no send is spent on it.
+      if (event && !(event.attendees ?? []).some((x) => x.self === true)) return [];
       if (event?.organizer?.email) candidates.push({ email: event.organizer.email });
     } else {
+      // The organizer is mailed too, and an outsider may be missing from the guest list Google shows.
+      if (event?.organizer?.email) candidates.push({ email: event.organizer.email });
       candidates.push(...(event?.attendees ?? []));
     }
   }
@@ -863,7 +876,8 @@ async function notifiedRecipients(
   const out = new Set<string>();
   for (const c of candidates) {
     const email = c.email.trim().toLowerCase();
-    if (c.resource === true || !email.includes("@") || own.has(email)) continue;
+    if (c.resource === true || email.endsWith(ROOM_DOMAIN) || !email.includes("@")) continue;
+    if (own.has(email)) continue;
     out.add(email);
   }
   return [...out];
