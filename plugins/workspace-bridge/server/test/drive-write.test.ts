@@ -407,10 +407,41 @@ describe("share_file", () => {
     const rows = await auditRows(ownerId, "share_file");
     expect(rows.map((r) => r.result)).toEqual(["pending"]);
     expect(JSON.parse(rows[0]?.to_addrs ?? "[]")).toEqual(["anyone"]);
+    // The row is written once the pending action exists and names it.
+    expect(rows[0]?.detail).toContain(`pending action ${json.pendingActionId}`);
+    expect(rows[0]?.detail).toContain("file=1OwnDoc");
     const got = await call(ownerId, "get_pending_action", {
       pendingActionId: json.pendingActionId,
     });
     expect(got.json.status).toBe("pending");
+  });
+
+  it("leaves no audit row when the hold cannot be queued (50 actions already waiting)", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([]);
+    const now = Math.floor(Date.now() / 1000);
+    const insert = env.DB.prepare(
+      `INSERT INTO pending_actions (id, owner_id, tool, params, preview, client_id, grant_id,
+         status, created_at, expires_at) VALUES (?, ?, 'share_file', '{}', 'null', 'c', 'g', 'pending', ?, ?)`,
+    );
+    await env.DB.batch(
+      Array.from({ length: 50 }, (_, i) => insert.bind(`pa_full${i}`, ownerId, now, now + 3600)),
+    );
+    const r = await call(ownerId, "share_file", {
+      fileId: "1OwnDoc",
+      role: "reader",
+      type: "anyone",
+    });
+    expect(r.isError).toBe(true);
+    expect(r.json.error.code).toBe("rate_limited");
+    expect(calls).toHaveLength(0);
+    expect(await auditRows(ownerId, "share_file")).toHaveLength(0);
+    const open = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM pending_actions WHERE owner_id = ?",
+    )
+      .bind(ownerId)
+      .first<{ n: number }>();
+    expect(open?.n).toBe(50);
   });
 
   it("holds a domain-wide share and a share to an address outside the owner's accounts", async () => {

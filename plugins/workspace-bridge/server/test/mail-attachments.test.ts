@@ -311,6 +311,95 @@ describe("send_message with attachments", () => {
     expect(calls).toHaveLength(0);
     expect(JSON.stringify(res.json)).not.toContain(sample);
   });
+
+  it("refuses over-cap files at once when the send would be held: nothing is queued", async () => {
+    const { ownerId, key } = await setup();
+    const calls = installGoogleRoutes([messageRoute(), sendRoute()]);
+    const e = ON({ SEND_REQUIRES_CONFIRM: "true", MAX_SEND_ATTACHMENT_BYTES: "199" });
+    const pendingCount = async () =>
+      (
+        await env.DB.prepare("SELECT COUNT(*) AS n FROM pending_actions WHERE owner_id = ?")
+          .bind(ownerId)
+          .first<{ n: number }>()
+      )?.n;
+    const cases: [string, Record<string, unknown>][] = [
+      ["send_message", { to: ["bob@example.com"], subject: "s", body: "b", attachments: [own] }],
+      ["reply", { messageId: `${key}:${fx.original.id}`, body: "thanks", attachments: [own] }],
+      [
+        "forward",
+        { messageId: `${key}:${fx.original.id}`, to: ["dan@example.com"], attachments: [own] },
+      ],
+    ];
+    for (const [tool, args] of cases) {
+      const res = await call(e, ownerId, tool, args);
+      expect(res.isError, tool).toBe(true);
+      expect(res.json.error.code, tool).toBe("too_large");
+    }
+    expect(await pendingCount()).toBe(0);
+    expect(calls).toHaveLength(0);
+    const rows = await auditRows(ownerId);
+    expect(rows.map((r) => [r.tool, r.result])).toEqual([
+      ["send_message", "refused"],
+      ["reply", "refused"],
+      ["forward", "refused"],
+    ]);
+    // Under the cap the same send is still held.
+    const held = await call(
+      ON({ SEND_REQUIRES_CONFIRM: "true", MAX_SEND_ATTACHMENT_BYTES: "200" }),
+      ownerId,
+      "send_message",
+      { to: ["bob@example.com"], subject: "s", body: "b", attachments: [own] },
+    );
+    expect(held.json.status).toBe("pending_approval");
+    expect(await pendingCount()).toBe(1);
+  });
+
+  it("refuses other cheap faults of a held send at once: bad address, no recipient on a forward, empty reply", async () => {
+    const { ownerId, key } = await setup();
+    const calls = installGoogleRoutes([messageRoute(), sendRoute()]);
+    const e = ON({ SEND_REQUIRES_CONFIRM: "true" });
+    const cases: [string, Record<string, unknown>][] = [
+      ["send_message", { to: ["not-an-address"], subject: "s", body: "b" }],
+      ["send_message", { to: ["bob@example.com"], subject: "a\nb", body: "b" }],
+      ["forward", { messageId: `${key}:${fx.original.id}` }],
+      ["reply", { messageId: `${key}:${fx.original.id}` }],
+    ];
+    for (const [tool, args] of cases) {
+      const res = await call(e, ownerId, tool, args);
+      expect(res.json.error.code, tool).toBe("invalid_argument");
+    }
+    const { n } = (await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM pending_actions WHERE owner_id = ?",
+    )
+      .bind(ownerId)
+      .first<{ n: number }>()) ?? { n: -1 };
+    expect(n).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("the handler still checks the cap when the stored send runs", async () => {
+    const { ownerId } = await setup();
+    installGoogleRoutes([sendRoute()]);
+    const held = await call(
+      ON({ SEND_REQUIRES_CONFIRM: "true", MAX_SEND_ATTACHMENT_BYTES: "200" }),
+      ownerId,
+      "send_message",
+      { to: ["bob@example.com"], subject: "s", body: "b", attachments: [own] },
+    );
+    expect(held.json.status).toBe("pending_approval");
+    // The cap was lowered before the owner approved: the stored call is run again as it is.
+    const row = await env.DB.prepare("SELECT params FROM pending_actions WHERE id = ?")
+      .bind(held.json.pendingActionId)
+      .first<{ params: string }>();
+    const stored = JSON.parse(row?.params ?? "{}") as { args: Record<string, unknown> };
+    const run = await call(
+      ON({ MAX_SEND_ATTACHMENT_BYTES: "199" }),
+      ownerId,
+      "send_message",
+      stored.args,
+    );
+    expect(run.json.error.code).toBe("too_large");
+  });
 });
 
 // ---- reply ---------------------------------------------------------------------------------------

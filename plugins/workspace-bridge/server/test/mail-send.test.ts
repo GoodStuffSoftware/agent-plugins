@@ -388,6 +388,30 @@ describe("send_message", () => {
     expect(row?.preview).not.toContain("SECRET-BODY-TEXT");
   });
 
+  it("refuses at once, queuing nothing, a send that could never go out: no recipient, sending off", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([sendRoute()]);
+    const pending = () =>
+      env.DB.prepare("SELECT COUNT(*) AS n FROM pending_actions WHERE owner_id = ?")
+        .bind(ownerId)
+        .first<{ n: number }>();
+    const none = await call(ON({ SEND_REQUIRES_CONFIRM: "true" }), ownerId, "send_message", {
+      subject: "s",
+      body: "b",
+    });
+    expect(none.json.error.code).toBe("invalid_argument");
+    const off = await call(
+      withEnv({ SEND_ENABLED: "false", SEND_REQUIRES_CONFIRM: "true" }),
+      ownerId,
+      "send_message",
+      { to: ["bob@example.com"], subject: "s", body: "b" },
+    );
+    expect(off.json.error.code).toBe("send_disabled");
+    expect((await pending())?.n).toBe(0);
+    expect(calls).toHaveLength(0);
+    expect((await auditRows(ownerId)).map((r) => r.result)).toEqual(["refused", "refused"]);
+  });
+
   it("validates before calling Google: header injection, attachments, no recipient", async () => {
     const { ownerId } = await setup();
     const calls = installGoogleRoutes([sendRoute()]);

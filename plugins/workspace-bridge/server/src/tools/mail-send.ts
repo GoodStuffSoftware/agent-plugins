@@ -160,7 +160,7 @@ async function refusing<T>(
   check: () => T,
 ): Promise<T> {
   try {
-    return check();
+    return await check();
   } catch (e) {
     try {
       await ctx.audit.write({
@@ -211,6 +211,41 @@ const attachmentsPreview = (
   }));
 
 const sendCap = (ctx: ToolContext): number => config(ctx.env).maxSendAttachmentBytes;
+
+/**
+ * What a send checks before it is queued for approval (`approval.when`; only when
+ * `SEND_REQUIRES_CONFIRM` holds it): the caller's own recipients and files, the send switches
+ * (SEND_ENABLED, the owner switch) and the mail.send component, with nothing from Google. A send
+ * that could never go out (files over `MAX_SEND_ATTACHMENT_BYTES`, a malformed address, no
+ * recipient, sending off) is refused at once, audited like the handler's refusals, and nothing is
+ * queued for the owner. The handler repeats the checks when the approved send runs.
+ * `needRecipient`: the message has only the recipients the caller gave (no reply defaults).
+ */
+async function checkBeforeHold(
+  ctx: ToolContext,
+  tool: string,
+  selector: string | undefined,
+  ref: string | undefined,
+  subject: string | undefined,
+  args: Parameters<typeof checkRecipients>[1] & {
+    attachments?: Parameters<typeof checkAttachments>[1];
+  },
+  needRecipient: boolean,
+): Promise<void> {
+  const a = await accountFor(ctx, selector, ref ? idOf(ctx, ref).shortId : undefined);
+  const given = await givenRecipients(ctx, a, tool, subject, args);
+  await givenAttachments(ctx, a, tool, subject, args.attachments);
+  await refusing(ctx, a, tool, subject, async () => {
+    if (needRecipient && everyone(given).length === 0) {
+      throw new ToolError(
+        "invalid_argument",
+        "A message needs at least one recipient in to, cc or bcc.",
+      );
+    }
+    await ctx.limits.assertSendEnabled(a);
+    ctx.use(SEND, a);
+  });
+}
 
 /** Recipients taken from the original message are third-party text. */
 function withRecipients(
@@ -324,7 +359,16 @@ const sendMessage = defineTool({
     attachments: attachmentsParam,
   }),
   approval: {
-    when: (_args, ctx) => sendNeedsApproval(ctx.env),
+    async when(args, ctx) {
+      if (!sendNeedsApproval(ctx.env)) return false;
+      assertSingleLine("subject", args.subject);
+      // A draft is sent as it is: its own recipients and files are read at send time.
+      if (!args.draftId) {
+        const ref = args.replyToMessageId ?? args.replyThreadId;
+        await checkBeforeHold(ctx, "send_message", args.account, ref, args.subject, args, true);
+      }
+      return true;
+    },
     preview: async (args, ctx) =>
       preview(ctx, args.account, args.draftId ?? args.replyToMessageId ?? args.replyThreadId, {
         from: args.from ?? null,
@@ -426,7 +470,14 @@ const reply = defineTool({
     attachments: attachmentsParam,
   }),
   approval: {
-    when: (_args, ctx) => sendNeedsApproval(ctx.env),
+    async when(args, ctx) {
+      if (!sendNeedsApproval(ctx.env)) return false;
+      if (!args.body && !args.htmlBody) {
+        throw new ToolError("invalid_argument", "A reply needs `body` or `htmlBody`.");
+      }
+      await checkBeforeHold(ctx, "reply", args.account, args.messageId, undefined, args, false);
+      return true;
+    },
     preview: async (args, ctx) =>
       preview(ctx, args.account, args.messageId, {
         action: "reply",
@@ -520,7 +571,11 @@ const forward = defineTool({
     attachments: attachmentsParam,
   }),
   approval: {
-    when: (_args, ctx) => sendNeedsApproval(ctx.env),
+    async when(args, ctx) {
+      if (!sendNeedsApproval(ctx.env)) return false;
+      await checkBeforeHold(ctx, "forward", args.account, args.messageId, undefined, args, true);
+      return true;
+    },
     preview: (args, ctx) =>
       preview(ctx, args.account, args.messageId, {
         action: "forward",

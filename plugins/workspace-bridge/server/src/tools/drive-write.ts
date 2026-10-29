@@ -476,14 +476,6 @@ const shareFile = defineTool({
       const spec = shareOf(args);
       const t = await target(ctx, args.account, args.fileId);
       const reason = await shareRisk(ctx, spec);
-      await ctx.audit.write({
-        tool: "share_file",
-        account: t.a,
-        to: [recipient(spec)],
-        providerRef: null,
-        result: "pending",
-        detail: `approval requested: role=${spec.role} type=${spec.type} file=${t.id}`,
-      });
       return {
         action: "Share a Drive file",
         account: t.a.label,
@@ -492,6 +484,19 @@ const shareFile = defineTool({
         to: recipient(spec),
         reason,
       };
+    },
+    // After the pending action exists, so a failed hold leaves no row, and with its id.
+    async onHeld(args, ctx, held) {
+      const spec = shareOf(args);
+      const file = ctx.ids.parse(args.fileId)?.providerId ?? args.fileId;
+      await ctx.audit.write({
+        tool: "share_file",
+        account: held.account,
+        to: [recipient(spec)],
+        providerRef: null,
+        result: "pending",
+        detail: `pending action ${held.pendingActionId}: approval requested, role=${spec.role} type=${spec.type} file=${file}`,
+      });
     },
   },
   async handler(args, ctx) {

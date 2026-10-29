@@ -26,6 +26,14 @@ export interface Grant {
   readonly scopes: readonly Scope[];
 }
 
+/** A call held for approval, as `approval.onHeld` sees it once the pending action exists. */
+export interface HeldAction {
+  readonly pendingActionId: string;
+  /** The one account the action is bound to. */
+  readonly account: AccountRef;
+  readonly preview: unknown;
+}
+
 /** What a handler gets besides its arguments (s.3.2). A new one per tool call. */
 export interface ToolContext {
   readonly kind: Kind;
@@ -75,8 +83,18 @@ export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
   /** The output carries third-party text. */
   untrusted?: boolean;
   approval?: {
+    /**
+     * Whether this call is held. It also runs the cheap checks that need no Google call, before
+     * anything is queued: an error it throws refuses the call and nothing is queued or audited as held.
+     */
     when(args: z.output<S>, ctx: ToolContext): boolean | Promise<boolean>;
     preview(args: z.output<S>, ctx: ToolContext): unknown;
+    /**
+     * Runs once the pending action exists, never when creating it failed (the 50-open cap, a
+     * rate limit, too large): the place for a "held" audit row that names `pendingActionId`. The
+     * hold stands whatever it does; an error it throws is logged, not returned to the caller.
+     */
+    onHeld?(args: z.output<S>, ctx: ToolContext, held: HeldAction): void | Promise<void>;
   };
   /** Returns a JSON-serialisable value; throws `ToolError` for an expected failure. */
   handler(args: z.output<S>, ctx: ToolContext): Promise<unknown>;
