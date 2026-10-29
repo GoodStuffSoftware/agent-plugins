@@ -126,7 +126,8 @@ async function readOriginal(a: AccountRef, messageId: string): Promise<Original>
 
 const totalsOf = (own: readonly MimeAttachment[], carried: readonly PartAttachment[] = []) => ({
   count: own.length + carried.length,
-  bytes: own.reduce((n, f) => n + base64Bytes(f.content), 0) + carried.reduce((n, f) => n + f.size, 0),
+  bytes:
+    own.reduce((n, f) => n + base64Bytes(f.content), 0) + carried.reduce((n, f) => n + f.size, 0),
 });
 
 async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMessage> {
@@ -218,7 +219,8 @@ async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMess
       { maxCount: MAX_ATTACHMENTS, count: totals.count },
     );
   }
-  if (totals.bytes > input.maxAttachmentBytes) throw tooLargeForward(input.maxAttachmentBytes, totals.bytes);
+  if (totals.bytes > input.maxAttachmentBytes)
+    throw tooLargeForward(input.maxAttachmentBytes, totals.bytes);
   return {
     to: input.to,
     cc: input.cc,
@@ -273,7 +275,8 @@ async function downloadOne(
   } catch (e) {
     // Gmail may hand out a new attachment id for the same part, which turns the old one stale.
     // The same file is then found again by name, type and size.
-    const stale = e instanceof ToolError && (e.code === "not_found" || e.code === "invalid_argument");
+    const stale =
+      e instanceof ToolError && (e.code === "not_found" || e.code === "invalid_argument");
     if (!stale) throw e;
     const again = (await listMessageAttachments(a, messageId)).find(
       (x) => x.filename === f.filename && x.mimeType === f.mimeType && x.size === f.size,

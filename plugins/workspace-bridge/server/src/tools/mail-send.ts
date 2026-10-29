@@ -140,8 +140,7 @@ const givenRecipients = (
   tool: string,
   subject: string | undefined,
   args: Parameters<typeof checkRecipients>[1],
-): Promise<Recipients> =>
-  refusing(ctx, a, tool, subject, () => checkRecipients(ctx.env, args));
+): Promise<Recipients> => refusing(ctx, a, tool, subject, () => checkRecipients(ctx.env, args));
 
 /** The caller's own files, checked and capped before any Google call; a refusal is audited. */
 const givenAttachments = (
@@ -201,7 +200,9 @@ function answer(
 
 /** The files an approval summary names: what they are called and about how large, never content. */
 const attachmentsPreview = (
-  files: readonly { content: string; filename?: string | undefined; mimeType?: string | undefined }[] | undefined,
+  files:
+    | readonly { content: string; filename?: string | undefined; mimeType?: string | undefined }[]
+    | undefined,
 ) =>
   (files ?? []).map((f) => ({
     filename: f.filename ?? null,

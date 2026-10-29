@@ -91,11 +91,15 @@ export const attachmentsParam = z
         .string()
         .max(255)
         .optional()
-        .describe("A plain type/subtype such as application/pdf. Defaults to application/octet-stream."),
+        .describe(
+          "A plain type/subtype such as application/pdf. Defaults to application/octet-stream.",
+        ),
       inline: z
         .boolean()
         .optional()
-        .describe("Inline images are not supported: true is refused. Send the file as an attachment."),
+        .describe(
+          "Inline images are not supported: true is refused. Send the file as an attachment.",
+        ),
       id: z.string().max(512).optional().describe("Ignored. Present for compatibility."),
     }),
   )
