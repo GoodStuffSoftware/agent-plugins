@@ -37,30 +37,16 @@ MIT
 
 ## Releases
 
-Versions are driven by [Release Please](https://github.com/googleapis/release-please) from conventional commits, and each plugin under `plugins/` versions **independently**.
+Every plugin under `plugins/` versions **independently** and is released by hand. This repo does not let Actions open pull requests, so changes land on `main` directly and there is no release bot. To release `<plugin>` at version `X.Y.Z`:
 
-```bash
-git commit -m "fix(session-sync): handle a BOM in the sync marker"   # -> patch
-git commit -m "feat(session-sync): support SFTP remotes"             # -> minor
-git commit -m "feat(session-sync)!: rename the remote layout"        # -> major
-```
+1. Set `X.Y.Z` in `plugins/<plugin>/.claude-plugin/plugin.json`, and in any in-code version (`workspace-bridge` also has `plugins/workspace-bridge/server/src/version.ts`).
+2. Sync the marketplace entry: `node scripts/sync-plugins.mjs` (`--check` fails if `marketplace.json` drifts from any `plugin.json`; CI runs it).
+3. Commit: `git commit -am "chore(<plugin>): release X.Y.Z"`.
+4. Push to `main`: `git push origin HEAD:main`.
+5. Tag that commit: `git tag <plugin>@vX.Y.Z && git push origin <plugin>@vX.Y.Z`.
+6. Publish: `gh release create <plugin>@vX.Y.Z --title "<plugin> X.Y.Z" --notes "..."`.
 
-Merging the release PR tags `session-sync@vX.Y.Z` and bumps that plugin's `plugin.json`. CI then syncs the marketplace entry:
-
-```bash
-node scripts/sync-plugins.mjs           # apply
-node scripts/sync-plugins.mjs --check   # CI: fail if out of sync
-```
-
-The check runs on every PR, because a `plugin.json` bump that never reaches `marketplace.json` means users silently never receive the update.
-
-### workspace-bridge (manual releases)
-
-`workspace-bridge` is released by hand, not by Release Please, because this repo does not let Actions open pull requests. It is not listed in `release-please-config.json` or `.release-please-manifest.json`, and `sync-plugins.mjs` skips it for those two files. To release version `X.Y.Z`:
-
-1. Set `X.Y.Z` in `plugins/workspace-bridge/.claude-plugin/plugin.json` and `plugins/workspace-bridge/server/src/version.ts`.
-2. Run `node scripts/sync-plugins.mjs` to update the marketplace entry, then commit (`chore(release): workspace-bridge X.Y.Z`) and push to `main`.
-3. Tag that commit and publish: `git tag workspace-bridge@vX.Y.Z && git push origin workspace-bridge@vX.Y.Z`, then `gh release create workspace-bridge@vX.Y.Z --title "workspace-bridge X.Y.Z" --notes "..."`.
+Existing `CHANGELOG.md` files are history from earlier releases and are no longer generated.
 
 ## Credits
 

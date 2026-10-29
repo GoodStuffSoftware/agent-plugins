@@ -7,12 +7,10 @@ usually not true and never useful to the next person.
 ## Repository and release patterns
 
 **[Nagell/claude-marketplace-template](https://github.com/Nagell/claude-marketplace-template)** — MIT
-The per-plugin independent versioning approach: Release Please with a
-`plugins/<name>/` monorepo, a sync script that discovers plugins and keeps
-`marketplace.json` and the release config aligned with each `plugin.json`, and
-conventional-commit-driven releases. Our `scripts/sync-plugins.mjs` and
-`release-please-config.json` follow this pattern; the implementation is ours,
-the idea is theirs.
+The per-plugin independent versioning approach: a `plugins/<name>/` monorepo
+and a sync script that discovers plugins and keeps `marketplace.json` aligned
+with each `plugin.json`. Our `scripts/sync-plugins.mjs` follows this pattern;
+the implementation is ours, the idea is theirs.
 
 **[ivan-magda/claude-code-plugin-template](https://github.com/ivan-magda/claude-code-plugin-template)** — the most-adopted template of the ones we surveyed.
 Reference for CI validation on every push/PR and for validating each plugin
@@ -46,7 +44,6 @@ project, which is the main standing risk; the version pin is the mitigation.
 
 ## Upstream tooling
 
-- **[Release Please](https://github.com/googleapis/release-please)** (Google, Apache-2.0) — release automation.
 - **[rclone](https://rclone.org)** (MIT) — every storage backend session-sync can use.
 
 ## Discord MCP servers we surveyed

@@ -8,7 +8,7 @@ description: Post a GitHub release's notes to a Discord channel. Use when asked 
 
 **There are zero GitHub Releases across these repos today.**
 
-- `GoodStuffSoftware/agent-plugins` uses release-please — its first Release object appears only once the first release PR is merged.
+- `GoodStuffSoftware/agent-plugins` is released by hand with `gh release create` per plugin tag.
 - `msantoro12/best-sudoku` has roughly 100 tags and 0 Releases. A tag is not a Release object and carries no body; a Release has to be created at tag time, and none have been.
 
 This is the actual state of both repos, not a bug in this skill. If you land here and there's still no Release with a non-empty body, say so and stop — do not fall back to scraping tags or commits to make up for it. That fallback is exactly what the rule below forbids.
