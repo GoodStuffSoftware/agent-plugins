@@ -164,7 +164,7 @@ export interface PendingActionRow {
   grant_id: string;
   status: PendingStatus;
   created_at: number;
-  /** `created_at` + 24 h. */
+  /** `created_at` + 7 days. */
   expires_at: number;
   decided_at: number | null;
   /** JSON text. */

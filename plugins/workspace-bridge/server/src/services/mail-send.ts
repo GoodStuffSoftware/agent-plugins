@@ -117,6 +117,13 @@ export interface SendService {
   ): Promise<SentMessage>;
   readDraft(a: AccountRef, draftId: string): Promise<DraftEnvelope>;
   sendDraft(a: AccountRef, draftId: string): Promise<SentMessage>;
+  /**
+   * Of `addresses` (already checked as plain, lowercase addresses), those the account has sent a
+   * message to before: one batch request of `in:sent to:<address>` lookups. Used by the "hold
+   * sends to new recipients" rule; it fails closed (an address that could not be checked is
+   * left out).
+   */
+  sentTo(a: AccountRef, addresses: readonly string[]): Promise<string[]>;
 }
 
 export const SEND = capability<SendService>("mail.send", "mail");

@@ -14,9 +14,8 @@ import { createSession, SESSION_COOKIE } from "../src/auth/session";
 import { randomId } from "../src/core/crypto";
 import { type AuditLogRow, all, first, type PendingActionRow } from "../src/core/db";
 import { ToolError } from "../src/core/errors";
-import { sendNeedsApproval } from "../src/core/pending";
 import { createRateLimiter } from "../src/core/ratelimit";
-import type { Env } from "../src/env";
+import { config, type Env } from "../src/env";
 import { cleanup } from "../src/index";
 import { compileRegistry } from "../src/registry/compile";
 import { grantIdOf, toolContext } from "../src/registry/context";
@@ -50,7 +49,7 @@ const guardedSend = defineTool({
   annotations: { openWorldHint: true },
   input: z.object({ account: z.string().optional(), to: z.string(), body: z.string() }),
   approval: {
-    when: (_args, ctx) => sendNeedsApproval(ctx.env),
+    when: (_args, ctx) => config(ctx.env).sendApprovalMode === "all",
     async preview(args, ctx) {
       const [a] = await ctx.accounts.resolve(args.account);
       return { account: a?.label, to: args.to };
@@ -77,7 +76,14 @@ afterEach(() => {
 });
 
 /** `env` with overrides; `config()` parses each new object once. */
-const withEnv = (overrides: Partial<Env>): Env => ({ ...env, ...overrides }) as Env;
+// These suites test the guardrails of a send, not the new-recipient rule (test/send-approval.test.ts):
+// approval is off unless a test asks for SEND_REQUIRES_CONFIRM, which with the mode unset means `all`.
+const withEnv = (overrides: Partial<Env>): Env =>
+  ({
+    ...env,
+    SEND_APPROVAL_MODE: "SEND_REQUIRES_CONFIRM" in overrides ? undefined : "off",
+    ...overrides,
+  }) as Env;
 
 function ctxFor(ownerId: string, e: Env = env): ToolContext {
   return toolContext(
@@ -379,7 +385,7 @@ describe("approval gate", () => {
       kind: "full",
       args: { to: "x@example.com", body: BODY_TEXT },
     });
-    expect((row?.expires_at ?? 0) - (row?.created_at ?? 0)).toBe(24 * 3600);
+    expect((row?.expires_at ?? 0) - (row?.created_at ?? 0)).toBe(7 * 86400);
 
     const got = await callTool(ownerId, "full", "get_pending_action", { pendingActionId: id });
     expect(got.json).toMatchObject({ pendingActionId: id, status: "pending", result: null });
@@ -525,7 +531,7 @@ describe("approval gate", () => {
     await linkGoogleAccount(ownerId);
     const { id } = await holdOne(confirmEnv, ownerId);
     await env.DB.prepare(
-      "UPDATE pending_actions SET created_at = created_at - 90000, expires_at = expires_at - 90000 WHERE id = ?",
+      "UPDATE pending_actions SET created_at = created_at - 700000, expires_at = expires_at - 700000 WHERE id = ?",
     )
       .bind(id)
       .run();

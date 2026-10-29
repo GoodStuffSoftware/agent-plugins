@@ -135,7 +135,10 @@ function checkRecipient(name: string, entry: string): string {
   // itself holds angle brackets would make the header say something other than what was checked.
   const angle = value.match(/^(?:"(?:[^"\\]|\\.)*"|[^<>"]*)\s*<([^<>]+)>$/s);
   if (value.includes("<") || value.includes(">")) {
-    if (!angle || angle[1]?.trim().toLowerCase() !== address) {
+    // A display name with an `@` could carry an address-shaped string that a search of the sent
+    // mail matches, so it is refused.
+    const shown = value.slice(0, value.lastIndexOf("<"));
+    if (!angle || angle[1]?.trim().toLowerCase() !== address || shown.includes("@")) {
       throw new ToolError(
         "invalid_argument",
         `Each ${name} entry must be one address such as user@example.com or Name <user@example.com>.`,

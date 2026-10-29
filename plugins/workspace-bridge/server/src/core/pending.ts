@@ -1,10 +1,10 @@
 // Pending actions (ARCHITECTURE s.2, s.3.3, s.4; plan s.10.5, D10 option a): a call whose
-// `approval.when` is true is stored with its exact arguments, endpoint, grant and account for 24 h,
+// `approval.when` is true is stored with its exact arguments, endpoint, grant and account for 7 days,
 // and runs only after the owner approves it on `/approvals/:id` (owner session and CSRF token, so
 // an MCP token can never approve). `web/guardrails.ts` decides and runs it with these helpers.
 
 import { KINDS, type Kind } from "../auth/endpoints";
-import { config, type Env } from "../env";
+import type { Env } from "../env";
 import type { Grant } from "../registry/types";
 import type { AccountRef } from "../services/types";
 import { randomId } from "./crypto";
@@ -62,7 +62,7 @@ export interface PendingDeps {
 }
 
 /** How long an action waits for the owner. */
-export const PENDING_TTL_SECONDS = 24 * 3600;
+export const PENDING_TTL_SECONDS = 7 * 86400;
 /** Largest stored arguments, in characters (D1 rows stay well under their 2 MB cap). */
 export const MAX_PENDING_PARAMS = 1_000_000;
 /** Largest stored result; a bigger one is replaced by a note. */
@@ -73,9 +73,6 @@ export interface StoredCall {
   kind: Kind;
   args: unknown;
 }
-
-/** True when `SEND_REQUIRES_CONFIRM=true`: send tools return it from `approval.when`. */
-export const sendNeedsApproval = (env: Env): boolean => config(env).sendRequiresConfirm;
 
 export function parseStoredCall(params: string): StoredCall | undefined {
   try {
