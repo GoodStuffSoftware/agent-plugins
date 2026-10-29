@@ -55,7 +55,7 @@ Plain reads and draft create and update are also on `/mcp/ro`, a separate read-o
 - **Approvals.** Risky actions are stored, not run. The owner approves them on the server's own page, which an agent cannot do. `get_pending_action` reports the outcome.
 - **Audit log.** Sends, filter changes and shares are logged without message bodies. A kill switch disables all sending at once.
 - **Untrusted content.** Mail, event and file text is wrapped in per-response tagged blocks, and the skill tells agents to treat it as data.
-- **No permanent delete.** Trash only. The server never asks Google for full-mailbox scope.
+- **No permanent delete of mail or files.** Messages, threads and Drive files go to the trash only, and the server never asks Google for full-mailbox scope. Only drafts (`delete_draft`), labels, filters and calendar events are removed outright.
 
 ## Credits
 

@@ -8,8 +8,8 @@ The tools come from your own workspace-bridge server and cover every Google acco
 
 ## Accounts
 
-- Every tool except `list_accounts` and `link_account_url` takes `account`: a label (`work`), an address, or a short id. Omit it for the default account. Call `list_accounts` first when unsure which accounts exist.
-- `account: "all"` works on `search_threads`, `list_events`, `search_events`, `search_files`, `list_recent_files` and `search_contacts`. Every result carries its `account`. To page, pass the answer's `nextPageToken` back as `pageToken`, unchanged.
+- Account-scoped tools take `account`: a label (`work`), an address, or a short id. Omit it for the default account. Call `list_accounts` first when unsure which accounts exist.
+- `account: "all"` works on `search_threads`, `list_events`, `search_events`, `search_files`, `list_recent_files` and `search_contacts` (not on `list_calendars`). Every result carries its `account`. To page, pass the answer's `nextPageToken` back as `pageToken`, unchanged.
 - Ids come back prefixed with the account (`a1:18c2f...`). Pass them back exactly as received; the prefix routes a follow-up call to the right mailbox. A bare id also needs `account`.
 - `needs_relink`: the account must be linked again. Give the user the URL from `link_account_url`; you cannot link or relink yourself. `component_disabled`: the owner switched that part (mail, calendar, files or contacts) off for the account on the server's `/accounts` page.
 
@@ -33,4 +33,4 @@ Routines and unattended runs should use the server's `/mcp/ro` endpoint, added a
 
 ## Deleting
 
-Nothing deletes permanently. Trash is reversible for 30 days (`untrash_message`, `untrash_thread`). Label, filter and calendar-event deletes do remove the item: confirm with the user first.
+Mail and Drive files are never deleted permanently: trash is reversible for 30 days (`untrash_message`, `untrash_thread`). `delete_draft`, `delete_label`, `delete_filter` and `delete_event` do remove the item for good: confirm with the user first.
