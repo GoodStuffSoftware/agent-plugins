@@ -279,10 +279,10 @@ claude plugin marketplace add GoodStuffSoftware/agent-plugins
 ```
 
 ```sh
-claude plugin install workspace-bridge@goodstuff
+claude plugin install workspace-bridge@goodstuff --config server_url=https://mcp.example.com
 ```
 
-Set `server_url` to `https://mcp.example.com` when prompted. The exact prompt and whether the plugin also registers the MCP server for you are decided at release 0.1.0. If you already added the connector in section 8, leave `server_url` empty to avoid a duplicate.
+`server_url` is your server's base URL, with no trailing slash and no `/mcp`. Inside Claude Code, `/plugin install workspace-bridge@goodstuff` opens a dialog that asks for it instead, and `/plugin configure` changes it later. The setting is required and has no default. The plugin registers the HTTP MCP server at `<server_url>/mcp` for you, so skip the `claude mcp add` command in section 8 when you use the plugin. If you already added that connector, you will see the tools twice: remove one of the two.
 
 ## 10. Link accounts and choose components (details finalized at release 0.1.0)
 

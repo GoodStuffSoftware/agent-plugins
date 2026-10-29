@@ -1,0 +1,30 @@
+{
+  "name": "workspace-bridge",
+  "description": "Use several Google accounts (Gmail, Calendar, Drive, Contacts) from Claude through your own self-hosted MCP server on Cloudflare Workers. Multi-account, with owner approval for risky actions and a read-only endpoint for routines.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Good Stuff Software",
+    "url": "https://github.com/GoodStuffSoftware"
+  },
+  "homepage": "https://github.com/GoodStuffSoftware/agent-plugins/tree/main/plugins/workspace-bridge",
+  "repository": "https://github.com/GoodStuffSoftware/agent-plugins",
+  "license": "MIT",
+  "keywords": [
+    "google-workspace",
+    "gmail",
+    "calendar",
+    "drive",
+    "contacts",
+    "mcp",
+    "cloudflare-workers",
+    "self-hosted"
+  ],
+  "userConfig": {
+    "server_url": {
+      "type": "string",
+      "title": "Server URL",
+      "description": "Base URL of your own deployed workspace-bridge server, with no trailing slash and no /mcp suffix, for example https://mcp.example.com",
+      "required": true
+    }
+  }
+}

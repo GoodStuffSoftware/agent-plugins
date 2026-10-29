@@ -17,6 +17,12 @@
       "source": "./plugins/session-sync",
       "description": "Roam Claude Code conversations between machines. Syncs the transcripts AND the desktop app's session index, so chats come back in the sidebar instead of only via `claude --resume`.",
       "version": "0.3.0"
+    },
+    {
+      "name": "workspace-bridge",
+      "source": "./plugins/workspace-bridge",
+      "description": "Use several Google accounts (Gmail, Calendar, Drive, Contacts) from Claude through your own self-hosted MCP server on Cloudflare Workers. Multi-account, with owner approval for risky actions and a read-only endpoint for routines.",
+      "version": "0.1.0"
     }
   ]
 }
