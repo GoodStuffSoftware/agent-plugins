@@ -17,7 +17,8 @@ import {
 } from "@cloudflare/workers-oauth-provider";
 import { base64url, randomBytes, sha256 } from "../core/crypto";
 import { config, type Env } from "../env";
-import { html, htmlResponse, page, SECURITY_HEADERS } from "../web/html";
+import { htmlResponse, page, SECURITY_HEADERS } from "../web/html";
+import { consentView, noticeView } from "../web/views";
 import {
   ALL_SCOPES,
   endpointScopes,
@@ -59,7 +60,7 @@ export function signinClient(env: Env): GoogleClient | undefined {
 
 /** A small HTML page that is never cached. */
 export function notice(status: number, title: string, message: string): Response {
-  const res = htmlResponse(page(title, html`<h1>${title}</h1><p>${message}</p>`), status);
+  const res = htmlResponse(page(title, noticeView(title, message)), status);
   res.headers.set("Cache-Control", "no-store");
   return res;
 }
@@ -162,29 +163,19 @@ async function consentPage(
   const about = await api.describeConsent(request);
   const consent = await api.beginConsent(request);
   const csrf = await csrfToken(env, session);
-  const choices = SCOPES[kind].map(
-    (scope) =>
-      html`<li><label><input type="checkbox" name="scope" value="${scope}" checked> ${SCOPE_LABELS[scope]}</label></li>`,
-  );
-  const body = html`<h1>Authorize ${about.clientName}</h1>
-<p>${
-    about.clientDomain
-      ? html`Client domain: <strong>${about.clientDomain}</strong>`
-      : html`This client named itself; the name is not verified.`
-  }</p>
-<p>Tokens go to <strong>${about.redirectHost}</strong> (<code>${about.redirectUri}</code>).</p>
-${
-  about.redirectIsLoopback &&
-  html`<p><strong>Warning:</strong> the tokens go to a program on this computer. Any local program could be listening, whatever name the client gives.</p>`
-}
-<p>Endpoint: <code>${PATH[kind]}</code> (${ENDPOINT_LABELS[kind]}). Signed in as ${session.email}.</p>
-<form method="post" action="/authorize">
-<input type="hidden" name="handle" value="${consent.handle}">
-<input type="hidden" name="csrf" value="${csrf}">
-<ul>${choices}</ul>
-<button type="submit" name="decision" value="approve">Approve</button>
-<button type="submit" name="decision" value="deny">Deny</button>
-</form>`;
+  const body = consentView({
+    clientName: about.clientName,
+    clientDomain: about.clientDomain,
+    redirectHost: about.redirectHost,
+    redirectUri: about.redirectUri,
+    loopback: about.redirectIsLoopback,
+    path: PATH[kind],
+    endpointLabel: ENDPOINT_LABELS[kind],
+    email: session.email,
+    handle: consent.handle,
+    csrf,
+    choices: SCOPES[kind].map((scope) => ({ scope, label: SCOPE_LABELS[scope] })),
+  });
   const res = htmlResponse(page(`Authorize ${about.clientName}`, body));
   for (const [name, value] of consent.headers) {
     if (name.toLowerCase() !== "set-cookie") res.headers.set(name, value);

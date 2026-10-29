@@ -21,7 +21,8 @@ import {
   revokeToken,
   scopesFor,
 } from "../providers/google/base";
-import { html, htmlResponse, page } from "../web/html";
+import { htmlResponse, page } from "../web/html";
+import { noticeView } from "../web/views";
 import { redirect } from "./consent";
 import { createFlow, FLOW_COOKIE } from "./flow-state";
 import {
@@ -116,13 +117,7 @@ function log(event: string, fields: Record<string, unknown>): void {
 
 /** A no-store page with a link back to `/accounts`. */
 function linkNotice(status: number, title: string, message: string): Response {
-  const res = htmlResponse(
-    page(
-      title,
-      html`<h1>${title}</h1><p>${message}</p><p><a href="/accounts">Back to accounts</a></p>`,
-    ),
-    status,
-  );
+  const res = htmlResponse(page(title, noticeView(title, message, true)), status);
   res.headers.set("Cache-Control", "no-store");
   return res;
 }

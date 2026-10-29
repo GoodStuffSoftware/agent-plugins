@@ -32,7 +32,8 @@ import { config, type Env } from "../env";
 import { REGISTRY, type Registry } from "../registry/compile";
 import { type RequestScope, toolContext } from "../registry/context";
 import type { ToolContext } from "../registry/types";
-import { html, htmlResponse, page, type SafeHtml } from "./html";
+import { htmlResponse, page, type SafeHtml } from "./html";
+import { approvalView, auditView } from "./views";
 
 const PENDING_ID = /^pa_[a-z2-7]{16}$/;
 
@@ -185,48 +186,6 @@ function newRecipientsOf(preview: string): string[] {
 
 const domainOf = (address: string): string => address.slice(address.lastIndexOf("@") + 1);
 
-/**
- * The decision form of a send held because of new recipients: approve once, approve and allow the
- * checked addresses (or the one address), approve and allow a whole domain (never a public mail
- * provider), reject. One POST, one CSRF token.
- */
-function newRecipientForm(
-  id: string,
-  csrf: string,
-  fresh: readonly string[],
-  mailbox: string,
-): SafeHtml {
-  const plain = fresh.filter(isQueryableAddress);
-  const domains = [...new Set(plain.map(domainOf))].filter((d) => !isFreemailDomain(d));
-  const hidden = html`<input type="hidden" name="csrf" value="${csrf}">`;
-  const only = plain.length === 1 ? plain[0] : undefined;
-  return html`<h2>New recipients</h2>
-<p>${fresh.length === 1 ? "This recipient is" : "These recipients are"} new to ${mailbox}: never written to from it, not in its contacts and not on its allow list. The send waits until you decide.</p>
-<form method="post" action="/approvals/${id}">
-${hidden}
-<ul>${fresh.map((a) =>
-    isQueryableAddress(a) && only === undefined
-      ? html`<li><label><input type="checkbox" name="allow" value="${a}"> ${a}</label></li>`
-      : html`<li>${a}</li>`,
-  )}</ul>
-${only === undefined ? "" : html`<input type="hidden" name="allow" value="${only}">`}
-<p><button name="decision" value="approve">Approve once</button></p>
-${
-  only === undefined
-    ? plain.length > 1
-      ? html`<p><button name="decision" value="approve_allow">Approve and always allow the checked addresses</button></p>`
-      : ""
-    : html`<p><button name="decision" value="approve_allow">Approve and always allow ${only}</button></p>`
-}
-${domains.map(
-  (d) =>
-    html`<p><button name="decision" value="approve_domain:${d}">Approve and always allow @${d}</button></p>`,
-)}
-<p><button name="decision" value="reject">Reject</button></p>
-</form>
-<p>"Always allow" adds to the allow list of ${mailbox} only; you can remove entries on <a href="/accounts">Accounts</a>. Approving once adds nothing, but the recipients count as known after the send goes out.</p>`;
-}
-
 /** What an approval writes to the allow list of the held send's account; refused as a whole. */
 type AllowRequest = { entries: { kind: AllowKind; value: string }[] } | { refusal: string };
 
@@ -265,38 +224,31 @@ function allowRequest(decision: string, form: FormData, fresh: readonly string[]
 async function approvalBody(env: Env, row: PendingActionRow, csrf: string): Promise<SafeHtml> {
   const info = pendingInfo(row, nowSeconds());
   const account = row.account_id ? await getAccount(env.DB, row.owner_id, row.account_id) : null;
-  const where = account ? html` on <strong>${account.label}</strong> (${account.address})` : "";
   const fresh = newRecipientsOf(row.preview);
-  const decide =
-    info.status !== "pending"
-      ? ""
-      : fresh.length > 0 && row.account_id !== null
-        ? newRecipientForm(row.id, csrf, fresh, account?.address ?? "this mailbox")
-        : html`<form method="post" action="/approvals/${row.id}">
-<input type="hidden" name="csrf" value="${csrf}">
-<button name="decision" value="approve">Approve</button>
-<button name="decision" value="reject">Reject</button>
-</form>`;
-  const result =
-    info.result === null
-      ? ""
-      : html`<h2>Result</h2><pre>${JSON.stringify(info.result, null, 2)}</pre>`;
-  return html`<h1>Approve an action</h1>
-<p>An MCP client asked to run <strong>${row.tool}</strong>${where}. Nothing happens unless you approve it here.</p>
-<dl>
-<dt>Status</dt><dd>${info.status}</dd>
-<dt>Requested</dt><dd>${iso(row.created_at)}</dd>
-<dt>Expires</dt><dd>${iso(row.expires_at)}</dd>
-<dt>Client</dt><dd>${row.client_id}</dd>
-</dl>
-<h2>Preview</h2>
-<pre>${JSON.stringify(info.preview, null, 2) ?? "null"}</pre>
-<h2>Exact arguments</h2>
-<p>This is what runs if you approve, whatever the preview says.</p>
-<pre>${storedArgs(row.params)}</pre>
-${decide}
-${result}
-<p><a href="/accounts">Accounts</a></p>`;
+  const mailbox = account?.address ?? "this mailbox";
+  const plain = fresh.filter(isQueryableAddress);
+  return approvalView({
+    id: row.id,
+    csrf,
+    tool: row.tool,
+    status: info.status,
+    clientId: row.client_id,
+    requested: iso(row.created_at),
+    expires: iso(row.expires_at),
+    account: account ? { label: account.label, address: account.address } : null,
+    preview: info.preview,
+    previewJson: JSON.stringify(info.preview, null, 2) ?? "null",
+    args: storedArgs(row.params),
+    resultJson: info.result === null ? null : JSON.stringify(info.result, null, 2),
+    held:
+      fresh.length > 0 && row.account_id !== null
+        ? {
+            fresh: fresh.map((address) => ({ address, queryable: isQueryableAddress(address) })),
+            mailbox,
+            domains: [...new Set(plain.map(domainOf))].filter((d) => !isFreemailDomain(d)),
+          }
+        : null,
+  });
 }
 
 const MAX_ARGS_SHOWN = 20_000;
@@ -328,7 +280,9 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     const row = PENDING_ID.test(id) ? await loadPending(env.DB, session.ownerId, id) : null;
     if (!row) return message(404, "Not found", "No pending action has that id.");
     const csrf = await csrfToken(env, session);
-    return noStore(htmlResponse(page("Approve an action", await approvalBody(env, row, csrf))));
+    return noStore(
+      htmlResponse(page("Approve an action", await approvalBody(env, row, csrf), { nav: "other" })),
+    );
   });
 
   routes.post("/approvals/:id", async (c) => {
@@ -486,28 +440,26 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     const enabled = config(env).sendEnabled;
     const csrf = await csrfToken(env, session);
     const last = rows.at(-1);
-    const body = html`<h1>Sending and audit log</h1>
-<p>Server setting SEND_ENABLED: <strong>${enabled ? "true" : "false"}</strong>. Owner switch: <strong>${switchedOff ? "sending off" : "sending on"}</strong>. Mail is sent only when both allow it.</p>
-<form method="post" action="/accounts/send-switch">
-<input type="hidden" name="csrf" value="${csrf}">
-<input type="hidden" name="sending" value="${switchedOff ? "on" : "off"}">
-<button>${switchedOff ? "Switch sending on" : "Switch sending off"}</button>
-</form>
-<h2>Audit log</h2>
-<table>
-<thead><tr><th>Time (UTC)</th><th>Account</th><th>Tool</th><th>Result</th><th>From</th><th>To, cc, bcc</th><th>Subject</th><th>Detail</th><th>Client</th></tr></thead>
-<tbody>
-${rows.map(
-  (
-    r,
-  ) => html`<tr><td>${iso(r.at)}</td><td>${r.account_id ? (labels.get(r.account_id) ?? r.account_id) : ""}</td><td>${r.tool}</td><td>${r.result}</td><td>${r.from_addr ?? ""}</td><td>${[addresses(r.to_addrs), addresses(r.cc_addrs), addresses(r.bcc_addrs)].filter((x) => x).join("; ")}</td><td>${r.subject ?? ""}</td><td>${r.detail ?? ""}</td><td>${r.client_id ?? ""}</td></tr>
-`,
-)}
-</tbody>
-</table>
-${rows.length === 100 && last ? html`<p><a href="/accounts/audit?before=${last.at}-${last.id}">Older entries</a></p>` : ""}
-<p><a href="/accounts">Accounts</a></p>`;
-    return noStore(htmlResponse(page("Sending and audit log", body)));
+    const body = auditView({
+      csrf,
+      sendEnabled: enabled,
+      switchedOff,
+      rows: rows.map((r) => ({
+        at: iso(r.at),
+        account: r.account_id ? (labels.get(r.account_id) ?? r.account_id) : "",
+        tool: r.tool,
+        result: r.result,
+        from: r.from_addr ?? "",
+        recipients: [addresses(r.to_addrs), addresses(r.cc_addrs), addresses(r.bcc_addrs)]
+          .filter((x) => x)
+          .join("; "),
+        subject: r.subject ?? "",
+        detail: r.detail ?? "",
+        client: r.client_id ?? "",
+      })),
+      older: rows.length === 100 && last ? `${last.at}-${last.id}` : null,
+    });
+    return noStore(htmlResponse(page("Sending and audit log", body, { nav: "audit" })));
   });
 
   return routes;

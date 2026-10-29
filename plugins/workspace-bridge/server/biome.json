@@ -6,7 +6,8 @@
       "!node_modules",
       "!.wrangler",
       "!test/fixtures",
-      "!worker-configuration.d.ts"
+      "!worker-configuration.d.ts",
+      "!src/web/theme.generated.ts"
     ]
   },
   "formatter": { "indentStyle": "space", "indentWidth": 2, "lineWidth": 100 },

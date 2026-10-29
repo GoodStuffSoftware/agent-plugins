@@ -35,24 +35,16 @@ import { config, type Env } from "../env";
 import {
   ACCOUNT_COMPONENTS,
   type AccountComponent,
-  excessScopes,
   grantedComponents,
   isAccountComponent,
   parseScopes,
   revokeToken,
   scopesFor,
 } from "../providers/google/base";
-import { html, htmlResponse, page, type SafeHtml } from "./html";
+import { htmlResponse, page } from "./html";
+import { type AllowEntryView, accountsView, noticeView } from "./views";
 
 export const accountsRoutes = new Hono<{ Bindings: Env }>();
-
-const COMPONENT_LABELS: Readonly<Record<AccountComponent, string>> = {
-  mail: "Mail: read, organize, drafts, filters",
-  "mail.send": "Mail: send",
-  calendar: "Calendar",
-  files: "Drive files",
-  contacts: "Contacts",
-};
 
 const ADDRESS = /^[^\s@]+@[^\s@]+$/;
 
@@ -64,13 +56,7 @@ function noStore(res: Response): Response {
 
 function result(status: number, title: string, message: string): Response {
   return noStore(
-    htmlResponse(
-      page(
-        title,
-        html`<h1>${title}</h1><p>${message}</p><p><a href="/accounts">Back to accounts</a></p>`,
-      ),
-      status,
-    ),
+    htmlResponse(page(title, noticeView(title, message, true), { nav: "other" }), status),
   );
 }
 
@@ -94,126 +80,37 @@ function components(account: AccountRow): AccountComponent[] {
   }
 }
 
-function postForm(action: string, csrf: string, fields: [string, string][], button: string) {
-  return html`<form method="post" action="${action}" style="display:inline">
-<input type="hidden" name="csrf" value="${csrf}">
-${fields.map(([name, value]) => html`<input type="hidden" name="${name}" value="${value}">`)}
-<button type="submit">${button}</button>
-</form>`;
-}
-
-function accountRow(account: AccountRow, isDefault: boolean, csrf: string): SafeHtml {
-  const on = components(account);
-  const id: [string, string] = ["account", account.id];
-  const excess = excessScopes(on, parseScopes(account.granted_scopes));
-  return html`<tr>
-<td>${account.label}
-<form method="post" action="/accounts/rename" style="display:inline">
-<input type="hidden" name="csrf" value="${csrf}">
-<input type="hidden" name="account" value="${account.id}">
-<input name="label" required maxlength="${LABEL_MAX}" value="${account.label}" title="${LABEL_RULE}" aria-label="New label for ${account.address}">
-<button type="submit">Rename</button>
-</form></td>
-<td>${account.address}</td>
-<td>${account.provider}</td>
-<td><ul>${ACCOUNT_COMPONENTS.map((c) => {
-    const isOn = on.includes(c);
-    return html`<li>${COMPONENT_LABELS[c]}: ${isOn ? "on" : "off"} ${postForm(
-      "/accounts/component",
-      csrf,
-      [id, ["component", c], ["on", isOn ? "0" : "1"]],
-      isOn ? "Turn off" : "Turn on",
-    )}</li>`;
-  })}</ul></td>
-<td>${account.status === "ok" ? "ok" : "needs re-link"}</td>
-<td>${isDefault ? "default" : ""}</td>
-<td>${postForm("/accounts/unlink", csrf, [id], "Unlink")}
-${account.status === "ok" ? "" : postForm("/accounts/relink", csrf, [id], "Re-link")}
-${excess.length > 0 ? postForm("/accounts/relink-minimal", csrf, [id], "Re-link minimal") : ""}</td>
-</tr>`;
-}
-
-function accountsTable(accounts: AccountRow[], defaultId: string | null, csrf: string): SafeHtml {
-  if (accounts.length === 0) return html`<p>No mailbox is linked yet.</p>`;
-  return html`<table>
-<thead><tr><th>Label</th><th>Address</th><th>Provider</th><th>Components</th><th>Status</th><th>Default</th><th></th></tr></thead>
-<tbody>${accounts.map((a) => accountRow(a, a.id === defaultId, csrf))}</tbody>
-</table>
-<p>A component switched off stops working at once. Google keeps the old access until you press "Re-link minimal", which revokes it and asks again for only the components that are on.</p>`;
-}
-
 const iso = (seconds: number): string => new Date(seconds * 1000).toISOString();
 
 const isAllowKind = (v: unknown): v is AllowKind => v === "address" || v === "domain";
 
-/** The allow list of each linked mailbox: what it may send to without approval, add and remove. */
-async function allowLists(
+/** The allow list of each linked mailbox: what it may send to without approval. */
+async function allowEntries(
   env: Env,
   ownerId: string,
   accounts: AccountRow[],
-  csrf: string,
-): Promise<SafeHtml> {
-  if (accounts.length === 0) return html``;
-  const sections: SafeHtml[] = [];
+): Promise<Map<string, AllowEntryView[]>> {
+  const out = new Map<string, AllowEntryView[]>();
   for (const a of accounts) {
     const entries = await listSendAllow(env.DB, ownerId, a.id);
-    sections.push(html`<h3>${a.label} (${a.address})</h3>
-${
-  entries.length === 0
-    ? html`<p>Nothing is allowed yet.</p>`
-    : html`<table>
-<thead><tr><th>Type</th><th>Allowed</th><th>Added (UTC)</th><th></th></tr></thead>
-<tbody>${entries.map(
-        (e) =>
-          html`<tr><td>${e.kind}</td><td>${e.kind === "domain" ? `@${e.value}` : e.value}</td><td>${iso(e.createdAt)}</td><td>${postForm(
-            "/accounts/allow/remove",
-            csrf,
-            [
-              ["account", a.id],
-              ["kind", e.kind],
-              ["value", e.value],
-            ],
-            "Remove",
-          )}</td></tr>`,
-      )}</tbody>
-</table>`
-}
-<form method="post" action="/accounts/allow">
-<input type="hidden" name="csrf" value="${csrf}">
-<input type="hidden" name="account" value="${a.id}">
-<p><label>Add <select name="kind"><option value="address">an address</option><option value="domain">a whole domain</option></select></label>
-<input name="value" required maxlength="254" placeholder="name@example.com or example.com" aria-label="Address or domain to allow for ${a.address}">
-<button type="submit">Add</button></p>
-</form>`);
+    out.set(
+      a.id,
+      entries.map((e) => ({ kind: e.kind, value: e.value, added: iso(e.createdAt) })),
+    );
   }
-  return html`<h2>Allowed recipients</h2>
-<p>A send to anyone who is not yours, not on a mailbox's list, never sent to and not in its contacts waits for your approval. Addresses and domains listed here go out without approval. A domain covers only that exact domain, not its subdomains, and public mail providers such as gmail.com cannot be allowed as a whole domain.</p>
-${sections}`;
+  return out;
 }
 
-function defaultForm(accounts: AccountRow[], defaultId: string | null, csrf: string): SafeHtml {
-  if (accounts.length === 0) return html``;
-  return html`<h2>Default mailbox</h2>
-<form method="post" action="/accounts/default">
-<input type="hidden" name="csrf" value="${csrf}">
-<p><label>Used when a tool names no mailbox
-<select name="account">
-<option value=""${defaultId === null ? " selected" : ""}>none</option>
-${accounts.map(
-  (a) =>
-    html`<option value="${a.id}"${a.id === defaultId ? " selected" : ""}>${a.label} (${a.address})</option>`,
-)}
-</select></label>
-<button type="submit">Save</button></p>
-</form>`;
-}
-
-async function encryptionForm(env: Env, ownerId: string, csrf: string): Promise<SafeHtml> {
+/** The token key version and how many stored tokens use another, or null when no key is set. */
+async function encryptionState(
+  env: Env,
+  ownerId: string,
+): Promise<{ version: number; old: number } | null> {
   let version: number;
   try {
     version = currentKeyVersion(env);
   } catch {
-    return html``;
+    return null;
   }
   const old = await first<{ n: number }>(
     env.DB,
@@ -222,26 +119,7 @@ async function encryptionForm(env: Env, ownerId: string, csrf: string): Promise<
     ownerId,
     version,
   );
-  return html`<h2>Token encryption</h2>
-<p>New tokens are sealed under key version ${version}. ${old?.n ?? 0} stored token(s) use another version; they move on their next refresh, or all at once here.</p>
-${postForm("/accounts/reencrypt", csrf, [], "Re-encrypt all tokens")}`;
-}
-
-function linkForm(csrf: string): SafeHtml {
-  return html`<h2>Link a mailbox</h2>
-<form method="post" action="/accounts/link">
-<input type="hidden" name="csrf" value="${csrf}">
-<p><label>Label <input name="label" required maxlength="${LABEL_MAX}" title="${LABEL_RULE}" placeholder="Personal" aria-describedby="label-help"></label><br>
-<small id="label-help">${LABEL_RULE} Capitals and spaces are fine; two mailboxes cannot differ only by case.</small></p>
-<p><label>Google address (optional) <input type="email" name="login_hint" maxlength="254"></label></p>
-<fieldset><legend>Components</legend>
-<ul>${ACCOUNT_COMPONENTS.map(
-    (c) =>
-      html`<li><label><input type="checkbox" name="components" value="${c}" checked> ${COMPONENT_LABELS[c]}</label></li>`,
-  )}</ul>
-</fieldset>
-<button type="submit">Link with Google</button>
-</form>`;
+  return { version, old: old?.n ?? 0 };
 }
 
 accountsRoutes.get("/", async (c) => {
@@ -266,20 +144,19 @@ accountsRoutes.get("/", async (c) => {
     .split(",")
     .filter(isAccountComponent);
   const relinked = new URL(c.req.url).searchParams.get("relinked");
-  const body = html`<h1>Linked mailboxes</h1>
-${relinked ? html`<p><strong>Re-linked ${relinked}.</strong> A linked mailbox keeps its label; use Rename to change its name.</p>` : ""}
-<p>Signed in as ${session.email}. <a href="/accounts/audit">Sending switch and audit log</a></p>
-${
-  partial.length > 0
-    ? html`<p><strong>Google did not grant everything asked for.</strong> These stay off: ${partial.map((p) => COMPONENT_LABELS[p]).join(", ")}.</p>`
-    : ""
-}
-${accountsTable(accounts, defaultId, csrf)}
-${await allowLists(env, session.ownerId, accounts, csrf)}
-${defaultForm(accounts, defaultId, csrf)}
-${linkForm(csrf)}
-${accounts.length > 0 ? await encryptionForm(env, session.ownerId, csrf) : ""}`;
-  return noStore(htmlResponse(page("Linked mailboxes", body)));
+  const body = accountsView({
+    email: session.email,
+    csrf,
+    accounts,
+    defaultId,
+    allow: await allowEntries(env, session.ownerId, accounts),
+    encryption: accounts.length > 0 ? await encryptionState(env, session.ownerId) : null,
+    relinked,
+    partial,
+    labelMax: LABEL_MAX,
+    labelRule: LABEL_RULE,
+  });
+  return noStore(htmlResponse(page("Linked mailboxes", body, { nav: "accounts" })));
 });
 
 /** The session and form of a POST, or the refusal page: no session, or a missing or wrong CSRF. */

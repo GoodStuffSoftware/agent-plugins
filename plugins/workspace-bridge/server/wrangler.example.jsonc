@@ -7,6 +7,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "workspace-bridge",
   "main": "src/index.ts",
+  // Bundles server/theme/ (or $WB_THEME_DIR) into the Worker; see docs/SELF-HOSTING.md, "Theming".
+  "build": { "command": "node scripts/build-theme.mjs" },
   "compatibility_date": "2026-10-28",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
   "routes": [{ "pattern": "mcp.example.com", "custom_domain": true }],

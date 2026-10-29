@@ -424,3 +424,82 @@ The next rotation uses `TOKEN_KEK_v3` and `"CURRENT_KEY_VERSION": "3"`.
 **Custom domain does not answer, or the certificate is not ready.** Cloudflare creates the DNS record and issues the certificate on the first deploy. This can take a few minutes. Check that the zone is on Cloudflare, that no other DNS record already uses the host, and that `routes[0].pattern` matches the host without `https://`. Retry after a few minutes before changing anything.
 
 **Workspace admin blocks the app.** Do the Trusted step in section 5.
+
+## Theming
+
+Every owner and public page (`/`, `/privacy`, `/accounts`, the audit log, approvals, consent, notices) uses one layout and one stylesheet, driven by CSS custom properties. The default is a neutral light and dark look. To restyle it you add files; you do not fork code.
+
+### A theme is a directory
+
+```
+theme/
+  theme.css        optional. CSS appended after the base sheet.
+  name.txt         optional. Product name in the header, one line, at most 40 characters.
+  assets/
+    logo.svg       optional. Header logo.
+    logo-dark.svg  optional. Logo shown instead of logo.svg in dark mode.
+    *.svg          optional. Backgrounds or other images.
+    *.woff2        optional. Fonts.
+```
+
+The repository ships `plugins/workspace-bridge/server/theme/` with a `theme.css` that changes nothing. A deploy swaps that directory, or points `WB_THEME_DIR` at another one.
+
+### Build step
+
+`npm run build:theme` (also run by `wrangler deploy` through `build.command` in `wrangler.example.jsonc`) reads the directory and writes `server/src/web/theme.generated.ts`, which the Worker bundles. Use another directory with:
+
+```sh
+WB_THEME_DIR=/path/to/my-theme npx wrangler deploy
+```
+
+Building with another directory overwrites `server/src/web/theme.generated.ts`, a tracked file. If that checkout is a clone of the public repository, do not commit it; restore it with `git checkout src/web/theme.generated.ts` after the deploy.
+
+If your own `wrangler.jsonc` replaces the `build` block, keep a `build.command` that runs `node scripts/build-theme.mjs` from the `server` directory. `npm test` checks that the generated file matches `theme/`, so unset `WB_THEME_DIR` when you run tests, or run `npm run build:theme` first.
+
+### What CSS may change
+
+Override custom properties on `:root` in `theme.css`. Colours also have dark values: the base sheet sets them inside `@media (prefers-color-scheme: dark)`, and a plain `:root` rule in your theme beats them in both modes. So set a colour's dark value inside the same media query:
+
+```css
+:root { --wb-accent: #7a3cff; --wb-radius: .25rem; }
+@media (prefers-color-scheme: dark) { :root { --wb-accent: #b79bff; --wb-accent-text: #14002e; } }
+```
+
+| Group | Properties |
+|---|---|
+| Fonts | `--wb-font-body`, `--wb-font-heading`, `--wb-font-mono`, `--wb-font-size`, `--wb-line-height` |
+| Page | `--wb-bg`, `--wb-page-bg` (any CSS background: colour, gradient, `url(/theme/assets/bg.svg) center / cover fixed`), `--wb-surface`, `--wb-surface-2`, `--wb-text`, `--wb-text-muted`, `--wb-border`, `--wb-border-strong`, `--wb-code-bg` |
+| Accent and links | `--wb-accent`, `--wb-accent-text`, `--wb-accent-soft`, `--wb-link`, `--wb-focus` |
+| Approve and reject | `--wb-approve`, `--wb-approve-text`, `--wb-approve-soft`, `--wb-reject`, `--wb-reject-text`, `--wb-reject-soft` |
+| Warnings | `--wb-warn`, `--wb-warn-soft`, `--wb-warn-border` |
+| Header | `--wb-header-bg`, `--wb-header-text`, `--wb-header-border`, `--wb-logo-height` |
+| Shape | `--wb-radius-sm`, `--wb-radius`, `--wb-radius-lg`, `--wb-radius-button` |
+| Spacing | `--wb-space-xs`, `--wb-space-s`, `--wb-space-m`, `--wb-space-l`, `--wb-space-xl`, `--wb-content-width`, `--wb-tap` |
+| Shadows | `--wb-shadow-card`, `--wb-shadow-button` |
+
+Keep Approve and Reject clearly different, and `--wb-tap` at 2.75rem or more. The defaults are in `server/src/web/style.ts`. You can also add your own rules to `theme.css`.
+
+### Fonts, logo and images
+
+Put files in `assets/` and refer to them as `/theme/assets/<file>`:
+
+```css
+@font-face { font-family: "My Font"; src: url(/theme/assets/my-font.woff2) format("woff2"); font-display: swap; }
+:root { --wb-font-body: "My Font", system-ui, sans-serif; }
+```
+
+The Worker serves them itself, so the Content Security Policy stays `default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'`. Nothing can load from another origin. It works on the Workers Free plan; the theme counts toward the script size cap in section 2.
+
+### Limits
+
+The checks below are a lint that catches mistakes; they are not a security boundary and clever escapes can slip past them. The boundary is the Content Security Policy above plus the sandboxed asset responses, which stop any page from loading another origin. A saved snapshot opened from disk has no such policy, so its preview can load more than the live site would. `build:theme` fails, naming the file, on any of these: `theme.css` over 64 KB, an SVG over 128 KB, a woff2 over 300 KB, the whole theme over 1.5 MB, `name.txt` over 40 characters or more than one line, `@import` or a `url()` to another origin in the CSS, `</style` in the CSS, scripts, event handlers, `foreignObject` or links to other origins in an SVG, a file that is not `.svg` or a real woff2, asset names other than lowercase letters, digits, `.`, `_` and `-`, and any other file or directory at the top.
+
+### Preview without a server
+
+```sh
+cd plugins/workspace-bridge/server
+npm run snapshots -- ./out                  # the theme in ./theme
+npm run snapshots -- ./out /path/to/my-theme
+```
+
+This writes every page with example.com sample data to `out/*.html` plus `out/index.html`, and copies the theme's assets to `out/theme/assets/`. Open `index.html` from disk: no sign-in and no Worker. Forms are inert.

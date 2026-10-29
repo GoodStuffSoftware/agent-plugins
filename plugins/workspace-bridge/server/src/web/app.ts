@@ -7,6 +7,7 @@ import { accountsRoutes } from "./accounts";
 import { guardrailsRoutes } from "./guardrails";
 import { withSecurityHeaders } from "./html";
 import { publicRoutes } from "./public";
+import { themeRoutes } from "./theme-routes";
 
 export const app = new Hono<{ Bindings: Env }>();
 
@@ -16,5 +17,6 @@ app.use("*", async (c, next) => {
 });
 
 app.route("/", publicRoutes);
+app.route("/theme", themeRoutes);
 app.route("/accounts", accountsRoutes);
 app.route("/", guardrailsRoutes());

@@ -1,5 +1,8 @@
 // Escaping `html` tagged template, page shell and security headers (ARCHITECTURE s.2).
 
+import { BASE_CSS } from "./style";
+import { assetUrl, getTheme, themeCss } from "./theme";
+
 const ESCAPES: Readonly<Record<string, string>> = {
   "&": "&amp;",
   "<": "&lt;",
@@ -44,23 +47,48 @@ function render(v: HtmlValue): string {
   return escapeHtml(String(v));
 }
 
-const STYLE = raw(
-  "body{font:16px/1.5 system-ui,sans-serif;margin:0;color:#1a1a1a;background:#fafafa}" +
-    "main{max-width:42rem;margin:0 auto;padding:2rem 1rem}h1{font-size:1.6rem}" +
-    "h2{font-size:1.15rem;margin-top:1.75rem}code{font-size:.9em}a{color:#0b57d0}",
-);
+export type NavPage = "accounts" | "audit";
 
-/** A complete HTML document. */
-export function page(title: string, body: SafeHtml): SafeHtml {
+export interface PageOptions {
+  /** Show the owner navigation in the header; the value marks the current page. */
+  nav?: NavPage | "other";
+}
+
+function brand(): SafeHtml {
+  const theme = getTheme();
+  const name = theme.name === "" ? "workspace-bridge" : theme.name;
+  if (!Object.hasOwn(theme.assets, "logo.svg")) {
+    return html`<a class="brand" href="/"><span class="brand-mark" aria-hidden="true"></span><span class="brand-name">${name}</span></a>`;
+  }
+  const dark = Object.hasOwn(theme.assets, "logo-dark.svg")
+    ? html`<source media="(prefers-color-scheme: dark)" srcset="${assetUrl("logo-dark.svg")}">`
+    : "";
+  return html`<a class="brand" href="/"><picture>${dark}<img class="brand-logo" src="${assetUrl("logo.svg")}" alt=""></picture><span class="brand-name">${name}</span></a>`;
+}
+
+function nav(current: PageOptions["nav"]): SafeHtml | "" {
+  if (current === undefined) return "";
+  const link = (target: NavPage, href: string, label: string) =>
+    html`<a href="${href}"${current === target ? raw(' aria-current="page"') : ""}>${label}</a>`;
+  return html`<nav class="site-nav" aria-label="Owner pages">${link("accounts", "/accounts", "Accounts")}${link("audit", "/accounts/audit", "Audit log")}</nav>`;
+}
+
+/** A complete HTML document: the shared layout, the base sheet, then the theme's CSS. */
+export function page(title: string, body: SafeHtml, options: PageOptions = {}): SafeHtml {
   return html`<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>${title}</title>
-<style>${STYLE}</style>
+<style>${raw(BASE_CSS)}</style>
+<style>${raw(themeCss())}</style>
 </head>
-<body><main>${body}</main></body>
+<body>
+<header class="site-header"><div class="site-header-inner">${brand()}${nav(options.nav)}</div></header>
+<main>${body}</main>
+</body>
 </html>`;
 }
 
@@ -77,7 +105,7 @@ export function htmlResponse(doc: SafeHtml, status = 200): Response {
  */
 export const SECURITY_HEADERS: Readonly<Record<string, string>> = {
   "Content-Security-Policy":
-    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-ancestors 'none'",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
   "Referrer-Policy": "no-referrer",
