@@ -267,7 +267,7 @@ describe("link leg", () => {
     expect(account).toMatchObject({
       owner_id: oid,
       short_id: before?.next_short_id,
-      label: "personal",
+      label: "Personal",
       address: OWNER.email,
       provider: "google",
       provider_sub: OWNER.sub,
@@ -328,7 +328,7 @@ describe("link leg", () => {
     ]);
 
     const { html } = await accountsPage(browser);
-    expect(html).toContain("<td>personal</td>");
+    expect(html).toContain("<td>Personal");
     expect(html).toContain(`<td>${OWNER.email}</td>`);
     expect(html).toContain('action="/accounts/unlink"');
     expectNoTokens(html);
@@ -378,15 +378,70 @@ describe("link leg", () => {
       { label: "x", components: ["admin"] },
       { label: "x", components: [] },
       { label: "all" },
-      { label: "two words" },
+      { label: "ALL" },
+      { label: "   " },
       { label: "" },
-      { label: "x".repeat(33) },
+      { label: "x".repeat(65) },
       { label: "x", loginHint: "not-an-address" },
     ]) {
       const res = await postLink(browser, form);
       expect(res.status).toBe(400);
     }
     expect(await linkFlows()).toBe(flows);
+  });
+
+  it("links a free-form label as typed (trimmed) and shows it escaped", async () => {
+    const browser = await signIn({ LINKABLE_EMAILS: `${WORK.email},${OTHER.email}` });
+    expect((await link(browser, { label: "  Mike's <b>Workspace</b>  " }, WORK)).status).toBe(302);
+    expect((await link(browser, { label: "x".repeat(64) }, OTHER)).status).toBe(302);
+    expect((await accounts()).map((a) => a.label)).toContain("Mike's <b>Workspace</b>");
+    const page = (await accountsPage(browser)).html;
+    expect(page).not.toContain("<b>Workspace</b>");
+    expect(page).toContain("Mike&#39;s &lt;b&gt;Workspace&lt;/b&gt;");
+    expect(page).toContain("Any name, up to 64 characters.");
+    expect(page).not.toContain("pattern=");
+  });
+
+  it("refuses a label that differs from another only by case", async () => {
+    const browser = await signIn({ LINKABLE_EMAILS: `${WORK.email},${OTHER.email}` });
+    expect((await link(browser, { label: "Shared" }, WORK)).status).toBe(302);
+    expect((await link(browser, { label: "SHARED" }, OTHER)).status).toBe(409);
+    expect(await count("accounts")).toBe(1);
+  });
+
+  it("renames a mailbox without touching its id, tokens or default", async () => {
+    const browser = await signIn({ LINKABLE_EMAILS: `${OWNER.email},${WORK.email}` });
+    const a = await linked(browser, "first");
+    expect((await link(browser, { label: "second" }, WORK)).status).toBe(302);
+    expect((await control(browser, "default", a)).status).toBe(303);
+    const tokens = await count("account_tokens");
+    expect((await accountsPage(browser)).html).toContain('action="/accounts/rename"');
+
+    const ok = await control(browser, "rename", a, [["label", " Mike's Main <i>"]]);
+    expect(ok.status).toBe(200);
+    const text = await ok.text();
+    expect(text).toContain("Mailbox renamed");
+    expect(text).toContain("Mike&#39;s Main &lt;i&gt;");
+    const after = (await accounts()).find((x) => x.id === a.id) as AccountRow;
+    expect(after.label).toBe("Mike's Main <i>");
+    expect(after.short_id).toBe(a.short_id);
+    expect(after.address).toBe(a.address);
+    expect(await count("account_tokens")).toBe(tokens);
+    expect(await defaultAccount()).toBe(a.id);
+
+    // Same rules as linking: a clash ignoring case, "all", empty, too long.
+    expect((await control(browser, "rename", a, [["label", "SECOND"]])).status).toBe(409);
+    for (const label of ["All", "  ", "x".repeat(65)]) {
+      expect((await control(browser, "rename", a, [["label", label]])).status).toBe(400);
+    }
+    // Not another mailbox's address, and the case rule holds beyond ASCII.
+    expect((await control(browser, "rename", a, [["label", WORK.email]])).status).toBe(409);
+    const b = (await accounts()).find((x) => x.address === WORK.email) as AccountRow;
+    expect((await control(browser, "rename", b, [["label", "École"]])).status).toBe(200);
+    expect((await control(browser, "rename", a, [["label", "ÉCOLE"]])).status).toBe(409);
+    // Keeping its own label in another case is allowed.
+    expect((await control(browser, "rename", a, [["label", "mike's main <I>"]])).status).toBe(200);
+    expect((await accounts()).find((x) => x.id === a.id)?.label).toBe("mike's main <I>");
   });
 
   it("stores the scopes Google granted and leaves components without them off", async () => {
@@ -501,7 +556,10 @@ describe("link leg", () => {
     expect(after.id).toBe(before.id);
     expect(after.short_id).toBe(before.short_id);
     expect(after.created_at).toBe(before.created_at);
-    expect(after.label).toBe("job");
+    expect(after.label).toBe("work");
+    expect(res.headers.get("Location")).toContain("relinked=work");
+    const shown = await browser.fetch(res.headers.get("Location") ?? "");
+    expect(await shown.text()).toContain("use Rename to change its name");
     expect(JSON.parse(after.components)).toEqual(["mail", "calendar"]);
     expect(await opened(after, "refresh")).toBe(google.issued.at(-1)?.refresh);
     expect(await opened(after, "access")).toBe(google.issued.at(-1)?.access);
@@ -1090,8 +1148,9 @@ describe("a refused link drops the new grant", () => {
     expect(google.revoked).toEqual([google.issued.at(-1)?.refresh]);
     google.revoked.length = 0;
     expect((await link(browser, { label: "mine" }, OTHER)).status).toBe(302);
-    // WORK is linked, so a clash on its relink must keep the grant it shares with the account.
-    expect((await link(browser, { label: "mine" }, WORK)).status).toBe(409);
+    // WORK is linked, so a relink keeps its label ("shared") and cannot clash: nothing is revoked.
+    expect((await link(browser, { label: "mine" }, WORK)).status).toBe(302);
+    expect((await accounts()).find((a) => a.address === WORK.email)?.label).toBe("shared");
     expect(google.revoked).toEqual([]);
   });
 

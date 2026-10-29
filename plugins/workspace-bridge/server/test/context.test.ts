@@ -437,7 +437,7 @@ describe("account tools", () => {
     expect(res.isError).toBe(false);
     expect(res.json).toMatchObject({
       url: ACCOUNTS_URL,
-      label: "work",
+      label: "Work",
       components: ["mail", "calendar"],
     });
 

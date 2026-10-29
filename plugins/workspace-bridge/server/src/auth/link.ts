@@ -9,7 +9,7 @@
 // cookie and writes no row.
 
 import { base64url, randomBytes, randomId, seal, sha256, type TokenKind } from "../core/crypto";
-import { type AccountRow, first, getAccount, nowSeconds } from "../core/db";
+import { type AccountRow, all, first, getAccount, nowSeconds } from "../core/db";
 import { config, type Env } from "../env";
 import {
   type AccountComponent,
@@ -58,17 +58,54 @@ export interface LinkPayload {
   nonce: string;
 }
 
-/** Lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 32. */
-export const LABEL_PATTERN = /^[a-z0-9][a-z0-9._-]{0,31}$/;
+/** Longest label, in characters. */
+export const LABEL_MAX = 64;
+
+/** The rule, as shown to the owner on the form, in the title and in refusals. */
+export const LABEL_RULE = `Any name, up to ${LABEL_MAX} characters. "all" is reserved.`;
 
 /** `all` selects every account in multi-account tools (plan s.6), so it cannot be a label. */
 const RESERVED_LABELS: ReadonlySet<string> = new Set(["all"]);
 
-/** The label as stored (trimmed, lowercased), or undefined if it breaks the label rules. */
+/**
+ * The label as stored: free-form display text, trimmed, control characters removed (any case,
+ * spaces and punctuation stay), or undefined if it is empty, over the cap or reserved (`all`, in
+ * any case). Labels are unique per owner ignoring case; that is enforced where they are stored.
+ */
 export function normalizeLabel(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const label = value.trim().toLowerCase();
-  return LABEL_PATTERN.test(label) && !RESERVED_LABELS.has(label) ? label : undefined;
+  const label = value.replace(/\p{Cc}/gu, "").trim();
+  if (label === "" || [...label].length > LABEL_MAX) return undefined;
+  return RESERVED_LABELS.has(label.toLowerCase()) ? undefined : label;
+}
+
+/**
+ * Why `label` cannot go on a mailbox of this owner (other than `exceptId`), or null. Labels are
+ * unique ignoring case (compared here in full Unicode; the SQL index is the ASCII backstop), and
+ * a label may not equal another mailbox's address, which the resolver would then match first.
+ */
+export async function labelClash(
+  db: D1Database,
+  ownerId: string,
+  label: string,
+  exceptId?: string,
+): Promise<string | null> {
+  const lower = label.toLowerCase();
+  const rows = await all<{ id: string; label: string; address: string }>(
+    db,
+    "SELECT id, label, address FROM accounts WHERE owner_id = ?",
+    ownerId,
+  );
+  for (const r of rows) {
+    if (r.id === exceptId) continue;
+    if (r.label.toLowerCase() === lower) {
+      return `Another mailbox already has the label "${label}" (labels are compared ignoring case).`;
+    }
+    if (r.address === lower) {
+      return `The label "${label}" is the address of another mailbox.`;
+    }
+  }
+  return null;
 }
 
 const GMAIL_SEND_AS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/settings/sendAs";
@@ -294,20 +331,11 @@ export async function finishLink(
       );
     }
   }
-  const clash = await first<{ id: string }>(
-    env.DB,
-    "SELECT id FROM accounts WHERE owner_id = ? AND label = ? AND address <> ?",
-    session.ownerId,
-    payload.label,
-    identity.email,
-  );
+  // A re-link of a linked address keeps its label (the Rename control changes it), so only a new
+  // mailbox can clash.
+  const clash = existing ? null : await labelClash(env.DB, session.ownerId, payload.label);
   if (clash) {
-    return refused(
-      "label_in_use",
-      409,
-      "Label in use",
-      `Another mailbox already has the label "${payload.label}". Pick another label.`,
-    );
+    return refused("label_in_use", 409, "Label in use", `${clash} Pick another label.`);
   }
   if (existing?.provider_sub && existing.provider_sub !== identity.sub) {
     // Same address, new Google user id: a deleted and recreated Workspace user. Verified by
@@ -350,13 +378,12 @@ export async function finishLink(
     ? [
         db
           .prepare(
-            `UPDATE accounts SET label = ?, provider_sub = ?, components = ?, granted_scopes = ?,
+            `UPDATE accounts SET provider_sub = ?, components = ?, granted_scopes = ?,
                status = 'ok', send_as_fetched_at = IIF(? = 1, NULL, COALESCE(?, send_as_fetched_at)),
                updated_at = ?
              WHERE id = ? AND owner_id = ?`,
           )
           .bind(
-            payload.label,
             identity.sub,
             JSON.stringify(components),
             granted.join(" "),
@@ -441,6 +468,9 @@ export async function finishLink(
   const missing = wanted.filter((c) => !components.includes(c));
   const back = new URL("/accounts", issuer);
   if (missing.length > 0) back.searchParams.set("partial", missing.join(","));
+  if (existing && existing.label !== payload.label) {
+    back.searchParams.set("relinked", existing.label);
+  }
   return redirect(back.toString(), headers);
 }
 

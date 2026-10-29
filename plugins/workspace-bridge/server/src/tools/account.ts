@@ -57,7 +57,7 @@ const linkAccountUrl = defineTool({
       .max(64)
       .optional()
       .describe(
-        "The label to give the account, such as `work`: lowercase letters, digits, `.`, `_`, `-`.",
+        "The label to give the account, such as `Work`: any name up to 64 characters (not `all`).",
       ),
     components: z
       .array(z.enum(ACCOUNT_COMPONENTS))
@@ -72,7 +72,7 @@ const linkAccountUrl = defineTool({
       if (label === undefined) {
         throw new ToolError(
           "invalid_argument",
-          "A label is 1 to 32 lowercase letters, digits, `.`, `_` or `-`, starts with a letter or digit, and is not `all`.",
+          "A label is any name of 1 to 64 characters and is not `all`.",
         );
       }
     }

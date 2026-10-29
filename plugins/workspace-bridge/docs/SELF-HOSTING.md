@@ -313,7 +313,7 @@ claude plugin install workspace-bridge@goodstuff --config server_url=https://mcp
 Signing in proves you are the owner. Linking connects a Google mailbox to the server.
 
 1. On `/accounts`, find the Link a mailbox form.
-2. Label: a short lowercase name such as `personal` or `work`. Tools refer to an account by label, address or short id.
+2. Label: any name up to 64 characters, such as `Personal` or `Mike's Workspace` (not `all`, in any case). Labels are unique per owner ignoring case. Tools refer to an account by label (matched ignoring case), address or short id. Change a label later with the Rename button on the mailbox's row; a re-link keeps the existing label.
 3. Google address (optional): preselects the account in Google's picker.
 4. Components, all ticked by default: Mail (read, organize, drafts, filters), Mail send, Calendar, Drive files, Contacts. Each asks Google only for its own scopes. Untick Mail send to make a mailbox unable to send whatever else is set.
 5. Click Link with Google. Google shows "Google hasn't verified this app". Click Advanced, then Go to workspace-bridge (unsafe), then Allow. This is expected for a private app (section 5).

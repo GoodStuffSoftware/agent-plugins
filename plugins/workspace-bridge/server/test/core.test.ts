@@ -188,7 +188,11 @@ describe("core tables", () => {
     const applied = await env.DB.prepare("SELECT name FROM d1_migrations ORDER BY id").all<{
       name: string;
     }>();
-    expect(applied.results.map((m) => m.name)).toEqual(["0001_auth.sql", "0002_core.sql"]);
+    expect(applied.results.map((m) => m.name)).toEqual([
+      "0001_auth.sql",
+      "0002_core.sql",
+      "0003_label_nocase.sql",
+    ]);
     const columns = await env.DB.prepare("SELECT name FROM pragma_table_info('accounts')").all<{
       name: string;
     }>();

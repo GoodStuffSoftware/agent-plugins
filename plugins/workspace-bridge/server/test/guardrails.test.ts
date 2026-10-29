@@ -394,6 +394,24 @@ describe("approval gate", () => {
     expect(res.json).toEqual({ sent: true, account: "work" });
   });
 
+  it("escapes an HTML-special label on the approval and audit pages", async () => {
+    const ownerId = await newOwner();
+    const a = await linkGoogleAccount(ownerId, { label: "<script>x</script> & co" });
+    await env.DB.prepare("UPDATE owners SET default_account_id = ? WHERE id = ?")
+      .bind(a.row.id, ownerId)
+      .run();
+    const { id } = await holdOne(confirmEnv, ownerId, { to: "x@example.com", body: BODY_TEXT });
+    const fetchPage = pages(confirmEnv);
+    const cookie = await ownerCookie(confirmEnv, ownerId);
+    for (const path of [`/approvals/${id}`, "/accounts/audit", "/accounts"]) {
+      const text = await (await fetchPage(path, { cookie })).text();
+      expect(text).not.toContain("<script>x</script>");
+    }
+    expect(await (await fetchPage(`/approvals/${id}`, { cookie })).text()).toContain(
+      "&lt;script&gt;x&lt;/script&gt; &amp; co",
+    );
+  });
+
   it("approve on the page with session and CSRF runs the handler once, on the stored account", async () => {
     const ownerId = await newOwner();
     const work = await linkGoogleAccount(ownerId, { label: "work" });
