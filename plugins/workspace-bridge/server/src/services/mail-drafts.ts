@@ -1,6 +1,7 @@
 // The mail.drafts capability (ARCHITECTURE s.3.6): what the draft tools need from a provider.
 // Values are raw provider data; the tools prefix ids and wrap third-party text.
 
+import type { MimeAttachment } from "../core/mime";
 import type { SendAsAddress } from "../core/send-as";
 import { capability } from "./capability";
 import type { AccountRef } from "./types";
@@ -51,6 +52,8 @@ export type CreateDraftInput = {
   replyToMessageId?: string;
   /** Every address the account sends as, so a reply leaves them out of its recipients. */
   selfAddresses: string[];
+  /** Files the caller gave, already checked and within the cap. */
+  attachments?: MimeAttachment[];
 };
 
 export type UpdateDraftInput = {
@@ -61,6 +64,10 @@ export type UpdateDraftInput = {
   body?: string;
   htmlBody?: string;
   from?: SendAsAddress;
+  /** Replace the draft's files with these; left out, the draft keeps the files it has. */
+  attachments?: MimeAttachment[];
+  /** Cap on the files the rewritten draft holds, whether new or kept. */
+  maxAttachmentBytes: number;
 };
 
 export interface DraftService {

@@ -3,8 +3,17 @@
 
 import { z } from "zod";
 import { ToolError } from "../core/errors";
-import { parseAddresses, splitAddressList } from "../core/mime";
+import {
+  base64Bytes,
+  cleanBase64,
+  isMediaType,
+  MAX_ATTACHMENTS,
+  type MimeAttachment,
+  parseAddresses,
+  splitAddressList,
+} from "../core/mime";
 import { config, type Env } from "../env";
+import type { AttachmentTotals } from "../services/mail-send";
 
 /** Plain text body cap, in characters. A larger body is `too_large` before any work is done. */
 export const MAX_BODY_CHARS = 50_000;
@@ -62,19 +71,39 @@ export const fromParam = z
     "The address to send from, one of the account's own addresses. Omit to use the account's default address.",
   );
 
-/** The official `attachments` shape. Accepted so a client can send the official call; not built yet. */
+/** A sanity bound on one file's base64; the real limit is MAX_SEND_ATTACHMENT_BYTES for the lot. */
+const MAX_ATTACHMENT_CHARS = 4_000_000;
+
+/** The official `attachments` shape (content, filename, mimeType, inline, id). */
 export const attachmentsParam = z
   .array(
     z.object({
-      content: z.string().describe("The file, base64 encoded."),
-      filename: z.string().optional(),
-      mimeType: z.string().optional(),
-      inline: z.boolean().optional(),
-      id: z.string().optional(),
+      content: z
+        .string()
+        .max(MAX_ATTACHMENT_CHARS)
+        .describe("The file, standard base64 encoded (whitespace is ignored)."),
+      filename: z
+        .string()
+        .max(255)
+        .optional()
+        .describe("The file name shown to the recipient. Optional."),
+      mimeType: z
+        .string()
+        .max(255)
+        .optional()
+        .describe("A plain type/subtype such as application/pdf. Defaults to application/octet-stream."),
+      inline: z
+        .boolean()
+        .optional()
+        .describe("Inline images are not supported: true is refused. Send the file as an attachment."),
+      id: z.string().max(512).optional().describe("Ignored. Present for compatibility."),
     }),
   )
+  .max(MAX_ATTACHMENTS)
   .optional()
-  .describe("File attachments. Not supported yet: a non-empty list is refused.");
+  .describe(
+    `Files to attach, at most ${MAX_ATTACHMENTS}, within the server's send size limit (MAX_SEND_ATTACHMENT_BYTES, 512 KB by default, for all files together). Over the limit is refused before anything is sent.`,
+  );
 
 export const replyToMessageIdParam = z
   .string()
@@ -155,15 +184,60 @@ export function assertRecipientCount(env: Env, r: Recipients): void {
   }
 }
 
-/** Attachments arrive with M16; until then a non-empty list is refused rather than dropped. */
-export function assertNoAttachments(attachments: readonly unknown[] | undefined): void {
-  if (attachments && attachments.length > 0) {
-    throw new ToolError(
-      "invalid_argument",
-      "Attachments are not supported yet. Send the message without the attachments parameter.",
-    );
-  }
+type GivenAttachment = {
+  content: string;
+  filename?: string | undefined;
+  mimeType?: string | undefined;
+  inline?: boolean | undefined;
+};
+
+/**
+ * The caller's files, checked before any Google call: no inline images, a plain media type, a
+ * filename on one line, standard base64, and a total within `MAX_SEND_ATTACHMENT_BYTES`. Returns
+ * the files as the MIME builder takes them (the base64 as given, never decoded) and their totals.
+ */
+export function checkAttachments(
+  env: Env,
+  given: readonly GivenAttachment[] | undefined,
+): { files: MimeAttachment[]; totals: AttachmentTotals } {
+  const files: MimeAttachment[] = [];
+  let bytes = 0;
+  const cap = config(env).maxSendAttachmentBytes;
+  (given ?? []).forEach((f, i) => {
+    const name = `attachments[${i}]`;
+    if (f.inline === true) {
+      throw new ToolError(
+        "invalid_argument",
+        `${name}: inline attachments are not supported. Send the file as a regular attachment.`,
+      );
+    }
+    const mimeType = (f.mimeType ?? "").trim().toLowerCase() || "application/octet-stream";
+    if (!isMediaType(mimeType)) {
+      throw new ToolError(
+        "invalid_argument",
+        `${name}: mimeType must be a plain type/subtype such as application/pdf.`,
+      );
+    }
+    assertSingleLine(`${name} filename`, f.filename);
+    const content = cleanBase64(name, f.content);
+    bytes += base64Bytes(content);
+    if (bytes > cap) throw tooLargeToSend(cap, bytes);
+    files.push({ ...(f.filename ? { filename: f.filename } : {}), mimeType, content });
+  });
+  return { files, totals: { count: files.length, bytes } };
 }
+
+/** The refusal for files over the send cap, the same wherever it is found. */
+export const tooLargeToSend = (cap: number, totalBytes: number): ToolError =>
+  new ToolError(
+    "too_large",
+    `The attachments are larger than the ${cap} byte send limit (all files together).`,
+    { maxBytes: cap, totalBytes },
+  );
+
+/** The audit `detail` for a message that holds files: the count and total size, never content. */
+export const attachmentDetail = (t: AttachmentTotals): string =>
+  `attachments=${t.count} bytes=${t.bytes}`;
 
 /** A subject or similar line from the caller: a line break would split the header. */
 export function assertSingleLine(name: string, value: string | undefined): void {

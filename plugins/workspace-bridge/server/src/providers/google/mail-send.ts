@@ -6,10 +6,15 @@
 // threaded message uses `uploadType=multipart`: a `multipart/related` body with the JSON metadata
 // `{"threadId":...}` and the `message/rfc822` part. A draft is sent by id (`drafts/send`).
 //
+// Files go in as base64 MIME parts, the client's own base64 re-wrapped and never decoded. A forward
+// carries the original's files: `prepare` only reads their sizes (and refuses past the cap), and
+// `deliver` downloads them, so nothing is fetched before the send guardrails have passed.
+//
 // Sending is never retried: gfetch does not retry a POST, and a second try could send twice.
 
 import { ToolError } from "../../core/errors";
 import {
+  base64Bytes,
   buildRfc822,
   decodeEncodedWords,
   escapeHtml,
@@ -21,7 +26,10 @@ import {
   headerOf,
   htmlToText,
   listAttachments,
+  MAX_ATTACHMENTS,
+  type MimeAttachment,
   normalizeMessageId,
+  type PartAttachment,
   parseAddresses,
   quoteHtml,
   quotePlain,
@@ -35,6 +43,7 @@ import {
 import type { SendAsAddress } from "../../core/send-as";
 import { provide } from "../../services/capability";
 import {
+  type AttachmentTotals,
   type DraftEnvelope,
   type PreparedMessage,
   type PrepareInput,
@@ -44,6 +53,7 @@ import {
 } from "../../services/mail-send";
 import type { AccountRef } from "../../services/types";
 import { gjson } from "./http";
+import { downloadAttachment, listMessageAttachments } from "./mail-attachments";
 
 const BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me";
@@ -81,7 +91,7 @@ interface Original {
   ccAddresses: string[];
   replyToAddresses: string[];
   body: string;
-  attachments: number;
+  attachments: PartAttachment[];
 }
 
 async function readOriginal(a: AccountRef, messageId: string): Promise<Original> {
@@ -110,14 +120,18 @@ async function readOriginal(a: AccountRef, messageId: string): Promise<Original>
     ccAddresses: parseAddresses(h("Cc")),
     replyToAddresses: parseAddresses(h("Reply-To")),
     body: truncate(extractBody(p), MAX_QUOTE),
-    attachments: listAttachments(p).length,
+    attachments: listAttachments(p),
   };
 }
 
-const NO_ATTACHMENTS = 0;
+const totalsOf = (own: readonly MimeAttachment[], carried: readonly PartAttachment[] = []) => ({
+  count: own.length + carried.length,
+  bytes: own.reduce((n, f) => n + base64Bytes(f.content), 0) + carried.reduce((n, f) => n + f.size, 0),
+});
 
 async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMessage> {
   if (input.kind === "send") {
+    const attachments = input.attachments ?? [];
     const base: PreparedMessage = {
       to: input.to,
       cc: input.cc,
@@ -126,7 +140,8 @@ async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMess
       body: input.body ?? (input.htmlBody ? htmlToText(input.htmlBody) : ""),
       ...(input.htmlBody ? { htmlBody: input.htmlBody } : {}),
       ...(input.replyThreadId ? { threadId: input.replyThreadId } : {}),
-      omittedAttachments: NO_ATTACHMENTS,
+      attachments,
+      attachmentTotals: totalsOf(attachments),
     };
     if (!input.replyToMessageId) return base;
     const o = await readOriginal(a, input.replyToMessageId);
@@ -176,7 +191,8 @@ async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMess
       ...(o.inReplyTo ? { inReplyTo: o.inReplyTo } : {}),
       ...(o.references ? { references: o.references } : {}),
       threadId: o.threadId,
-      omittedAttachments: NO_ATTACHMENTS,
+      attachments: input.attachments ?? [],
+      attachmentTotals: totalsOf(input.attachments ?? []),
     };
   }
 
@@ -190,6 +206,19 @@ async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMess
     cc: o.cc || undefined,
   };
   const text = input.forwardText ?? (input.htmlBody ? htmlToText(input.htmlBody) : "");
+  const own = input.attachments ?? [];
+  const carried = input.includeOriginalAttachments ? o.attachments : [];
+  // The sizes the parts declare decide here, before anything is downloaded; `deliver` checks the
+  // bytes it really gets. Over the cap is a refusal, never a forward with files missing.
+  const totals = totalsOf(own, carried);
+  if (totals.count > MAX_ATTACHMENTS) {
+    throw new ToolError(
+      "too_large",
+      `A message may hold at most ${MAX_ATTACHMENTS} attachments; this forward would hold ${totals.count}. Set includeAttachments to false or give fewer files.`,
+      { maxCount: MAX_ATTACHMENTS, count: totals.count },
+    );
+  }
+  if (totals.bytes > input.maxAttachmentBytes) throw tooLargeForward(input.maxAttachmentBytes, totals.bytes);
   return {
     to: input.to,
     cc: input.cc,
@@ -201,8 +230,57 @@ async function prepare(a: AccountRef, input: PrepareInput): Promise<PreparedMess
       plain: `${forwardHeaderBlock(fields)}\n\n${o.body}`,
       html: forwardHtmlBlock({ ...fields, body: o.body }),
     },
-    omittedAttachments: o.attachments,
+    attachments: own,
+    ...(carried.length > 0 ? { carried: { messageId: input.messageId, files: carried } } : {}),
+    attachmentTotals: totals,
   };
+}
+
+const tooLargeForward = (cap: number, totalBytes?: number): ToolError =>
+  new ToolError(
+    "too_large",
+    `The files of this forward are larger than the ${cap} byte send limit (the original's and yours together). Nothing was sent. Set includeAttachments to false to forward without the original's files.`,
+    totalBytes === undefined ? { maxBytes: cap } : { maxBytes: cap, totalBytes },
+  );
+
+/** The original's files, fetched now that the send is allowed, within what the cap leaves. */
+async function fetchCarried(
+  a: AccountRef,
+  m: PreparedMessage,
+  cap: number,
+): Promise<MimeAttachment[]> {
+  if (!m.carried) return [];
+  let used = m.attachments.reduce((n, f) => n + base64Bytes(f.content), 0);
+  const out: MimeAttachment[] = [];
+  for (const f of m.carried.files) {
+    const got = await downloadOne(a, m.carried.messageId, f, cap - used).catch((e: unknown) => {
+      throw e instanceof ToolError && e.code === "too_large" ? tooLargeForward(cap) : e;
+    });
+    used += got.bytes;
+    out.push({ filename: f.filename, mimeType: f.mimeType, content: got.content });
+  }
+  return out;
+}
+
+async function downloadOne(
+  a: AccountRef,
+  messageId: string,
+  f: PartAttachment,
+  budget: number,
+): Promise<{ content: string; bytes: number }> {
+  try {
+    return await downloadAttachment(a, messageId, f.attachmentId, budget);
+  } catch (e) {
+    // Gmail may hand out a new attachment id for the same part, which turns the old one stale.
+    // The same file is then found again by name, type and size.
+    const stale = e instanceof ToolError && (e.code === "not_found" || e.code === "invalid_argument");
+    if (!stale) throw e;
+    const again = (await listMessageAttachments(a, messageId)).find(
+      (x) => x.filename === f.filename && x.mimeType === f.mimeType && x.size === f.size,
+    );
+    if (!again) throw e;
+    return downloadAttachment(a, messageId, again.attachmentId, budget);
+  }
 }
 
 // ---- Sending -------------------------------------------------------------------------------------
@@ -250,11 +328,16 @@ function sent(g: GmailMessage): SentMessage {
 async function deliver(
   a: AccountRef,
   m: PreparedMessage,
-  opts: { from?: SendAsAddress | undefined; includeSignature: boolean },
+  opts: {
+    from?: SendAsAddress | undefined;
+    includeSignature: boolean;
+    maxAttachmentBytes: number;
+  },
 ): Promise<SentMessage> {
   const signature = opts.includeSignature
     ? await signatureOf(a, opts.from?.email ?? a.address)
     : undefined;
+  const carried = await fetchCarried(a, m, opts.maxAttachmentBytes);
   const raw = buildRfc822(
     {
       to: m.to,
@@ -265,6 +348,7 @@ async function deliver(
       ...compose(m, signature || undefined),
       ...(m.inReplyTo ? { inReplyTo: m.inReplyTo } : {}),
       ...(m.references ? { references: m.references } : {}),
+      attachments: [...m.attachments, ...carried],
     },
     { requireRecipient: true },
   );
@@ -313,20 +397,24 @@ async function readDraft(a: AccountRef, draftId: string): Promise<DraftEnvelope>
     a,
     `${BASE}/drafts/${enc(draftId)}`,
     {},
-    {
-      fields: "id,message(payload(headers))",
-      query: { format: "metadata", metadataHeaders: ["From", "To", "Cc", "Bcc", "Subject"] },
-    },
+    // Full format: only it lists the draft's files (the metadata format leaves the parts out).
+    { fields: "id,message(payload)", query: { format: "full" } },
   );
   if (!d.id) throw malformed();
   const p = d.message?.payload;
   const from = headerOf(p, "From");
+  const files = listAttachments(p);
+  const attachmentTotals: AttachmentTotals = {
+    count: files.length,
+    bytes: files.reduce((n, f) => n + f.size, 0),
+  };
   return {
     ...(from === undefined ? {} : { from: singleLine(decodeEncodedWords(from)) }),
     to: readAddressList(headerOf(p, "To")),
     cc: readAddressList(headerOf(p, "Cc")),
     bcc: readAddressList(headerOf(p, "Bcc")),
     subject: singleLine(decodeEncodedWords(headerOf(p, "Subject") ?? "")),
+    attachmentTotals,
   };
 }
 

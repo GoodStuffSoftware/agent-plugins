@@ -7,9 +7,10 @@
 // send itself and one audit row. The audit row never holds a body. A send that is refused or
 // fails writes a row too (`refused` before Google was called, `error` after).
 //
-// Attachments arrive with M16: the `attachments` parameter is accepted so the official call shape
-// works and refused with `invalid_argument` when it is not empty. A forward does not carry the
-// original's files yet; the answer says how many were left out.
+// Attachments (M16): `attachments` is checked and capped before any Google call (a refusal is
+// audited like a recipient refusal). A forward carries the original's files unless
+// `includeAttachments` is false; they are fetched only after the guardrails passed. The audit row
+// records the count and total size of the files, never their content.
 
 import { z } from "zod";
 import { ToolError } from "../core/errors";
@@ -17,18 +18,20 @@ import { accountKey } from "../core/ids";
 import { parseAddresses } from "../core/mime";
 import { sendNeedsApproval } from "../core/pending";
 import type { SendAsAddress } from "../core/send-as";
+import { config } from "../env";
 import { googleSend } from "../providers/google/mail-send";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
-import { SEND, type SentMessage } from "../services/mail-send";
+import { type AttachmentTotals, SEND, type SentMessage } from "../services/mail-send";
 import type { AccountRef } from "../services/types";
 import {
   accountParam,
-  assertNoAttachments,
   assertSingleLine,
+  attachmentDetail,
   attachmentsParam,
   bccParam,
   bodyParam,
   ccParam,
+  checkAttachments,
   checkRecipients,
   fromParam,
   htmlBodyParam,
@@ -79,13 +82,18 @@ async function guardedSend(
     from: string | undefined;
     subject: string;
     recipients: () => Recipients;
+    /** The files the message holds; the audit row says how many and how large, never what. */
+    attachments?: AttachmentTotals;
   },
   deliver: (from: SendAsAddress | undefined) => Promise<SentMessage>,
 ): Promise<{ sent: SentMessage; from: SendAsAddress; recipients: Recipients }> {
   let stage: "refused" | "error" = "refused";
   let recipients: Recipients = { to: [], cc: [], bcc: [] };
   let allowed: SendAsAddress | undefined;
-  const audit = async (result: string, providerRef?: string, detail?: string) => {
+  const audit = async (result: string, providerRef?: string, reason?: string) => {
+    const files =
+      meta.attachments && meta.attachments.count > 0 ? attachmentDetail(meta.attachments) : "";
+    const detail = [reason, files].filter(Boolean).join("; ");
     try {
       await ctx.audit.write({
         tool: meta.tool,
@@ -97,7 +105,7 @@ async function guardedSend(
         subject: meta.subject,
         providerRef: providerRef ?? null,
         result,
-        detail: detail ?? null,
+        detail: detail || null,
       });
     } catch {
       // The send already happened or was already refused; a failing log must not change the answer.
@@ -126,15 +134,34 @@ async function guardedSend(
 }
 
 /** The caller's own recipient lists, checked before any Google call; a refusal is audited. */
-async function givenRecipients(
+const givenRecipients = (
   ctx: ToolContext,
   a: AccountRef,
   tool: string,
   subject: string | undefined,
   args: Parameters<typeof checkRecipients>[1],
-): Promise<Recipients> {
+): Promise<Recipients> =>
+  refusing(ctx, a, tool, subject, () => checkRecipients(ctx.env, args));
+
+/** The caller's own files, checked and capped before any Google call; a refusal is audited. */
+const givenAttachments = (
+  ctx: ToolContext,
+  a: AccountRef,
+  tool: string,
+  subject: string | undefined,
+  given: Parameters<typeof checkAttachments>[1],
+) => refusing(ctx, a, tool, subject, () => checkAttachments(ctx.env, given));
+
+/** Runs a check made before any Google call; when it refuses, writes the audit row and rethrows. */
+async function refusing<T>(
+  ctx: ToolContext,
+  a: AccountRef,
+  tool: string,
+  subject: string | undefined,
+  check: () => T,
+): Promise<T> {
   try {
-    return checkRecipients(ctx.env, args);
+    return check();
   } catch (e) {
     try {
       await ctx.audit.write({
@@ -156,15 +183,33 @@ async function givenRecipients(
   }
 }
 
-/** What a send answers: the Gmail message, ids prefixed. */
-function answer(ctx: ToolContext, a: AccountRef, s: SentMessage): Record<string, unknown> {
+/** What a send answers: the Gmail message, ids prefixed, and how many files it carried. */
+function answer(
+  ctx: ToolContext,
+  a: AccountRef,
+  s: SentMessage,
+  files?: AttachmentTotals,
+): Record<string, unknown> {
   return {
     id: ctx.ids.encode(a, s.id),
     threadId: ctx.ids.encode(a, s.threadId),
     ...(s.labelIds ? { labelIds: s.labelIds.map((l) => ctx.ids.encode(a, l)) } : {}),
     account: accountKey(a.shortId),
+    ...(files && files.count > 0 ? { attachments: files } : {}),
   };
 }
+
+/** The files an approval summary names: what they are called and about how large, never content. */
+const attachmentsPreview = (
+  files: readonly { content: string; filename?: string | undefined; mimeType?: string | undefined }[] | undefined,
+) =>
+  (files ?? []).map((f) => ({
+    filename: f.filename ?? null,
+    mimeType: f.mimeType ?? null,
+    approxBytes: Math.floor((f.content.length * 3) / 4),
+  }));
+
+const sendCap = (ctx: ToolContext): number => config(ctx.env).maxSendAttachmentBytes;
 
 /** Recipients taken from the original message are third-party text. */
 function withRecipients(
@@ -255,7 +300,7 @@ const sendMessage = defineTool({
   name: "send_message",
   title: "Send an email",
   description:
-    "Sends an email now from the account (or one of its verified send-as addresses via `from`). Give recipients in `to`, `cc` or `bcc`, a `subject`, and `body` (plain text) and/or `htmlBody`. Or give `draftId` to send an existing draft as it is (the other fields are then ignored). `replyThreadId` or `replyToMessageId` threads the message under an existing conversation. Sending can be switched off, is rate limited, and may wait for the owner's approval, in which case nothing is sent and the answer carries an approval link. `attachments` is not supported yet.",
+    "Sends an email now from the account (or one of its verified send-as addresses via `from`). Give recipients in `to`, `cc` or `bcc`, a `subject`, and `body` (plain text) and/or `htmlBody`. Or give `draftId` to send an existing draft as it is (the other fields are then ignored). `replyThreadId` or `replyToMessageId` threads the message under an existing conversation. Sending can be switched off, is rate limited, and may wait for the owner's approval, in which case nothing is sent and the answer carries an approval link. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit, refused before anything is sent). A draft sent by `draftId` keeps the files it has.",
   component: "mail",
   scopes: ["mail.send"],
   endpoints: ["full"],
@@ -289,11 +334,11 @@ const sendMessage = defineTool({
               cc: nonEmpty(args.cc),
               bcc: nonEmpty(args.bcc),
               subject: args.subject ?? "",
+              attachments: attachmentsPreview(args.attachments),
             }),
       }),
   },
   async handler(args, ctx) {
-    assertNoAttachments(args.attachments);
     assertSingleLine("subject", args.subject);
     const ref = args.draftId ?? args.replyToMessageId ?? args.replyThreadId;
     const a = await accountFor(ctx, args.account, ref ? idOf(ctx, ref).shortId : undefined);
@@ -311,17 +356,20 @@ const sendMessage = defineTool({
           from: fromHeader,
           subject: draft.subject,
           recipients: () => checkRecipients(ctx.env, draft),
+          attachments: draft.attachmentTotals,
         },
         () => sender.sendDraft(a, draftId),
       );
-      return answer(ctx, a, sent);
+      return answer(ctx, a, sent, draft.attachmentTotals);
     }
 
-    // The caller's own lists are checked before any Google call.
+    // The caller's own lists and files are checked before any Google call.
     const given = await givenRecipients(ctx, a, "send_message", args.subject, args);
+    const attached = await givenAttachments(ctx, a, "send_message", args.subject, args.attachments);
     const prepared = await sender.prepare(a, {
       kind: "send",
       ...given,
+      ...(attached.files.length ? { attachments: attached.files } : {}),
       ...(args.subject === undefined ? {} : { subject: args.subject }),
       ...(args.body === undefined ? {} : { body: args.body }),
       ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
@@ -338,11 +386,16 @@ const sendMessage = defineTool({
         from: args.from,
         subject: prepared.subject,
         recipients: () => given,
+        attachments: prepared.attachmentTotals,
       },
       (from) =>
-        sender.deliver(a, prepared, { from, includeSignature: args.includeSignature === true }),
+        sender.deliver(a, prepared, {
+          from,
+          includeSignature: args.includeSignature === true,
+          maxAttachmentBytes: sendCap(ctx),
+        }),
     );
-    return answer(ctx, a, sent);
+    return answer(ctx, a, sent, prepared.attachmentTotals);
   },
 });
 
@@ -352,7 +405,7 @@ const reply = defineTool({
   name: "reply",
   title: "Reply to an email",
   description:
-    "Replies to a message now. The reply is threaded under it (thread, In-Reply-To, References), the subject is `Re: ...` without doubling, and the original is quoted below your text. By default it goes to the original's Reply-To or sender; `replyAll` adds everyone else on the original (the account's own addresses are always left out). `to` replaces the default recipients and `cc` the default Cc when given and not empty. `body` and/or `htmlBody` is required. Sending can be switched off, is rate limited, and may wait for the owner's approval. `attachments` is not supported yet.",
+    "Replies to a message now. The reply is threaded under it (thread, In-Reply-To, References), the subject is `Re: ...` without doubling, and the original is quoted below your text. By default it goes to the original's Reply-To or sender; `replyAll` adds everyone else on the original (the account's own addresses are always left out). `to` replaces the default recipients and `cc` the default Cc when given and not empty. `body` and/or `htmlBody` is required. Sending can be switched off, is rate limited, and may wait for the owner's approval. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit, refused before anything is sent).",
   component: "mail",
   scopes: ["mail.send"],
   endpoints: ["full"],
@@ -382,11 +435,11 @@ const reply = defineTool({
         to: nonEmpty(args.to),
         cc: nonEmpty(args.cc),
         bcc: nonEmpty(args.bcc),
+        attachments: attachmentsPreview(args.attachments),
         ...(await replySummary(ctx, args)),
       }),
   },
   async handler(args, ctx) {
-    assertNoAttachments(args.attachments);
     if (!args.body && !args.htmlBody) {
       throw new ToolError("invalid_argument", "A reply needs `body` or `htmlBody`.");
     }
@@ -394,12 +447,14 @@ const reply = defineTool({
     const a = await accountFor(ctx, args.account, id.shortId);
     const sender = ctx.use(SEND, a);
     const given = await givenRecipients(ctx, a, "reply", undefined, args);
+    const attached = await givenAttachments(ctx, a, "reply", undefined, args.attachments);
     const self = (await ctx.sendAs.list(a)).map((s) => s.email);
     const prepared = await sender.prepare(a, {
       kind: "reply",
       messageId: id.providerId,
       replyAll: args.replyAll === true,
       ...given,
+      ...(attached.files.length ? { attachments: attached.files } : {}),
       ...(args.body === undefined ? {} : { body: args.body }),
       ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
       selfAddresses: self,
@@ -412,11 +467,22 @@ const reply = defineTool({
         from: args.from,
         subject: prepared.subject,
         recipients: () => checkRecipients(ctx.env, prepared),
+        attachments: prepared.attachmentTotals,
       },
       (from) =>
-        sender.deliver(a, prepared, { from, includeSignature: args.includeSignature === true }),
+        sender.deliver(a, prepared, {
+          from,
+          includeSignature: args.includeSignature === true,
+          maxAttachmentBytes: sendCap(ctx),
+        }),
     );
-    return withRecipients(ctx, a, answer(ctx, a, sent), prepared.subject, recipients);
+    return withRecipients(
+      ctx,
+      a,
+      answer(ctx, a, sent, prepared.attachmentTotals),
+      prepared.subject,
+      recipients,
+    );
   },
 });
 
@@ -426,7 +492,7 @@ const forward = defineTool({
   name: "forward",
   title: "Forward an email",
   description:
-    "Forwards a message now: your comments (`forwardText` and/or `htmlBody`) come first, then the original under a `---------- Forwarded message ---------` header block, with the subject `Fwd: ...`. At least one recipient is needed in `to`, `cc` or `bcc`. The original's attachments are not carried along yet; the answer says how many were left out. Sending can be switched off, is rate limited, and may wait for the owner's approval. `attachments` is not supported yet.",
+    "Forwards a message now: your comments (`forwardText` and/or `htmlBody`) come first, then the original under a `---------- Forwarded message ---------` header block, with the subject `Fwd: ...`. At least one recipient is needed in `to`, `cc` or `bcc`. The original's attachments are carried along (set `includeAttachments` false to leave them out); together with any extra `attachments` they must fit the server's send size limit, otherwise the forward is refused and nothing is sent. Sending can be switched off, is rate limited, and may wait for the owner's approval.",
   component: "mail",
   scopes: ["mail.send"],
   endpoints: ["full"],
@@ -446,6 +512,10 @@ const forward = defineTool({
     htmlBody: htmlBodyParam,
     from: fromParam,
     includeSignature: includeSignatureParam,
+    includeAttachments: z
+      .boolean()
+      .optional()
+      .describe("Carry the original's attachments along (default true)."),
     attachments: attachmentsParam,
   }),
   approval: {
@@ -458,10 +528,11 @@ const forward = defineTool({
         to: nonEmpty(args.to),
         cc: nonEmpty(args.cc),
         bcc: nonEmpty(args.bcc),
+        includeOriginalAttachments: args.includeAttachments !== false,
+        attachments: attachmentsPreview(args.attachments),
       }),
   },
   async handler(args, ctx) {
-    assertNoAttachments(args.attachments);
     const id = idOf(ctx, args.messageId);
     const a = await accountFor(ctx, args.account, id.shortId);
     const sender = ctx.use(SEND, a);
@@ -472,12 +543,17 @@ const forward = defineTool({
         "A forward needs at least one recipient in to, cc or bcc.",
       );
     }
+    const attached = await givenAttachments(ctx, a, "forward", undefined, args.attachments);
+    const cap = sendCap(ctx);
     const prepared = await sender.prepare(a, {
       kind: "forward",
       messageId: id.providerId,
       ...given,
       ...(args.forwardText === undefined ? {} : { forwardText: args.forwardText }),
       ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
+      ...(attached.files.length ? { attachments: attached.files } : {}),
+      includeOriginalAttachments: args.includeAttachments !== false,
+      maxAttachmentBytes: cap,
     });
     const { sent } = await guardedSend(
       ctx,
@@ -487,22 +563,22 @@ const forward = defineTool({
         from: args.from,
         subject: prepared.subject,
         recipients: () => given,
+        attachments: prepared.attachmentTotals,
       },
       (from) =>
-        sender.deliver(a, prepared, { from, includeSignature: args.includeSignature === true }),
+        sender.deliver(a, prepared, {
+          from,
+          includeSignature: args.includeSignature === true,
+          maxAttachmentBytes: cap,
+        }),
     );
-    const out = withRecipients(ctx, a, answer(ctx, a, sent), prepared.subject, {
-      to: [],
-      cc: [],
-      bcc: [],
-    });
-    return prepared.omittedAttachments > 0
-      ? {
-          ...out,
-          omittedAttachments: prepared.omittedAttachments,
-          note: "The original's attachments were not forwarded: that is not supported yet.",
-        }
-      : out;
+    return withRecipients(
+      ctx,
+      a,
+      answer(ctx, a, sent, prepared.attachmentTotals),
+      prepared.subject,
+      { to: [], cc: [], bcc: [] },
+    );
   },
 });
 
