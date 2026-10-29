@@ -233,3 +233,34 @@ export async function linkGoogleAccount(
   });
   return { row, accessToken, refreshToken };
 }
+
+/** The MIME text of a draft as `drafts.get?format=raw` carries it, base64url-encoded. */
+export function rawDraft(
+  over: {
+    id?: string;
+    from?: string;
+    to?: string;
+    cc?: string;
+    subject?: string;
+    threadId?: string;
+    /** Extra header lines, such as `["Bcc", "x@example.org"]`. */
+    headers?: [string, string][];
+  } = {},
+): { id: string; message: { threadId?: string; raw: string } } {
+  const lines = [
+    `From: ${over.from ?? "work@example.com"}`,
+    `To: ${over.to ?? "dan@example.net"}`,
+    ...(over.cc ? [`Cc: ${over.cc}`] : []),
+    `Subject: ${over.subject ?? "Draft subject"}`,
+    ...(over.headers ?? []).map(([k, v]) => `${k}: ${v}`),
+    "Content-Type: text/plain; charset=UTF-8",
+  ];
+  const mime = `${lines.join("\r\n")}\r\n\r\nDraft body\r\n`;
+  return {
+    id: over.id ?? "d1",
+    message: {
+      ...(over.threadId ? { threadId: over.threadId } : {}),
+      raw: base64url(new TextEncoder().encode(mime)),
+    },
+  };
+}

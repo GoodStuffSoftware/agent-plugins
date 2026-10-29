@@ -32,6 +32,7 @@ import {
   installGoogleRoutes,
   linkGoogleAccount,
   newOwner,
+  rawDraft,
 } from "./helpers/google";
 import { ISSUER, mcpRequest, parseMcp, toolJson } from "./helpers/mcp";
 import { mintToken } from "./helpers/tokens";
@@ -42,7 +43,6 @@ const GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me";
 const UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send";
 const BATCH = "https://gmail.googleapis.com/batch/gmail/v1";
 const DRAFT = `${GMAIL}/drafts/d1`;
-const DRAFT_SEND = `${GMAIL}/drafts/send`;
 const MESSAGE = `${GMAIL}/messages/m_orig`;
 const SEARCH = "https://people.googleapis.com/v1/people:searchContacts";
 const OTHER = "https://people.googleapis.com/v1/otherContacts:search";
@@ -101,6 +101,12 @@ async function call(
 
 const sentAnswer = () => googleJson(200, fx.sent);
 const sendRoute = (): GoogleRoute => ({ method: "POST", url: UPLOAD, reply: sentAnswer });
+/** The delete of a draft once it has been sent. */
+const draftDeleteRoute = (): GoogleRoute => ({
+  method: "DELETE",
+  url: DRAFT,
+  reply: () => new Response(null, { status: 204 }),
+});
 
 /** The `in:sent to:` queries a batch request carried, in order. */
 const sentQueries = (calls: GoogleCall[]): string[] =>
@@ -495,28 +501,30 @@ describe("reply, forward and draft sends", () => {
     const { ownerId, accountId, key } = await setup();
     // dan@example.net is the draft's To (the fixture); the call names nobody.
     const held = installGoogleRoutes([
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
       batchRoute(),
       ...peopleRoutes(),
-      { method: "POST", url: DRAFT_SEND, reply: sentAnswer },
+      sendRoute(),
+      draftDeleteRoute(),
     ]);
     const res = await call(MODE("new_recipients"), ownerId, "send_message", {
       draftId: `${key}:d1`,
     });
     expect(res.json.status).toBe("pending_approval");
     expect(res.json.preview.newRecipients).toEqual(["dan@example.net"]);
-    expect(held.some((c) => c.url.startsWith(DRAFT_SEND))).toBe(false);
+    expect(held.some((c) => c.url.startsWith(UPLOAD))).toBe(false);
 
     await recordKnownRecipients(env.DB, accountId, ["dan@example.net"], "sent");
     const calls = installGoogleRoutes([
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
-      { method: "POST", url: DRAFT_SEND, reply: sentAnswer },
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+      sendRoute(),
+      draftDeleteRoute(),
     ]);
     const sent = await call(MODE("new_recipients"), ownerId, "send_message", {
       draftId: `${key}:d1`,
     });
     expect(JSON.stringify(sent.json)).not.toContain("error");
-    expect(calls.some((c) => c.url.startsWith(DRAFT_SEND))).toBe(true);
+    expect(sendCalls(calls)).toHaveLength(1);
   });
 });
 
@@ -547,6 +555,193 @@ describe("calendar notifications", () => {
     const ok = await call(MODE("new_recipients"), ownerId, "create_event", create);
     expect(ok.json.status).toBeUndefined();
     expect(calls.some((c) => c.url.startsWith(EVENTS))).toBe(true);
+  });
+
+  describe("an update, delete or response checked against the guests it would email", () => {
+    const EVENT = `${EVENTS}/evt1`;
+    const tagged = { ...calendarFx.event, etag: '"e1"' };
+    /** The same event with one more guest: an outsider added after the hold. */
+    const withOutsider = {
+      ...tagged,
+      etag: '"e2"',
+      attendees: [
+        ...calendarFx.event.attendees,
+        { email: "late@attacker.test", responseStatus: "needsAction" },
+      ],
+    };
+    const known = ["boss@example.com", "guest@example.com"];
+    const patchRoute = (): GoogleRoute => ({
+      method: "PATCH",
+      url: EVENT,
+      reply: () => googleJson(200, tagged),
+    });
+    const update = { eventId: "evt1", summary: "Renamed", notificationLevel: "ALL" };
+
+    it("refuses a held update, once approved, whose event gained a guest", async () => {
+      const { ownerId } = await setup();
+      const e = MODE("all");
+      installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, tagged) },
+        batchRoute(),
+        ...peopleRoutes(),
+        patchRoute(),
+      ]);
+      const id = await heldWithGrant(e, ownerId, "update_event", update);
+      const row = await first<PendingActionRow>(
+        env.DB,
+        "SELECT * FROM pending_actions WHERE id = ?",
+        id,
+      );
+      expect(JSON.parse(row?.params ?? "{}").args.checkedRecipients).toEqual(known);
+      const page = await approvals(e, ownerId, id);
+      const calls = installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, withOutsider) },
+        patchRoute(),
+      ]);
+      await page.approve();
+      expect((await page.row())?.status).toBe("failed");
+      expect(calls.filter((c) => c.method === "PATCH")).toHaveLength(0);
+    });
+
+    it("sends a held update whose guests are the ones that were checked, if-match the event", async () => {
+      const { ownerId } = await setup();
+      const e = MODE("all");
+      installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, tagged) },
+        batchRoute(),
+        ...peopleRoutes(),
+      ]);
+      const id = await heldWithGrant(e, ownerId, "update_event", update);
+      const page = await approvals(e, ownerId, id);
+      let ifMatch: string | null = null;
+      const calls = installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, tagged) },
+        {
+          method: "PATCH",
+          url: EVENT,
+          reply: (req) => {
+            ifMatch = req.headers.get("If-Match");
+            return googleJson(200, tagged);
+          },
+        },
+      ]);
+      await page.approve();
+      expect((await page.row())?.status).toBe("executed");
+      const patch = calls.find((c) => c.method === "PATCH");
+      expect(new URL(patch?.url ?? "").searchParams.get("sendUpdates")).toBe("all");
+      expect(ifMatch).toBe('"e1"');
+    });
+
+    for (const [tool, args] of [
+      ["update_event", update],
+      ["delete_event", { eventId: "evt1", notificationLevel: "ALL" }],
+      [
+        "respond_to_event",
+        { eventId: "evt1", responseStatus: "accepted", notificationLevel: "ALL" },
+      ],
+    ] as const) {
+      it(`${tool}: refuses on the direct path when the fresh plan has a guest nobody checked`, async () => {
+        const { ownerId, accountId } = await setup();
+        await recordKnownRecipients(env.DB, accountId, known, "sent");
+        await recordKnownRecipients(env.DB, accountId, ["late@attacker.test"], "sent");
+        // Every address is known, so nothing is held; the guest list differs only by the time the
+        // handler reads it. Known-ness cannot be what refuses it: the checked set is.
+        let reads = 0;
+        const calls = installGoogleRoutes([
+          {
+            url: EVENT,
+            // A response mails only the organizer, so for it the organizer is the one that changes.
+            reply: () =>
+              googleJson(
+                200,
+                reads++ === 0
+                  ? tagged
+                  : tool === "respond_to_event"
+                    ? { ...withOutsider, organizer: { email: "late@attacker.test" } }
+                    : withOutsider,
+              ),
+          },
+          patchRoute(),
+          { method: "DELETE", url: EVENT, reply: () => new Response(null, { status: 204 }) },
+        ]);
+        const res = await call(MODE("new_recipients"), ownerId, tool, args);
+        expect(res.json.status).toBeUndefined();
+        expect(res.json.error?.message ?? "").toContain("not the ones that were checked");
+        expect(calls.filter((c) => c.method !== "GET")).toHaveLength(0);
+      });
+    }
+
+    it("sends the etag the plan was made from, so a changed event is refused by Google", async () => {
+      const { ownerId, accountId } = await setup();
+      await recordKnownRecipients(env.DB, accountId, known, "sent");
+      let ifMatch: string | null = null;
+      installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, tagged) },
+        {
+          method: "PATCH",
+          url: EVENT,
+          reply: (req) => {
+            ifMatch = req.headers.get("If-Match");
+            return googleJson(412, { error: { code: 412, message: "Precondition Failed" } });
+          },
+        },
+      ]);
+      const res = await call(MODE("new_recipients"), ownerId, "update_event", update);
+      expect(ifMatch).toBe('"e1"');
+      expect(res.json.error.message).toContain("changed while this change was being sent");
+    });
+
+    it("delete_event sends the etag it planned on, and refuses a notifying delete without one", async () => {
+      const { ownerId, accountId } = await setup();
+      await recordKnownRecipients(env.DB, accountId, known, "sent");
+      let ifMatch: string | null = null;
+      installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, tagged) },
+        {
+          method: "DELETE",
+          url: EVENT,
+          reply: (req) => {
+            ifMatch = req.headers.get("If-Match");
+            return new Response(null, { status: 204 });
+          },
+        },
+      ]);
+      const args = { eventId: "evt1", notificationLevel: "ALL" };
+      const ok = await call(MODE("new_recipients"), ownerId, "delete_event", args);
+      expect(ok.isError).toBe(false);
+      expect(ifMatch).toBe('"e1"');
+
+      // No etag in the answer: a delete that would email guests is not made unprotected.
+      const { etag: _etag, ...untagged } = tagged;
+      const calls = installGoogleRoutes([
+        { url: EVENT, reply: () => googleJson(200, untagged) },
+        { method: "DELETE", url: EVENT, reply: () => new Response(null, { status: 204 }) },
+      ]);
+      const refused = await call(MODE("new_recipients"), ownerId, "delete_event", args);
+      expect(refused.isError).toBe(true);
+      expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0);
+    });
+
+    it("sets no precondition when nobody is notified", async () => {
+      const { ownerId } = await setup();
+      let ifMatch: string | null = "unset";
+      installGoogleRoutes([
+        {
+          method: "PATCH",
+          url: EVENT,
+          reply: (req) => {
+            ifMatch = req.headers.get("If-Match");
+            return googleJson(200, tagged);
+          },
+        },
+      ]);
+      const res = await call(MODE("new_recipients"), ownerId, "update_event", {
+        eventId: "evt1",
+        summary: "Renamed",
+      });
+      expect(res.isError).toBe(false);
+      expect(ifMatch).toBeNull();
+    });
   });
 
   it("records the invitees as known once the invitation went out", async () => {
@@ -721,19 +916,20 @@ describe("the approved send", () => {
     const { ownerId, accountId, key } = await setup();
     const e = MODE("new_recipients");
     installGoogleRoutes([
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
       batchRoute(),
       ...peopleRoutes(),
     ]);
     const id = await heldWithGrant(e, ownerId, "send_message", { draftId: `${key}:d1` });
     const page = await approvals(e, ownerId, id);
     const calls = installGoogleRoutes([
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
-      { method: "POST", url: DRAFT_SEND, reply: sentAnswer },
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+      sendRoute(),
+      draftDeleteRoute(),
     ]);
     await page.approve();
     expect((await page.row())?.status).toBe("executed");
-    expect(calls.filter((c) => c.url.startsWith(DRAFT_SEND))).toHaveLength(1);
+    expect(sendCalls(calls)).toHaveLength(1);
     expect(await knownRow(accountId, "dan@example.net")).not.toBeNull();
   });
 
@@ -742,25 +938,22 @@ describe("the approved send", () => {
       const { ownerId, key } = await setup();
       const e = MODE(mode);
       installGoogleRoutes([
-        { url: DRAFT, reply: () => googleJson(200, fx.draft) },
+        { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
         batchRoute(),
         ...peopleRoutes(),
       ]);
       const id = await heldWithGrant(e, ownerId, "send_message", { draftId: `${key}:d1` });
       const page = await approvals(e, ownerId, id);
       // The draft is edited after the owner's preview: an outsider is added.
-      const edited = { ...fx.draft, message: structuredClone(fx.draft.message) } as Json;
-      const headers = edited.message.payload.headers as { name: string; value: string }[];
-      for (const h of headers) {
-        if (h.name.toLowerCase() === "to") h.value = `${h.value}, evil@attacker.test`;
-      }
+      const edited = rawDraft({ to: "dan@example.net, evil@attacker.test" });
       const calls = installGoogleRoutes([
         { url: DRAFT, reply: () => googleJson(200, edited) },
-        { method: "POST", url: DRAFT_SEND, reply: sentAnswer },
+        sendRoute(),
+        draftDeleteRoute(),
       ]);
       await page.approve();
       expect((await page.row())?.status).toBe("failed");
-      expect(calls.some((c) => c.url.startsWith(DRAFT_SEND))).toBe(false);
+      expect(sendCalls(calls)).toHaveLength(0);
     });
   }
 
@@ -768,7 +961,7 @@ describe("the approved send", () => {
     const { ownerId, key } = await setup();
     const e = MODE("new_recipients");
     installGoogleRoutes([
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
       batchRoute(),
       ...peopleRoutes(),
     ]);
@@ -783,6 +976,54 @@ describe("the approved send", () => {
     );
     expect(JSON.parse(row?.params ?? "{}").args.checkedRecipients).toEqual(["dan@example.net"]);
   });
+
+  for (const [mode, readsBeforeSend] of [
+    ["off", 1],
+    ["new_recipients", 2],
+  ] as const) {
+    it(`sends only the checked bytes when the draft is edited after the read (mode ${mode})`, async () => {
+      const { ownerId, accountId, key } = await setup();
+      await recordKnownRecipients(env.DB, accountId, ["dan@example.net"], "sent");
+      const checked = rawDraft();
+      const edited = rawDraft({ to: "dan@example.net, evil@attacker.test" });
+      // The draft as Gmail holds it: a concurrent update_draft lands right after the last read
+      // this call makes before it sends, so anything that read the draft again would see `edited`.
+      let live = checked;
+      let reads = 0;
+      let sentBody = "";
+      const calls = installGoogleRoutes([
+        {
+          url: DRAFT,
+          reply: () => {
+            const answer = googleJson(200, live);
+            reads += 1;
+            if (reads === readsBeforeSend) live = edited;
+            return answer;
+          },
+        },
+        {
+          method: "POST",
+          url: UPLOAD,
+          reply: async (req) => {
+            sentBody = await req.text();
+            return sentAnswer();
+          },
+        },
+        draftDeleteRoute(),
+      ]);
+      const res = await call(MODE(mode), ownerId, "send_message", { draftId: `${key}:d1` });
+      expect(res.isError).toBe(false);
+      expect(res.json.status).toBeUndefined();
+      expect(reads).toBe(readsBeforeSend);
+      expect(sentBody).toBe(atob(checked.message.raw.replace(/-/g, "+").replace(/_/g, "/")));
+      expect(sentBody).toContain("dan@example.net");
+      expect(sentBody).not.toContain("evil@attacker.test");
+      // The draft is deleted after it was sent, as `drafts.send` would have.
+      const methods = calls.map((c) => c.method);
+      expect(methods.at(-2)).toBe("POST");
+      expect(methods.at(-1)).toBe("DELETE");
+    });
+  }
 
   it("records the recipients of a send that was not held", async () => {
     const { ownerId, accountId } = await setup();

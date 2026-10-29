@@ -17,6 +17,7 @@ const ATTENDEE_FIELDS =
   "email,displayName,responseStatus,self,organizer,optional,resource,comment,additionalGuests";
 const EVENT_FIELDS = [
   "id",
+  "etag",
   "status",
   "summary",
   "description",
@@ -57,6 +58,7 @@ interface GAttendee {
 
 interface GEvent {
   id: string;
+  etag?: string;
   status?: string;
   summary?: string;
   description?: string;
@@ -81,6 +83,22 @@ interface GEvent {
   guestsCanSeeOtherGuests?: boolean;
   created?: string;
   updated?: string;
+}
+
+/**
+ * The answer to a write made `If-Match` an etag the event no longer has (HTTP 412): the event,
+ * and with it the guest list the notification was planned on, changed in between. Other errors
+ * pass through.
+ */
+function changedSince(e: unknown): unknown {
+  if (e instanceof ToolError && e.details?.status === 412) {
+    return new ToolError(
+      "upstream_error",
+      "The event changed while this change was being sent, so nothing was changed. Read it again and retry.",
+      { status: 412 },
+    );
+  }
+  return e;
 }
 
 const EVENT_TYPE_OUT: Record<string, string> = {
@@ -135,6 +153,7 @@ function toEvent(e: GEvent): EventInfo {
   });
   return defined({
     id: e.id,
+    etag: e.etag,
     status: e.status,
     summary: e.summary,
     description: e.description,
@@ -319,32 +338,41 @@ export const googleCalendar: CalendarService = {
     return toEvent(e);
   },
 
-  async updateEvent(a, calendarId, eventId, patch, sendUpdates) {
-    const e = await gjson<GEvent>(
-      a,
-      eventUrl(calendarId, eventId),
-      { method: "PATCH", json: clearOtherTimeKind(toBody(patch)) },
-      {
-        fields: EVENT_FIELDS,
-        query: { sendUpdates, supportsAttachments: true, conferenceDataVersion: 1 },
-      },
-    );
+  async updateEvent(a, calendarId, eventId, patch, sendUpdates, ifMatch) {
+    let e: GEvent | undefined;
+    try {
+      e = await gjson<GEvent>(
+        a,
+        eventUrl(calendarId, eventId),
+        {
+          method: "PATCH",
+          json: clearOtherTimeKind(toBody(patch)),
+          ...(ifMatch ? { headers: { "If-Match": ifMatch } } : {}),
+        },
+        {
+          fields: EVENT_FIELDS,
+          query: { sendUpdates, supportsAttachments: true, conferenceDataVersion: 1 },
+        },
+      );
+    } catch (err) {
+      throw changedSince(err);
+    }
     if (!e) throw new ToolError("upstream_error", "Google answered with an empty body.");
     return toEvent(e);
   },
 
-  async deleteEvent(a, calendarId, eventId, sendUpdates) {
+  async deleteEvent(a, calendarId, eventId, sendUpdates, ifMatch) {
     try {
       await gjson<undefined>(
         a,
         eventUrl(calendarId, eventId),
-        { method: "DELETE" },
+        { method: "DELETE", ...(ifMatch ? { headers: { "If-Match": ifMatch } } : {}) },
         { query: { sendUpdates } },
       );
     } catch (e) {
       // 410 Gone: the event was already deleted, which is what the caller wanted.
       if (e instanceof ToolError && e.details?.status === 410) return;
-      throw e;
+      throw changedSince(e);
     }
   },
 

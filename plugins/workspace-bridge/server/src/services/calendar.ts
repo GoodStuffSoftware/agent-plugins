@@ -55,6 +55,8 @@ export interface GuestPermissions {
 
 export interface EventInfo {
   id: string;
+  /** Google's etag of this version of the event, for a conditional write (`ifMatch`). */
+  etag?: string;
   status?: string;
   summary?: string;
   description?: string;
@@ -156,12 +158,15 @@ export interface CalendarService {
     eventId: string,
     patch: EventInput,
     sendUpdates: SendUpdates,
+    /** The etag the caller planned the write on: the write fails if the event changed since. */
+    ifMatch?: string,
   ): Promise<EventInfo>;
   deleteEvent(
     a: AccountRef,
     calendarId: string,
     eventId: string,
     sendUpdates: SendUpdates,
+    ifMatch?: string,
   ): Promise<void>;
   /** Sets only the caller's own attendee entry; every other entry is sent back unchanged. */
   respond(

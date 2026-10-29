@@ -98,6 +98,13 @@ export type DraftEnvelope = {
   subject: string;
   /** The files the draft holds, for the audit row. */
   attachmentTotals: AttachmentTotals;
+  /**
+   * The message exactly as read (base64url RFC 822), which the fields above were taken from.
+   * `sendDraft` sends these bytes and nothing else.
+   */
+  raw: string;
+  /** The thread the draft belongs to, kept when the message is sent. */
+  threadId?: string;
 };
 
 export type SentMessage = { id: string; threadId: string; labelIds?: string[] };
@@ -115,8 +122,13 @@ export interface SendService {
       maxAttachmentBytes: number;
     },
   ): Promise<SentMessage>;
-  readDraft(a: AccountRef, draftId: string): Promise<DraftEnvelope>;
-  sendDraft(a: AccountRef, draftId: string): Promise<SentMessage>;
+  /** Refused as `too_large` when the message is past `maxBytes` of files plus room for its text. */
+  readDraft(a: AccountRef, draftId: string, maxBytes: number): Promise<DraftEnvelope>;
+  /**
+   * Sends `draft.raw` (what `readDraft` returned and the caller checked, never a fresh copy of the
+   * draft) and then deletes the draft `draftId`.
+   */
+  sendDraft(a: AccountRef, draftId: string, draft: DraftEnvelope): Promise<SentMessage>;
   /**
    * Of `addresses` (already checked as plain, lowercase addresses), those the account has sent a
    * message to before: one batch request of `in:sent to:<address>` lookups. Used by the "hold

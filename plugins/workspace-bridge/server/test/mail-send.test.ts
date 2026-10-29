@@ -7,6 +7,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { type Kind, SCOPES } from "../src/auth/endpoints";
 import { mcpHandler } from "../src/auth/mcp-factory";
+import { base64url } from "../src/core/crypto";
 import { type AuditLogRow, all } from "../src/core/db";
 import type { Env } from "../src/env";
 import { compileRegistry } from "../src/registry/compile";
@@ -19,6 +20,7 @@ import {
   installGoogleRoutes,
   linkGoogleAccount,
   newOwner,
+  rawDraft,
   tokenRoute,
 } from "./helpers/google";
 import { ISSUER, mcpRequest, parseMcp, toolJson } from "./helpers/mcp";
@@ -30,7 +32,6 @@ const UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/s
 const SEND_AS = `${BASE}/settings/sendAs`;
 const MESSAGE = `${BASE}/messages/m_orig`;
 const DRAFT = `${BASE}/drafts/d1`;
-const DRAFT_SEND = `${BASE}/drafts/send`;
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -346,7 +347,7 @@ describe("send_message", () => {
     const { ownerId, key } = await setup();
     installGoogleRoutes([
       originalRoute(),
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
       sendRoute(),
     ]);
     const e = ON({ SEND_REQUIRES_CONFIRM: "true" });
@@ -445,25 +446,28 @@ describe("send_message", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it("sends a draft by id after checking its recipients and From", async () => {
+  it("sends a draft by id after checking its recipients and From, then deletes the draft", async () => {
     const { ownerId, key } = await setup();
+    const draft = rawDraft();
     let sentBody = "";
+    let contentType: string | null = null;
     const calls = installGoogleRoutes([
-      { url: DRAFT, reply: () => googleJson(200, fx.draft) },
-      {
-        method: "POST",
-        url: DRAFT_SEND,
-        reply: async (req) => {
-          sentBody = await req.text();
-          return sentAnswer();
-        },
-      },
+      { url: DRAFT, reply: () => googleJson(200, draft) },
+      sendRoute(async (req) => {
+        contentType = req.headers.get("Content-Type");
+        sentBody = await req.text();
+        return sentAnswer();
+      }),
+      { method: "DELETE", url: DRAFT, reply: () => new Response(null, { status: 204 }) },
     ]);
     const res = await call(ON(), ownerId, "send_message", { draftId: `${key}:d1` });
     expect(res.isError).toBe(false);
     expect(res.json.id).toBe(`${key}:m_sent`);
-    expect(JSON.parse(sentBody)).toEqual({ id: "d1" });
-    expect(query(calls[0]).get("format")).toBe("full");
+    // Exactly the bytes that were read and checked go out, as a media upload.
+    expect(contentType).toBe("message/rfc822");
+    expect(sentBody).toBe(atob(draft.message.raw.replace(/-/g, "+").replace(/_/g, "/")));
+    expect(query(calls[0]).get("format")).toBe("raw");
+    expect(calls.map((c) => c.method)).toEqual(["GET", "POST", "DELETE"]);
     const rows = await auditRows(ownerId);
     expect(rows[0]).toMatchObject({
       tool: "send_message",
@@ -474,13 +478,114 @@ describe("send_message", () => {
     expect(JSON.parse(rows[0]?.to_addrs ?? "[]")).toEqual(["dan@example.net"]);
   });
 
+  it("keeps the draft's thread when it sends the draft", async () => {
+    const { ownerId, key } = await setup();
+    let sentBody = "";
+    installGoogleRoutes([
+      { url: DRAFT, reply: () => googleJson(200, rawDraft({ threadId: "t_draft" })) },
+      sendRoute(async (req) => {
+        sentBody = await req.text();
+        return sentAnswer();
+      }),
+      { method: "DELETE", url: DRAFT, reply: () => new Response(null, { status: 204 }) },
+    ]);
+    const res = await call(ON(), ownerId, "send_message", { draftId: `${key}:d1` });
+    expect(res.isError).toBe(false);
+    expect(sentBody).toContain('{"threadId":"t_draft"}');
+    expect(sentBody).toContain("Subject: Draft subject");
+  });
+
+  it("still answers when the sent draft cannot be deleted", async () => {
+    const { ownerId, key } = await setup();
+    installGoogleRoutes([
+      { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+      sendRoute(),
+      { method: "DELETE", url: DRAFT, reply: () => googleJson(500, { error: { code: 500 } }) },
+    ]);
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const res = await call(ON(), ownerId, "send_message", { draftId: `${key}:d1` });
+    expect(res.isError).toBe(false);
+    expect(res.json.id).toBe(`${key}:m_sent`);
+  });
+
+  it("refuses a draft past the send limit before decoding it", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      {
+        url: DRAFT,
+        reply: () => googleJson(200, rawDraft({ headers: [["X-Pad", "a".repeat(400_000)]] })),
+      },
+      sendRoute(),
+    ]);
+    const res = await call(ON({ MAX_SEND_ATTACHMENT_BYTES: "1000" }), ownerId, "send_message", {
+      draftId: "d1",
+    });
+    expect(res.json.error.code).toBe("too_large");
+    expect(sendCalls(calls)).toHaveLength(0);
+  });
+
+  it("reports the files a draft holds, and scans a hostile body in linear time", async () => {
+    const { ownerId, key } = await setup();
+    const file = `${"QUJD".repeat(19)}\r\n`.repeat(10); // 10 lines of 76 characters: 570 bytes
+    const mime = [
+      "From: work@example.com",
+      "To: dan@example.net",
+      "Subject: Files",
+      'Content-Type: multipart/mixed; boundary="b1"',
+      "",
+      "--b1",
+      "Content-Type: text/plain",
+      "",
+      "hi",
+      "--b1",
+      "Content-Type: application/pdf",
+      "Content-Disposition: attachment; filename=a.pdf",
+      "",
+      file,
+      "--b1--",
+      // A body shaped to make a backtracking scan quadratic: many blank lines, no boundary.
+      "Content-Disposition: attachment",
+      "\r\n".repeat(20_000),
+    ].join("\r\n");
+    const draft = { id: "d1", message: { raw: base64url(new TextEncoder().encode(mime)) } };
+    installGoogleRoutes([
+      { url: DRAFT, reply: () => googleJson(200, draft) },
+      sendRoute(),
+      { method: "DELETE", url: DRAFT, reply: () => new Response(null, { status: 204 }) },
+    ]);
+    const started = Date.now();
+    const res = await call(ON(), ownerId, "send_message", { draftId: `${key}:d1` });
+    expect(res.isError).toBe(false);
+    expect(res.json.attachments.count).toBe(2);
+    expect(Date.now() - started).toBeLessThan(3000);
+  });
+
+  it("counts every To and Cc line of a draft against the recipient cap", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      {
+        url: DRAFT,
+        reply: () =>
+          googleJson(
+            200,
+            rawDraft({ headers: [["To", "second@example.net"]], cc: "cy@example.net" }),
+          ),
+      },
+      sendRoute(),
+    ]);
+    const res = await call(ON({ MAX_RECIPIENTS: "2" }), ownerId, "send_message", {
+      draftId: "d1",
+    });
+    expect(res.json.error.code).toBe("too_many_recipients");
+    expect(sendCalls(calls)).toHaveLength(0);
+  });
+
   it("refuses a draft whose From is not allowed, without sending it", async () => {
     const { ownerId } = await setup();
-    const draft = structuredClone(fx.draft);
-    draft.message.payload.headers[0] = { name: "From", value: "stranger@example.org" };
+    const draft = rawDraft({ from: "stranger@example.org" });
     const calls = installGoogleRoutes([
       { url: DRAFT, reply: () => googleJson(200, draft) },
-      { method: "POST", url: DRAFT_SEND, reply: sentAnswer },
+      sendRoute(),
     ]);
     const res = await call(ON(), ownerId, "send_message", { draftId: "d1" });
     expect(res.json.error.code).toBe("sender_not_allowed");

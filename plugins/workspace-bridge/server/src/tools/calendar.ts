@@ -806,7 +806,15 @@ interface NotifyArgs {
   addedAttendees?: readonly AttendeeIn[] | undefined;
   addedAttendeeEmails?: readonly string[] | undefined;
   responseComment?: string | undefined;
+  /** The notified recipients `approval.when` checked (the server's field, never the caller's). */
+  checkedRecipients?: string[] | undefined;
 }
+
+/** The input field that carries `checkedRecipients` on the three tools that read the event. */
+const checkedRecipientsParam = z
+  .array(z.string())
+  .optional()
+  .describe("Set by the server; any value given here is replaced.");
 
 interface SendPlan {
   a: AccountRef;
@@ -815,6 +823,8 @@ interface SendPlan {
   sendUpdates: SendUpdates;
   /** Distinct lowercase addresses outside the owner's own accounts that Google will email. */
   recipients: string[];
+  /** The etag of the event the plan was made from, when it read one. */
+  etag?: string | undefined;
 }
 
 /**
@@ -834,13 +844,14 @@ async function notifiedRecipients(
   tool: CalendarSendTool,
   args: NotifyArgs,
   known?: EventInfo,
-): Promise<string[]> {
+): Promise<{ recipients: string[]; etag?: string | undefined }> {
   const level = sendUpdatesOf(args.notificationLevel);
   const comment = tool === "respond_to_event" && (args.responseComment ?? "").trim() !== "";
-  if (level === "none" && !comment) return [];
+  if (level === "none" && !comment) return { recipients: [] };
   // The caller's own `resource` flag is never trusted (it would let a prompt-injected caller take
   // an outside address out of the count); only what Google returned, and room addresses, are skipped.
   const candidates: EventAttendee[] = [];
+  let etag: string | undefined;
   const named = (list: readonly AttendeeIn[] | undefined, emails: readonly string[] | undefined) =>
     attendeesOf(list, emails).map((x) => ({ ...x, resource: false }));
   if (tool === "create_event") candidates.push(...named(args.attendees, args.attendeeEmails));
@@ -859,10 +870,11 @@ async function notifiedRecipients(
         if (!(tool === "delete_event" && gone)) throw e;
       }
     }
+    etag = event?.etag;
     if (tool === "respond_to_event") {
       // An account that is not a guest has no response to set: the provider refuses it, so nothing
       // is mailed and no send is spent on it.
-      if (event && !(event.attendees ?? []).some((x) => x.self === true)) return [];
+      if (event && !(event.attendees ?? []).some((x) => x.self === true)) return { recipients: [] };
       if (event?.organizer?.email) candidates.push({ email: event.organizer.email });
     } else {
       // The organizer is mailed too, and an outsider may be missing from the guest list Google shows.
@@ -880,7 +892,7 @@ async function notifiedRecipients(
     if (own.has(email)) continue;
     out.add(email);
   }
-  return [...out];
+  return { recipients: [...out], etag };
 }
 
 /** Writes an audit row for a calendar send; a failing log never changes the answer. */
@@ -950,8 +962,49 @@ async function planOf(
   known?: { t?: Awaited<ReturnType<typeof target>>; event?: EventInfo },
 ): Promise<SendPlan> {
   const t = known?.t ?? (await target(ctx, args.account, args.calendarId, args.eventId));
-  const recipients = await notifiedRecipients(ctx, t, tool, args, known?.event);
-  return { ...t, sendUpdates: sendUpdatesOf(args.notificationLevel), recipients };
+  const { recipients, etag } = await notifiedRecipients(ctx, t, tool, args, known?.event);
+  return { ...t, sendUpdates: sendUpdatesOf(args.notificationLevel), recipients, etag };
+}
+
+/**
+ * The `If-Match` of a write that notifies people: the etag of the event the plan was made from, so
+ * Google refuses the write (HTTP 412) if the event, and with it the guest list, changed since. With
+ * notifications off nobody is mailed and no precondition is set.
+ */
+function ifMatchOf(plan: SendPlan): string | undefined {
+  if (plan.sendUpdates === "none") return undefined;
+  // An event that is already gone (nothing to read) mails nobody. Otherwise no etag would mean
+  // no precondition on a write that notifies people: refused rather than sent unprotected.
+  if (plan.etag === undefined && plan.recipients.length > 0) {
+    throw new ToolError(
+      "upstream_error",
+      "Google did not say which version of the event was read, so the change cannot be made safely. Nothing was sent or changed.",
+    );
+  }
+  return plan.etag;
+}
+
+/**
+ * Refuses a call whose fresh plan notifies someone the plan that was checked (and, when held,
+ * shown to the owner) did not name. The handler of `update_event`, `delete_event` and
+ * `respond_to_event` works the list out from the event's guests as they are when it runs, so a
+ * guest added after the check would otherwise be mailed unchecked. Nothing has been sent or
+ * changed when this throws; it is audited like any other refusal. No `checkedRecipients` (sending
+ * approval is off) means nothing to compare.
+ */
+async function assertChecked(
+  ctx: ToolContext,
+  tool: CalendarSendTool,
+  args: NotifyArgs,
+  plan: SendPlan,
+): Promise<void> {
+  const checked = args.checkedRecipients;
+  if (!checked || plan.recipients.every((r) => checked.includes(r))) return;
+  await auditSend(ctx, tool, plan.a, plan.recipients, "refused", "recipients_changed");
+  throw new ToolError(
+    "invalid_argument",
+    "The people this change would email are not the ones that were checked: the event's guests changed in between. Nothing was sent or changed; ask for the change again.",
+  );
 }
 
 const heldPlans = new WeakMap<object, Promise<SendPlan>>();
@@ -992,9 +1045,15 @@ async function holdsSend(ctx: ToolContext, plan: SendPlan, args: object): Promis
 function sendApproval(tool: CalendarSendTool) {
   return {
     async when(args: NotifyArgs, ctx: ToolContext): Promise<boolean> {
+      // The server's field, never the caller's: cleared first, whatever the mode.
+      args.checkedRecipients = undefined;
       // Cheap exit: no event read for a call that cannot be held.
       if (config(ctx.env).sendApprovalMode === "off") return false;
       const plan = await heldPlan(ctx, tool, args);
+      // The notified recipients as checked here, held or not: stored with the call, so the handler
+      // (now, or once approved) refuses when the event's guests would notify someone else.
+      // `create_event` names its guests in the call itself and needs no such record.
+      if (tool !== "create_event") args.checkedRecipients = plan.recipients;
       if (plan.recipients.length === 0 || !(await holdsSend(ctx, plan, args))) return false;
       try {
         await ctx.limits.assertSendEnabled(plan.a);
@@ -1233,6 +1292,7 @@ const updateEvent = defineTool({
     useDefaultReminders: z.boolean().optional(),
     visibility,
     notificationLevel,
+    checkedRecipients: checkedRecipientsParam,
     account,
   }),
   approval: sendApproval("update_event"),
@@ -1354,12 +1414,13 @@ const updateEvent = defineTool({
       t,
       ...(current ? { event: current } : {}),
     });
+    await assertChecked(ctx, "update_event", args, plan);
     const { sendUpdates } = plan;
     const e = await guardedNotify(
       ctx,
       "update_event",
       plan,
-      () => svc.updateEvent(t.a, t.cal, eventId, patch, sendUpdates),
+      () => svc.updateEvent(t.a, t.cal, eventId, patch, sendUpdates, ifMatchOf(plan)),
       (r) => r.id,
     );
     return { event: view(ctx, t.a, e, t.cal), notified: sendUpdates };
@@ -1384,18 +1445,23 @@ const deleteEvent = defineTool({
     eventId: z.string().min(1).describe("Required. The id of the event to delete."),
     calendarId,
     notificationLevel,
+    checkedRecipients: checkedRecipientsParam,
     account,
   }),
   approval: sendApproval("delete_event"),
   async handler(args, ctx) {
     const t = await target(ctx, args.account, args.calendarId, args.eventId);
     const plan = await planOf(ctx, "delete_event", args, { t });
+    await assertChecked(ctx, "delete_event", args, plan);
     const { sendUpdates } = plan;
     await guardedNotify(
       ctx,
       "delete_event",
       plan,
-      () => ctx.use(CALENDAR, t.a).deleteEvent(t.a, t.cal, t.event as string, sendUpdates),
+      () =>
+        ctx
+          .use(CALENDAR, t.a)
+          .deleteEvent(t.a, t.cal, t.event as string, sendUpdates, ifMatchOf(plan)),
       () => t.event,
     );
     return { deleted: ctx.ids.encode(t.a, t.event as string), notified: sendUpdates };
@@ -1425,12 +1491,19 @@ const respondToEvent = defineTool({
     responseComment: z.string().optional().describe("A comment sent with the response."),
     calendarId,
     notificationLevel,
+    checkedRecipients: checkedRecipientsParam,
     account,
   }),
   approval: sendApproval("respond_to_event"),
   async handler(args, ctx) {
     const t = await target(ctx, args.account, args.calendarId, args.eventId);
     const plan = await planOf(ctx, "respond_to_event", args, { t });
+    // Residual window: the organizer, the one person a response mails, is read here, and the
+    // provider then reads the guest list and patches (two more Google calls). The organizer cannot
+    // change in between except by moving the event to another calendar, and no other guest is
+    // mailed by a response. There is no `If-Match` here: the etag moves whenever any guest
+    // answers, which would fail most responses to a large event.
+    await assertChecked(ctx, "respond_to_event", args, plan);
     const { sendUpdates } = plan;
     const e = await guardedNotify(
       ctx,

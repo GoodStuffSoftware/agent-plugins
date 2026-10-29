@@ -329,7 +329,7 @@ async function draftSummary(
   try {
     const id = idOf(ctx, draftId);
     const a = await accountFor(ctx, selector, id.shortId);
-    const d = await ctx.use(SEND, a).readDraft(a, id.providerId);
+    const d = await ctx.use(SEND, a).readDraft(a, id.providerId, sendCap(ctx));
     return { to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject };
   } catch {
     return {};
@@ -401,16 +401,19 @@ const sendMessage = defineTool({
   }),
   approval: {
     async when(args, ctx) {
+      // The server's field, never the caller's: cleared first, whatever the mode.
+      args.checkedRecipients = undefined;
       if (mode(ctx) === "off") return false;
       assertSingleLine("subject", args.subject);
       const ref = args.draftId ?? args.replyToMessageId ?? args.replyThreadId;
-      // A draft's recipients as seen now are stored with the call (the server's field, never the
-      // caller's): the send, now or once approved, refuses a draft that gained a recipient since.
-      args.checkedRecipients = undefined;
+      // A draft's recipients as seen now are stored with the call: the send, now or once approved,
+      // refuses a draft that gained a recipient since, and sends only the bytes it read and checked.
       if (mode(ctx) === "all") {
         if (args.draftId) {
           const a = await accountFor(ctx, args.account, idOf(ctx, args.draftId).shortId);
-          const draft = await ctx.use(SEND, a).readDraft(a, idOf(ctx, args.draftId).providerId);
+          const draft = await ctx
+            .use(SEND, a)
+            .readDraft(a, idOf(ctx, args.draftId).providerId, sendCap(ctx));
           args.checkedRecipients = normalizeRecipients(entriesOf(draft));
         } else {
           await checkBeforeHold(ctx, "send_message", args.account, ref, args.subject, args, true);
@@ -421,7 +424,9 @@ const sendMessage = defineTool({
       let entries: string[];
       if (args.draftId) {
         // The draft's real To, Cc and Bcc; a failing read is the caller's error, never a free pass.
-        const draft = await ctx.use(SEND, a).readDraft(a, idOf(ctx, args.draftId).providerId);
+        const draft = await ctx
+          .use(SEND, a)
+          .readDraft(a, idOf(ctx, args.draftId).providerId, sendCap(ctx));
         entries = entriesOf(draft);
         args.checkedRecipients = normalizeRecipients(entries);
       } else {
@@ -465,7 +470,7 @@ const sendMessage = defineTool({
 
     if (args.draftId) {
       const draftId = idOf(ctx, args.draftId).providerId;
-      const draft = await sender.readDraft(a, draftId);
+      const draft = await sender.readDraft(a, draftId, sendCap(ctx));
       const fromHeader = draft.from ? parseAddresses(draft.from)[0] : undefined;
       const { sent } = await guardedSend(
         ctx,
@@ -488,7 +493,7 @@ const sendMessage = defineTool({
           },
           attachments: draft.attachmentTotals,
         },
-        () => sender.sendDraft(a, draftId),
+        () => sender.sendDraft(a, draftId, draft),
       );
       return answer(ctx, a, sent, draft.attachmentTotals);
     }

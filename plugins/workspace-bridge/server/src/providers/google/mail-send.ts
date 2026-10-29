@@ -4,7 +4,9 @@
 // is the request body (`uploadType=media`, `Content-Type: message/rfc822`), which spares the base64
 // pass on the Worker's 10 ms CPU budget. A plain media upload cannot carry a `threadId`, so a
 // threaded message uses `uploadType=multipart`: a `multipart/related` body with the JSON metadata
-// `{"threadId":...}` and the `message/rfc822` part. A draft is sent by id (`drafts/send`).
+// `{"threadId":...}` and the `message/rfc822` part. A draft is read in `format=raw` and sent as
+// those very bytes through `messages/send`, then deleted (see `sendDraft`): `drafts/send` would send
+// whatever the draft holds at that instant, which a concurrent edit could have changed.
 //
 // Files go in as base64 MIME parts, the client's own base64 re-wrapped and never decoded. A forward
 // carries the original's files: `prepare` only reads their sizes (and refuses past the cap), and
@@ -14,7 +16,9 @@
 
 import { ToolError } from "../../core/errors";
 import {
+  b64urlToBytes,
   base64Bytes,
+  binaryToBytes,
   buildRfc822,
   decodeEncodedWords,
   escapeHtml,
@@ -357,8 +361,21 @@ async function deliver(
     },
     { requireRecipient: true },
   );
+  return uploadMessage(a, raw, m.threadId);
+}
+
+/**
+ * One `messages/send` by media upload: the RFC 822 bytes as the request body, or, to thread the
+ * message, a `multipart/related` body with the `{"threadId":...}` metadata. A string is sent as
+ * UTF-8 text, bytes exactly as they are.
+ */
+async function uploadMessage(
+  a: AccountRef,
+  raw: string | Uint8Array,
+  threadId: string | undefined,
+): Promise<SentMessage> {
   const url = `${UPLOAD}/messages/send`;
-  if (!m.threadId) {
+  if (!threadId) {
     return sent(
       await gjson<GmailMessage>(
         a,
@@ -369,18 +386,17 @@ async function deliver(
     );
   }
   const boundary = `wb_${crypto.randomUUID()}`;
-  const body = [
+  const head = [
     `--${boundary}`,
     "Content-Type: application/json; charset=UTF-8",
     "",
-    JSON.stringify({ threadId: m.threadId }),
+    JSON.stringify({ threadId }),
     `--${boundary}`,
     "Content-Type: message/rfc822",
     "",
-    raw,
-    `--${boundary}--`,
     "",
   ].join("\r\n");
+  const body = new Blob([head, raw, `\r\n--${boundary}--\r\n`]);
   return sent(
     await gjson<GmailMessage>(
       a,
@@ -397,41 +413,143 @@ async function deliver(
 
 // ---- Drafts --------------------------------------------------------------------------------------
 
-async function readDraft(a: AccountRef, draftId: string): Promise<DraftEnvelope> {
-  const d = await gjson<{ id?: string; message?: GmailMessage }>(
+/** Base64 characters allowed on top of the attachment limit, for a draft's text parts and headers. */
+const DRAFT_TEXT_ROOM = 262_144;
+
+const unreadable = (): ToolError =>
+  new ToolError("invalid_argument", "The draft could not be read as a mail message.");
+
+/**
+ * The top-level header fields of a raw message, unfolded, by lowercase name (every occurrence, in
+ * order). Strict on purpose: a header line that is neither `name: value` nor a fold, a bare CR or a
+ * NUL is refused rather than guessed at, because the recipients checked here must be the ones Gmail
+ * will read from the same bytes.
+ */
+function rawHeaders(bin: string): Map<string, string[]> {
+  const end = bin.search(/\r?\n\r?\n/);
+  const block = end < 0 ? bin : bin.slice(0, end);
+  if (/\r(?!\n)|\0/.test(block)) throw unreadable();
+  // 8-bit header text is UTF-8 on the wire; the rest is ASCII.
+  const text = new TextDecoder().decode(binaryToBytes(block));
+  const out = new Map<string, string[]>();
+  let name: string | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    if (line === "") continue; // the end of a header-only message
+    if (/^[ \t]/.test(line)) {
+      const list = name === undefined ? undefined : out.get(name);
+      if (!list) throw unreadable();
+      list[list.length - 1] += ` ${line.trim()}`;
+      continue;
+    }
+    const m = line.match(/^([^\s:]+):[ \t]*(.*)$/);
+    if (!m) throw unreadable();
+    name = (m[1] ?? "").toLowerCase();
+    const list = out.get(name) ?? [];
+    list.push((m[2] ?? "").trim());
+    out.set(name, list);
+  }
+  return out;
+}
+
+/**
+ * The files a raw message holds and about how large they are, for the audit row only (an estimate
+ * from the base64 bodies of the parts marked `attachment`).
+ */
+function rawAttachmentTotals(bin: string): AttachmentTotals {
+  // One forward pass (the cursor only moves on), so a crafted body cannot make it slow.
+  const lower = bin.toLowerCase();
+  const tag = "content-disposition:";
+  let count = 0;
+  let bytes = 0;
+  let at = 0;
+  for (;;) {
+    const i = lower.indexOf(tag, at);
+    if (i < 0) break;
+    at = i + tag.length;
+    if (i > 0 && lower[i - 1] !== "\n") continue; // not the start of a header line
+    if (!/^[ \t]*attachment/.test(lower.slice(at, at + 48))) continue;
+    const lf = lower.indexOf("\n\n", at);
+    const crlf = lower.indexOf("\r\n\r\n", at);
+    const gap = lf < 0 ? crlf : crlf < 0 ? lf : Math.min(lf, crlf);
+    if (gap < 0) break;
+    const start = gap + (gap === crlf ? 4 : 2);
+    const end = lower.indexOf("\n--", start);
+    const stop = end < 0 ? lower.length : end;
+    count++;
+    // Base64 lines of 76 characters plus a line break, three bytes to four characters.
+    bytes += Math.floor(((stop - start) * 76 * 3) / (78 * 4));
+    at = stop;
+  }
+  return { count, bytes };
+}
+
+/**
+ * Reads a draft as the exact message it would send (`format=raw`). The envelope carries those
+ * bytes (`raw`), so the recipients the caller checks and the message `sendDraft` sends are one and
+ * the same thing, whatever happens to the draft in between.
+ */
+async function readDraft(a: AccountRef, draftId: string, maxBytes: number): Promise<DraftEnvelope> {
+  const d = await gjson<{ id?: string; message?: { threadId?: string; raw?: string } }>(
     a,
     `${BASE}/drafts/${enc(draftId)}`,
     {},
-    // Full format: only it lists the draft's files (the metadata format leaves the parts out).
-    { fields: "id,message(payload)", query: { format: "full" } },
+    { fields: "id,message(threadId,raw)", query: { format: "raw" } },
   );
-  if (!d.id) throw malformed();
-  const p = d.message?.payload;
-  const from = headerOf(p, "From");
-  const files = listAttachments(p);
-  const attachmentTotals: AttachmentTotals = {
-    count: files.length,
-    bytes: files.reduce((n, f) => n + f.size, 0),
-  };
+  const raw = d.message?.raw;
+  if (!d.id || !raw) throw malformed();
+  // The read pulls every byte of the message and it is decoded and scanned here, so a draft past
+  // the send limit (the files, as for the other send tools, plus room for the text) is refused
+  // before any of that work.
+  if (raw.length > Math.ceil((maxBytes * 4) / 3) + DRAFT_TEXT_ROOM) {
+    throw new ToolError(
+      "too_large",
+      `This draft is larger than the ${maxBytes} byte send limit (plus room for its text), so send_message cannot send it. Remove files from it or send a smaller message.`,
+      { maxBytes },
+    );
+  }
+  let bin: string;
+  try {
+    bin = atob(raw.replace(/-/g, "+").replace(/_/g, "/"));
+  } catch {
+    throw malformed();
+  }
+  const h = rawHeaders(bin);
+  const one = (name: string) => h.get(name)?.[0];
+  // Every To, Cc and Bcc line counts: a message may carry the field twice.
+  const list = (name: string) => readAddressList(h.get(name)?.join(", "));
+  if ((h.get("from")?.length ?? 0) > 1) throw unreadable();
+  const from = one("from");
   return {
     ...(from === undefined ? {} : { from: singleLine(decodeEncodedWords(from)) }),
-    to: readAddressList(headerOf(p, "To")),
-    cc: readAddressList(headerOf(p, "Cc")),
-    bcc: readAddressList(headerOf(p, "Bcc")),
-    subject: singleLine(decodeEncodedWords(headerOf(p, "Subject") ?? "")),
-    attachmentTotals,
+    to: list("to"),
+    cc: list("cc"),
+    bcc: list("bcc"),
+    subject: singleLine(decodeEncodedWords(one("subject") ?? "")),
+    attachmentTotals: rawAttachmentTotals(bin),
+    raw,
+    ...(d.message?.threadId ? { threadId: d.message.threadId } : {}),
   };
 }
 
-async function sendDraft(a: AccountRef, draftId: string): Promise<SentMessage> {
-  return sent(
-    await gjson<GmailMessage>(
-      a,
-      `${BASE}/drafts/send`,
-      { method: "POST", json: { id: draftId } },
-      { fields: SENT_FIELDS },
-    ),
-  );
+/**
+ * Sends exactly `draft.raw`, the bytes `readDraft` returned and the caller checked, through
+ * `messages/send` (keeping the thread), then deletes the draft as `drafts/send` would have. Nothing
+ * that happens to the draft after the read can reach Gmail: an edit adding a recipient changes the
+ * draft, not these bytes. The delete is best effort (the message is already sent, and failing the
+ * call would invite a second send); an edited draft is deleted too, its edit never having been sent.
+ */
+async function sendDraft(
+  a: AccountRef,
+  draftId: string,
+  draft: DraftEnvelope,
+): Promise<SentMessage> {
+  const out = await uploadMessage(a, b64urlToBytes(draft.raw), draft.threadId);
+  try {
+    await gjson<undefined>(a, `${BASE}/drafts/${enc(draftId)}`, { method: "DELETE" });
+  } catch {
+    console.error("send_message: the sent draft could not be deleted");
+  }
+  return out;
 }
 
 /** Addresses the account has sent to, by one batch of `in:sent to:<address>` (`maxResults=1`). */
