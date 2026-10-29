@@ -1,6 +1,11 @@
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
 
+// Shared CI runners (the Windows one above all) are several times slower than a dev box, so the
+// 5 s default flakes on tests that are correct. Raise the limits on CI only; they stay finite so a
+// real hang still fails.
+const onCi = Boolean(process.env.CI);
+
 export default defineConfig({
   plugins: [
     cloudflareTest(async () => ({
@@ -31,6 +36,8 @@ export default defineConfig({
   ],
   test: {
     include: ["test/**/*.test.ts"],
+    testTimeout: onCi ? 30_000 : 5_000,
+    hookTimeout: onCi ? 30_000 : 10_000,
     setupFiles: ["./test/setup.ts"],
   },
 });
