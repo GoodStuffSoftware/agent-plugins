@@ -1,5 +1,4 @@
 {
   "plugins/session-sync": "0.3.0",
-  "plugins/discord": "0.1.0",
-  "plugins/workspace-bridge": "0.1.0"
+  "plugins/discord": "0.1.0"
 }

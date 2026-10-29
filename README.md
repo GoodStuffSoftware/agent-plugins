@@ -54,6 +54,14 @@ node scripts/sync-plugins.mjs --check   # CI: fail if out of sync
 
 The check runs on every PR, because a `plugin.json` bump that never reaches `marketplace.json` means users silently never receive the update.
 
+### workspace-bridge (manual releases)
+
+`workspace-bridge` is released by hand, not by Release Please, because this repo does not let Actions open pull requests. It is not listed in `release-please-config.json` or `.release-please-manifest.json`, and `sync-plugins.mjs` skips it for those two files. To release version `X.Y.Z`:
+
+1. Set `X.Y.Z` in `plugins/workspace-bridge/.claude-plugin/plugin.json` and `plugins/workspace-bridge/server/src/version.ts`.
+2. Run `node scripts/sync-plugins.mjs` to update the marketplace entry, then commit (`chore(release): workspace-bridge X.Y.Z`) and push to `main`.
+3. Tag that commit and publish: `git tag workspace-bridge@vX.Y.Z && git push origin workspace-bridge@vX.Y.Z`, then `gh release create workspace-bridge@vX.Y.Z --title "workspace-bridge X.Y.Z" --notes "..."`.
+
 ## Credits
 
 Structure and release tooling adapted from work by others — see [CREDITS.md](CREDITS.md).

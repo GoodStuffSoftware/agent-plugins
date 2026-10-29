@@ -54,6 +54,10 @@ function discover() {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+// Plugins released by hand (tag + gh release), not by release-please. They stay
+// in the marketplace sync but are kept out of the release-please files.
+const MANUAL_RELEASE = new Set(['workspace-bridge']);
+
 const plugins = discover();
 if (!plugins.length) {
   console.error('no plugins found under plugins/ — nothing to sync');
@@ -93,6 +97,7 @@ market.plugins.sort((a, b) => a.name.localeCompare(b.name));
 const rp = existsSync(RP_CONFIG) ? readJson(RP_CONFIG) : { packages: {} };
 rp.packages ||= {};
 for (const p of plugins) {
+  if (MANUAL_RELEASE.has(p.name)) continue;
   if (!rp.packages[p.dir]) {
     rp.packages[p.dir] = {
       'release-type': 'simple',
@@ -111,6 +116,7 @@ for (const p of plugins) {
 // ---- 3. .release-please-manifest.json ---------------------------------------
 const rpm = existsSync(RP_MANIFEST) ? readJson(RP_MANIFEST) : {};
 for (const p of plugins) {
+  if (MANUAL_RELEASE.has(p.name)) continue;
   if (p.version && rpm[p.dir] !== p.version) {
     changes.push(`.release-please-manifest.json: ${p.dir} ${rpm[p.dir] ?? '(unset)'} -> ${p.version}`);
     rpm[p.dir] = p.version;
