@@ -92,6 +92,18 @@ function check({ criteria, action }: CreateArgs): void {
 const bare = (id: string) => id.replace(/^a[0-9]+:/, "");
 
 /**
+ * A filter that trashes or spams future mail is held, like a forward. This matches the label tools
+ * (M11/M12), which refuse TRASH and SPAM: adding either, or removing INBOX together with either.
+ */
+function trashesMail(action: z.output<typeof actionSchema>): boolean {
+  const risky = (id: string) => ["TRASH", "SPAM"].includes(bare(id));
+  const add = action.addLabelIds ?? [];
+  const remove = action.removeLabelIds ?? [];
+  if (add.some(risky)) return true;
+  return remove.some((id) => bare(id) === "INBOX") && remove.some(risky);
+}
+
+/**
  * Resolves the one account a filter addresses. The first prefixed label id selects the account
  * (else the selector or the default does); every prefixed id must belong to it. Returns the
  * provider's label ids.
@@ -184,7 +196,7 @@ const createFilter = defineTool({
   name: "create_filter",
   title: "Create a filter",
   description:
-    "Creates a Gmail filter that labels, archives or forwards incoming mail matching its criteria. A filter cannot be edited: delete it and create another. A filter that forwards mail is held until the owner approves it on the approval page (the answer carries the approvalUrl); the forwarding address must already be verified in Gmail.",
+    "Creates a Gmail filter that labels, archives or forwards incoming mail matching its criteria. A filter cannot be edited: delete it and create another. A filter that forwards mail, or that trashes or spams it, is held until the owner approves it on the approval page (the answer carries the approvalUrl). A forwarding filter needs sending switched on and an already verified forwarding address.",
   component: "mail",
   scopes: ["mail.write"],
   endpoints: ["full"],
@@ -201,14 +213,29 @@ const createFilter = defineTool({
     account,
   }),
   approval: {
-    when(args) {
+    async when(args, ctx) {
       check(args);
-      return args.action.forward !== undefined;
+      const { forward } = args.action;
+      if (forward !== undefined) {
+        // Refuse a doomed forward filter now, so nothing is queued for the owner to approve.
+        const a = await resolveAccount(ctx, args.account, idsOf(args.action));
+        await ctx.limits.assertSendEnabled(a);
+        if (!(await ctx.use(FILTERS, a).isForwardingVerified(a, forward))) {
+          throw new ToolError(
+            "invalid_argument",
+            `${forward} is not a verified forwarding address of this account. Add and confirm it in Gmail settings (Forwarding and POP/IMAP), then try again; this tool cannot add forwarding addresses.`,
+          );
+        }
+        return true;
+      }
+      return trashesMail(args.action);
     },
     async preview(args, ctx) {
       const a = await resolveAccount(ctx, args.account, idsOf(args.action));
       return {
-        summary: `Create a filter on ${a.address} that forwards matching mail to ${args.action.forward}.`,
+        summary: args.action.forward
+          ? `Create a filter on ${a.address} that forwards matching mail to ${args.action.forward}.`
+          : `Create a filter on ${a.address} that moves matching mail to trash or spam.`,
         account: a.address,
         criteria: args.criteria,
         action: {
@@ -240,7 +267,11 @@ const createFilter = defineTool({
         subject: args.criteria.subject ?? null,
         detail: action.forward ? "filter that forwards" : "filter",
       },
-      () => svc.create(a, { criteria: args.criteria, action }),
+      async () => {
+        // Also runs when the owner approves a held forward filter: sending may be off by then.
+        if (action.forward) await ctx.limits.assertSendEnabled(a);
+        return svc.create(a, { criteria: args.criteria, action });
+      },
     );
     return filterView(ctx, a, created);
   },
