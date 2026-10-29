@@ -437,6 +437,141 @@ describe("forward with attachments", () => {
   });
 });
 
+// ---- drafts --------------------------------------------------------------------------------------
+
+describe("drafts with attachments", () => {
+  const DRAFTS = `${BASE}/drafts`;
+  const DRAFT_UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts";
+  const draftAnswer = () => googleJson(200, { id: "d1", message: { id: "m1", threadId: "t1" } });
+  /** A draft that holds the fixture's file. */
+  const draftWithFile = () =>
+    googleJson(200, {
+      id: "d1",
+      message: {
+        id: "m1",
+        threadId: "t1",
+        payload: {
+          mimeType: "multipart/mixed",
+          headers: [{ name: "To", value: "bob@example.com" }],
+          parts: [
+            { mimeType: "text/plain", body: { data: b64u("old text") } },
+            {
+              mimeType: fx.file.mimeType,
+              filename: fx.file.filename,
+              body: { attachmentId: "att9", size: fx.file.bytes },
+            },
+          ],
+        },
+      },
+    });
+
+  it("create_draft builds a multipart/mixed with the file", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      { method: "POST", url: DRAFT_UPLOAD, reply: () => draftAnswer() },
+    ]);
+    const res = await call(env, ownerId, "create_draft", {
+      to: ["bob@example.com"],
+      subject: "Files",
+      body: "see attached",
+      attachments: [own],
+    });
+    expect(res.isError).toBe(false);
+    expect(calls).toHaveLength(1);
+    const { parts, closed } = mixedParts(calls[0]?.body ?? "");
+    expect(closed).toBe(true);
+    expect(parts).toHaveLength(2);
+    expect(parts[1]?.headers).toContain('filename="plan.pdf"');
+    expect(fromB64(parts[1]?.body ?? "")).toBe(fromB64(fx.file.base64));
+  });
+
+  it("update_draft replaces the draft's files when it is given some", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      { url: `${DRAFTS}/d1`, reply: () => draftWithFile() },
+      { method: "PUT", url: `${DRAFT_UPLOAD}/d1`, reply: () => draftAnswer() },
+    ]);
+    const res = await call(env, ownerId, "update_draft", {
+      draftId: "d1",
+      attachments: [{ content: "aGk=", filename: "new.txt", mimeType: "text/plain" }],
+    });
+    expect(res.isError).toBe(false);
+    // The old file is neither downloaded nor kept.
+    expect(calls.map((c) => c.method)).toEqual(["GET", "PUT"]);
+    const { parts } = mixedParts(calls[1]?.body ?? "");
+    expect(parts).toHaveLength(2);
+    expect(parts[1]?.headers).toContain('filename="new.txt"');
+    expect(calls[1]?.body).not.toContain("plan.pdf");
+  });
+
+  it("update_draft keeps the draft's files when the list is empty", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([
+      { url: `${DRAFTS}/d1`, reply: () => draftWithFile() },
+      {
+        url: `${BASE}/messages/m1/attachments/att9`,
+        reply: () => googleJson(200, { size: fx.file.bytes, data: fx.file.base64url }),
+      },
+      { method: "PUT", url: `${DRAFT_UPLOAD}/d1`, reply: () => draftAnswer() },
+    ]);
+    const res = await call(env, ownerId, "update_draft", {
+      draftId: "d1",
+      subject: "again",
+      attachments: [],
+    });
+    expect(res.isError).toBe(false);
+    const { parts } = mixedParts(calls[2]?.body ?? "");
+    expect(parts[1]?.headers).toContain('filename="plan.pdf"');
+  });
+});
+
+// ---- stale attachment ids ------------------------------------------------------------------------
+
+describe("stale attachment id on forward", () => {
+  it("finds the same file again by name, type and size when Gmail renumbered its id", async () => {
+    const { ownerId, key } = await setup();
+    const message = (id: string): Response =>
+      googleJson(200, {
+        id: fx.original.id,
+        threadId: fx.original.threadId,
+        payload: {
+          mimeType: "multipart/mixed",
+          headers: Object.entries(fx.original.headers).map(([name, value]) => ({ name, value })),
+          parts: [
+            { mimeType: "text/plain", body: { size: 22, data: b64u(fx.original.text) } },
+            {
+              mimeType: fx.file.mimeType,
+              filename: fx.file.filename,
+              body: { attachmentId: id, size: fx.file.bytes },
+            },
+          ],
+        },
+      });
+    const calls = installGoogleRoutes([
+      // The first read names `old`, the re-read after the 404 names `fresh`.
+      { url: MESSAGE, reply: (_req, n) => message(n === 0 ? "old" : "fresh") },
+      {
+        url: `${MESSAGE}/attachments/old`,
+        reply: () => googleJson(404, { error: { code: 404, message: "gone" } }),
+      },
+      {
+        url: `${MESSAGE}/attachments/fresh`,
+        reply: () => googleJson(200, { size: fx.file.bytes, data: fx.file.base64url }),
+      },
+      sendRoute(),
+    ]);
+    const res = await call(ON(), ownerId, "forward", {
+      messageId: `${key}:${fx.original.id}`,
+      to: ["dan@example.com"],
+    });
+    expect(res.isError).toBe(false);
+    const upload = calls.at(-1);
+    expect(upload?.method).toBe("POST");
+    const { parts } = mixedParts(upload?.body ?? "");
+    expect(fromB64(parts[1]?.body ?? "")).toBe(fromB64(fx.file.base64));
+  });
+});
+
 // ---- get_attachment ------------------------------------------------------------------------------
 
 describe("get_attachment", () => {
