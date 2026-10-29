@@ -29,6 +29,20 @@
           "jsonpath": "$.version"
         }
       ]
+    },
+    "plugins/workspace-bridge": {
+      "release-type": "simple",
+      "package-name": "workspace-bridge",
+      "tag-separator": "@",
+      "component": "workspace-bridge",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": ".claude-plugin/plugin.json",
+          "jsonpath": "$.version"
+        }
+      ]
     }
   }
 }
