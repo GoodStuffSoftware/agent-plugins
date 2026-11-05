@@ -1100,3 +1100,25 @@ describe("Gmail signature", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe("includeSignature schema text", () => {
+  const text = (name: string): string => {
+    const t = registry.listFor("full", SCOPES.full).find((x) => x.name === name);
+    const schema = t?.inputSchema as { properties: Record<string, { description?: string }> };
+    return schema.properties.includeSignature?.description ?? "";
+  };
+
+  it.each(["send_message", "reply", "forward"])(
+    "%s says an omitted value follows the account setting",
+    (name) => {
+      const d = text(name);
+      expect(d).toContain("Omit to follow the account's 'Add my Gmail signature' setting");
+      expect(d).toContain("on by default");
+      expect(d).not.toMatch(/defaults to false/i);
+    },
+  );
+
+  it("create_draft says it ignores the account setting", () => {
+    expect(text("create_draft")).toContain("omitted or false adds no signature");
+  });
+});

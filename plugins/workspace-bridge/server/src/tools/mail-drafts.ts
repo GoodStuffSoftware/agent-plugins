@@ -101,7 +101,7 @@ const createDraft = defineTool({
   name: "create_draft",
   title: "Create a draft",
   description:
-    "Creates a draft email in the account. Nothing is sent. With `replyToMessageId` the draft is a reply: it is threaded under that message, the subject and To default from it (the original sender, minus the account's own addresses) and the original is quoted below your text. `includeSignature` appends the account's Gmail signature. The body is plain text (`body`), HTML (`htmlBody`) or both; HTML alone gets a text alternative made from it. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit).",
+    "Creates a draft email in the account. Nothing is sent. With `replyToMessageId` the draft is a reply: it is threaded under that message, the subject and To default from it (the original sender, minus the account's own addresses) and the original is quoted below your text. `includeSignature: true` appends the account's Gmail signature (omitted adds none; unlike send_message, a draft ignores the account's signature setting). The body is plain text (`body`), HTML (`htmlBody`) or both; HTML alone gets a text alternative made from it. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit).",
   component: "mail",
   scopes: ["mail.write"],
   endpoints: ["full", "ro"],
@@ -124,7 +124,9 @@ const createDraft = defineTool({
     includeSignature: z
       .boolean()
       .optional()
-      .describe("Append the account's Gmail signature for the From address."),
+      .describe(
+        "Drafts do not follow the account's 'Add my Gmail signature' setting: omitted or false adds no signature, true appends the From address's Gmail signature.",
+      ),
     attachments: attachmentsParam,
   }),
   async handler(args, ctx) {

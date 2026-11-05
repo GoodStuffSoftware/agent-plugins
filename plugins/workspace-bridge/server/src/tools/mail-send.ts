@@ -52,7 +52,7 @@ const includeSignatureParam = z
   .boolean()
   .optional()
   .describe(
-    "Append the account's Gmail signature for the From address (an alias with no signature of its own uses the account's main one). When omitted, the account's \"Add my Gmail signature\" setting decides; it is on unless the owner turned it off. false never adds it.",
+    "Omit to follow the account's 'Add my Gmail signature' setting (on by default); true or false overrides it for this message. The signature is the From address's (an alias with no signature of its own uses the account's main one).",
   );
 
 /**
