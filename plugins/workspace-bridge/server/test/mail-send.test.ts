@@ -32,6 +32,7 @@ const UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/s
 const SEND_AS = `${BASE}/settings/sendAs`;
 const MESSAGE = `${BASE}/messages/m_orig`;
 const DRAFT = `${BASE}/drafts/d1`;
+const DRAFTS_UPLOAD = "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -1088,6 +1089,39 @@ describe("Gmail signature", () => {
     expect(calls).toHaveLength(0);
   });
 
+  it("a draft made with the signature and sent by draftId goes out with exactly one", async () => {
+    const { ownerId, key } = await setup();
+    await setting(key, 1);
+    let draftRaw = "";
+    let sentRaw = "";
+    const calls = installGoogleRoutes([
+      sigRoute(WORK_SIG, "<b>Pat</b>"),
+      {
+        method: "POST",
+        url: DRAFTS_UPLOAD,
+        reply: () => googleJson(200, { id: "d1", message: { id: "m1", threadId: "t1" } }),
+      },
+      { url: DRAFT, reply: () => googleJson(200, { id: "d1", message: { raw: b64u(draftRaw) } }) },
+      sendRoute(async (req) => {
+        sentRaw = await req.text();
+        return sentAnswer();
+      }),
+      { method: "DELETE", url: DRAFT, reply: () => new Response(null, { status: 204 }) },
+    ]);
+    const made = await call(ON(), ownerId, "create_draft", { to: ["bob@example.com"], body: "hi" });
+    expect(made.isError).toBe(false);
+    // An unthreaded draft is uploaded as the bare message/rfc822 body.
+    draftRaw = calls.find((c) => c.url.startsWith(DRAFTS_UPLOAD))?.body ?? "";
+    const res = await call(ON(), ownerId, "send_message", { draftId: `${key}:d1` });
+    expect(res.isError).toBe(false);
+    // The draft's bytes go out as composed: one signature read (at create), one in the message.
+    expect(sigCalls(calls)).toHaveLength(1);
+    expect(sentRaw).toBe(draftRaw);
+    const [text, html] = bodies(sentRaw);
+    expect(text?.split("-- \r\n")).toHaveLength(2);
+    expect(html?.split("gmail_signature")).toHaveLength(2);
+  });
+
   it("still obeys the hold rule: a held send reads no signature", async () => {
     const { ownerId, key } = await setup();
     await setting(key, 1);
@@ -1108,7 +1142,7 @@ describe("includeSignature schema text", () => {
     return schema.properties.includeSignature?.description ?? "";
   };
 
-  it.each(["send_message", "reply", "forward"])(
+  it.each(["send_message", "reply", "forward", "create_draft", "update_draft"])(
     "%s says an omitted value follows the account setting",
     (name) => {
       const d = text(name);
@@ -1118,7 +1152,8 @@ describe("includeSignature schema text", () => {
     },
   );
 
-  it("create_draft says it ignores the account setting", () => {
-    expect(text("create_draft")).toContain("omitted or false adds no signature");
+  it("create_draft no longer says it ignores the account setting", () => {
+    expect(text("create_draft")).not.toContain("omitted or false adds no signature");
+    expect(text("create_draft")).not.toMatch(/do not follow/i);
   });
 });

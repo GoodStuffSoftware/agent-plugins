@@ -2,6 +2,7 @@
 // forward tools (M15) take the same recipients, subject, bodies, From and threading fields.
 
 import { z } from "zod";
+import { first } from "../core/db";
 import { ToolError } from "../core/errors";
 import {
   base64Bytes,
@@ -13,7 +14,9 @@ import {
   splitAddressList,
 } from "../core/mime";
 import { config, type Env } from "../env";
+import type { ToolContext } from "../registry/types";
 import type { AttachmentTotals } from "../services/mail-send";
+import type { AccountRef } from "../services/types";
 
 /** Plain text body cap, in characters. A larger body is `too_large` before any work is done. */
 export const MAX_BODY_CHARS = 50_000;
@@ -251,4 +254,24 @@ export function assertSingleLine(name: string, value: string | undefined): void 
   if (value !== undefined && /[\r\n\0]/.test(value)) {
     throw new ToolError("invalid_argument", `The ${name} must be a single line.`);
   }
+}
+
+/**
+ * Whether this message carries the signature: the caller's `includeSignature` when given, else the
+ * account's setting (on by default). A signature that came from the setting never stops a send or a draft
+ * (`signatureOptional`); one the caller asked for does when it cannot be fetched.
+ */
+export async function signatureChoice(
+  ctx: ToolContext,
+  a: AccountRef,
+  asked: boolean | undefined,
+): Promise<{ includeSignature: boolean; signatureOptional: boolean }> {
+  if (asked !== undefined) return { includeSignature: asked, signatureOptional: false };
+  const row = await first<{ signature_default: number }>(
+    ctx.env.DB,
+    "SELECT signature_default FROM accounts WHERE id = ? AND owner_id = ?",
+    a.accountId,
+    a.ownerId,
+  );
+  return { includeSignature: row?.signature_default !== 0, signatureOptional: true };
 }

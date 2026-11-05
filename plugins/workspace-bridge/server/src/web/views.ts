@@ -228,7 +228,7 @@ ${sections}</section>`;
 function signatureSettings(d: AccountsViewData): SafeHtml {
   if (d.accounts.length === 0) return html``;
   return html`<section class="card"><h2>Gmail signature</h2>
-<p>With "Add my Gmail signature" on, send_message, reply and forward add the mailbox's Gmail signature whenever the caller does not say otherwise. A send-as address with no signature of its own uses the mailbox's main one. A picture stored inside the signature (not a web address) is left out, because some mail clients show it as a broken attachment. Host the logo at a web address and insert it by that address in Gmail's signature editor.</p>
+<p>With "Add my Gmail signature" on, send_message, reply, forward, create_draft and update_draft (a new body) add the mailbox's Gmail signature whenever the caller does not say otherwise. A send-as address with no signature of its own uses the mailbox's main one. A picture stored inside the signature (not a web address) is left out, because some mail clients show it as a broken attachment. Host the logo at a web address and insert it by that address in Gmail's signature editor.</p>
 ${d.accounts.map((a) => {
   const isOn = a.signature_default !== 0;
   return html`<div class="field-row"><span>${a.label} (${a.address}): <strong>${isOn ? "on" : "off"}</strong></span>

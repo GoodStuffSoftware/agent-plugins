@@ -48,6 +48,8 @@ export type CreateDraftInput = {
   /** Set only when the caller named a From; otherwise the account's default address is used. */
   from?: SendAsAddress;
   includeSignature?: boolean;
+  /** The signature came from the account's default, not the caller: a failed fetch skips it. */
+  signatureOptional?: boolean;
   /** The provider id of the message this draft answers. */
   replyToMessageId?: string;
   /** Every address the account sends as, so a reply leaves them out of its recipients. */
@@ -64,6 +66,10 @@ export type UpdateDraftInput = {
   body?: string;
   htmlBody?: string;
   from?: SendAsAddress;
+  /** Add the signature, unless the new body already carries one (never two). */
+  includeSignature?: boolean;
+  /** The signature came from the account's default, not the caller: a failed fetch skips it. */
+  signatureOptional?: boolean;
   /** Replace the draft's files with these; left out, the draft keeps the files it has. */
   attachments?: MimeAttachment[];
   /** Cap on the files the rewritten draft holds, whether new or kept. */

@@ -273,6 +273,32 @@ async function signatureOf(a: AccountRef, email: string): Promise<string> {
   return s.signature ?? "";
 }
 
+/** A signature the draft's body already carries: Gmail's HTML div, or the `-- ` line of the text. */
+export function hasSignature(text: string, html: string | undefined): boolean {
+  return (
+    (html !== undefined && /class\s*=\s*["'][^"']*\bgmail_signature\b/i.test(html)) ||
+    /^-- $/m.test(text.replace(/\r\n?/g, "\n"))
+  );
+}
+
+/**
+ * The signature of the From address (the account's own when the alias has none); "" when there is
+ * none. A signature that came from the account setting never stops a draft: a Google error on the
+ * read leaves it out, as for a send.
+ */
+async function draftSignature(
+  a: AccountRef,
+  from: string,
+  optional: boolean | undefined,
+): Promise<string> {
+  try {
+    return await signatureFor((email) => signatureOf(a, email), from, a.address);
+  } catch (e) {
+    if (!optional || !(e instanceof ToolError) || e.code === "internal") throw e;
+    return "";
+  }
+}
+
 /**
  * The text and HTML a draft carries. HTML given alone gets a text alternative made from it; text
  * given alone stays text unless a signature (HTML) or nothing else calls for HTML.
@@ -315,11 +341,7 @@ async function create(a: AccountRef, input: CreateDraftInput): Promise<Draft> {
     }
   }
   const signature = input.includeSignature
-    ? await signatureFor(
-        (email) => signatureOf(a, email),
-        input.from?.email ?? a.address,
-        a.address,
-      )
+    ? await draftSignature(a, input.from?.email ?? a.address, input.signatureOptional)
     : undefined;
   const text = compose({
     body: input.body,
@@ -404,6 +426,25 @@ async function update(a: AccountRef, draftId: string, input: UpdateDraftInput): 
   const fromHeader = input.from
     ? addressLine(input.from.displayName, input.from.email)
     : list(h("From"))[0];
+  // The signature goes on once: not when the body (the new one, or the draft's own) already
+  // carries it. A kept body that has none gets it only when the caller asked with `true`, so an
+  // edit of the subject or recipients never rewrites a body composed without one.
+  const rebuilt = input.body !== undefined || input.htmlBody !== undefined;
+  if (input.includeSignature && (rebuilt || input.signatureOptional !== true)) {
+    if (!hasSignature(body, htmlBody)) {
+      const signature = await draftSignature(
+        a,
+        input.from?.email ?? parseAddresses(h("From"))[0] ?? a.address,
+        input.signatureOptional,
+      );
+      if (signature) {
+        ({ text: body, html: htmlBody } = appendSignature(
+          { text: body, html: htmlBody },
+          signature,
+        ));
+      }
+    }
+  }
   const raw = buildRfc822({
     to: input.to ?? list(h("To")),
     cc: input.cc ?? list(h("Cc")),

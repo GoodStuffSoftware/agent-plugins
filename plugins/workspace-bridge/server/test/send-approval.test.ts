@@ -1047,6 +1047,71 @@ describe("the approved send", () => {
     expect(await knownRow(accountId, "dan@example.net")).not.toBeNull();
   });
 
+  it("sends a held draft with exactly the one signature it was made with", async () => {
+    const { ownerId, accountId, key } = await setup();
+    await env.DB.prepare("UPDATE accounts SET signature_default = 1 WHERE id = ?")
+      .bind(accountId)
+      .run();
+    const e = MODE("new_recipients");
+    const made = installGoogleRoutes([
+      {
+        url: `${GMAIL}/settings/sendAs/work%40example.com`,
+        reply: () => googleJson(200, { signature: "<b>Pat</b>" }),
+      },
+      {
+        method: "POST",
+        url: "https://gmail.googleapis.com/upload/gmail/v1/users/me/drafts",
+        reply: () => googleJson(200, { id: "d1", message: { id: "m1", threadId: "t1" } }),
+      },
+    ]);
+    const created = await call(e, ownerId, "create_draft", {
+      to: ["fresh@example.org"],
+      body: "hi",
+    });
+    expect(created.isError).toBe(false);
+    const upload = made.find((c) => c.method === "POST")?.body ?? "";
+    const rfc = upload;
+    expect(rfc).toBeDefined();
+    const b64url = btoa(String.fromCharCode(...new TextEncoder().encode(rfc ?? "")))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    const draft = { id: "d1", message: { raw: b64url } };
+
+    installGoogleRoutes([
+      { url: DRAFT, reply: () => googleJson(200, draft) },
+      batchRoute(),
+      ...peopleRoutes(),
+    ]);
+    const id = await heldWithGrant(e, ownerId, "send_message", { draftId: `${key}:d1` });
+    const page = await approvals(e, ownerId, id);
+    let sentRaw = "";
+    const calls = installGoogleRoutes([
+      { url: DRAFT, reply: () => googleJson(200, draft) },
+      {
+        method: "POST",
+        url: UPLOAD,
+        reply: async (req) => {
+          sentRaw = await req.text();
+          return sentAnswer();
+        },
+      },
+      draftDeleteRoute(),
+    ]);
+    await page.approve();
+    expect((await page.row())?.status).toBe("executed");
+    expect(sendCalls(calls)).toHaveLength(1);
+    expect(calls.some((c) => c.url.includes("/settings/sendAs/"))).toBe(false);
+    expect(sentRaw).toBe(rfc);
+    expect(sentRaw.split("gmail_signature")).toHaveLength(1);
+    const decoded = [
+      ...sentRaw.matchAll(/Content-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/g),
+    ].map((m) => atob((m[1] ?? "").replace(/\s+/g, "")));
+    expect(decoded).toHaveLength(2);
+    expect(decoded[0]?.split("-- \r\n")).toHaveLength(2);
+    expect(decoded[1]?.split("gmail_signature")).toHaveLength(2);
+  });
+
   for (const mode of ["new_recipients", "all"]) {
     it(`refuses a held draft that gained a recipient after the hold (mode ${mode})`, async () => {
       const { ownerId, key } = await setup();

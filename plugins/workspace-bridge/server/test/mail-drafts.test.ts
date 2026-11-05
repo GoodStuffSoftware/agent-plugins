@@ -8,6 +8,7 @@ import { type Kind, SCOPES } from "../src/auth/endpoints";
 import { mcpHandler } from "../src/auth/mcp-factory";
 import { compileRegistry } from "../src/registry/compile";
 import { FAMILIES } from "../src/tools";
+import fx from "./fixtures/google/mail-send.json";
 import {
   type GoogleCall,
   type GoogleRoute,
@@ -34,13 +35,25 @@ afterEach(() => {
 // biome-ignore lint/suspicious/noExplicitAny: the JSON a tool answered, read loosely by the tests
 type Json = any;
 
-async function setup(opts: { components?: readonly string[]; label?: string } = {}) {
+async function setup(
+  opts: {
+    components?: readonly string[];
+    label?: string;
+    /** The account's 'Add my Gmail signature' setting; off unless a test turns it on. */
+    signature?: 0 | 1;
+    /** Leave the sendAs cache empty, so the list is fetched (an alias test). */
+    stale?: boolean;
+  } = {},
+) {
+  const { signature, stale, ...link } = opts;
   const ownerId = await newOwner();
-  const linked = await linkGoogleAccount(ownerId, { components: ["mail"], ...opts });
+  const linked = await linkGoogleAccount(ownerId, { components: ["mail"], ...link });
   // A fresh, empty sendAs cache (M14): the account may send as its own address only, and no test
   // here sees a sendAs list fetch among its Google calls.
-  await env.DB.prepare("UPDATE accounts SET send_as_fetched_at = ? WHERE id = ?")
-    .bind(Math.floor(Date.now() / 1000), linked.row.id)
+  await env.DB.prepare(
+    "UPDATE accounts SET send_as_fetched_at = ?, signature_default = ? WHERE id = ?",
+  )
+    .bind(stale ? null : Math.floor(Date.now() / 1000), signature ?? 0, linked.row.id)
     .run();
   return { ownerId, key: `a${linked.row.short_id}` };
 }
@@ -348,7 +361,7 @@ describe("create_draft", () => {
     expect(text).toMatch(/> the original text/);
   });
 
-  it("appends the account's signature when asked", async () => {
+  it("appends the account's signature when asked (setting off)", async () => {
     const { ownerId } = await setup();
     const calls = installGoogleRoutes([
       {
@@ -732,6 +745,167 @@ function storedDraftWithBody(id: string, body: string) {
     },
   };
 }
+
+// ---- Gmail signature -----------------------------------------------------------------------------
+
+describe("draft signature", () => {
+  const SIG = `${BASE}/settings/sendAs`;
+  const sigRoute = (email: string, signature: string): GoogleRoute => ({
+    url: `${SIG}/${encodeURIComponent(email)}`,
+    reply: () => googleJson(200, { signature }),
+  });
+  const sigCalls = (calls: GoogleCall[]) => calls.filter((c) => c.url.startsWith(`${SIG}/`));
+  const createRoute = (): GoogleRoute => ({
+    method: "POST",
+    url: UPLOAD,
+    reply: () => draftAnswer(),
+  });
+  const create = (ownerId: string, extra: Record<string, unknown> = {}) =>
+    call(ownerId, "create_draft", { to: ["a@example.com"], body: "line one", ...extra });
+  const uploaded = (calls: GoogleCall[]) => calls.find((c) => c.method === "POST");
+
+  it("omitted with the setting on: the signature is there", async () => {
+    const { ownerId } = await setup({ signature: 1 });
+    const calls = installGoogleRoutes([
+      sigRoute("work@example.com", "<b>Pat</b><br>Team"),
+      createRoute(),
+    ]);
+    expect((await create(ownerId)).isError).toBe(false);
+    const [text, html] = bodies(uploaded(calls)?.body ?? "");
+    expect(text).toContain("line one\r\n\r\n-- \r\nPat");
+    expect(html).toContain('<div class="gmail_signature"><b>Pat</b><br>Team</div>');
+    expect(html).not.toContain("-- ");
+  });
+
+  it("omitted with the setting off: no signature, nothing fetched", async () => {
+    const { ownerId } = await setup({ signature: 0 });
+    const calls = installGoogleRoutes([sigRoute("work@example.com", "<b>Pat</b>"), createRoute()]);
+    expect((await create(ownerId)).isError).toBe(false);
+    expect(sigCalls(calls)).toHaveLength(0);
+    expect(bodies(uploaded(calls)?.body ?? "")).toEqual(["line one"]);
+  });
+
+  it("an explicit false wins over the setting", async () => {
+    const { ownerId } = await setup({ signature: 1 });
+    const calls = installGoogleRoutes([sigRoute("work@example.com", "<b>Pat</b>"), createRoute()]);
+    expect((await create(ownerId, { includeSignature: false })).isError).toBe(false);
+    expect(sigCalls(calls)).toHaveLength(0);
+    expect(bodies(uploaded(calls)?.body ?? "")).toEqual(["line one"]);
+  });
+
+  it("true with the setting off still adds it", async () => {
+    const { ownerId } = await setup({ signature: 0 });
+    const calls = installGoogleRoutes([sigRoute("work@example.com", "<b>Pat</b>"), createRoute()]);
+    expect((await create(ownerId, { includeSignature: true })).isError).toBe(false);
+    const [text, html] = bodies(uploaded(calls)?.body ?? "");
+    expect(text).toContain("-- \r\nPat");
+    expect(html).toContain('<div class="gmail_signature"><b>Pat</b></div>');
+  });
+
+  it("an alias with no signature of its own falls back to the account's main one", async () => {
+    const { ownerId } = await setup({ signature: 1, stale: true });
+    const calls = installGoogleRoutes([
+      { url: SIG, reply: () => googleJson(200, fx.sendAs) },
+      sigRoute("alias@example.com", ""),
+      sigRoute("work@example.com", '<b>Primary Pat</b><img src="data:image/png;base64,AAAA">'),
+      createRoute(),
+    ]);
+    expect((await create(ownerId, { from: "alias@example.com" })).isError).toBe(false);
+    const asked = sigCalls(calls).map((c) =>
+      decodeURIComponent(new URL(c.url).pathname.split("/").pop() ?? ""),
+    );
+    expect(asked).toEqual(["alias@example.com", "work@example.com"]);
+    const [text, html] = bodies(uploaded(calls)?.body ?? "");
+    expect(text).toContain("-- \r\nPrimary Pat");
+    expect(html).toContain('<div class="gmail_signature"><b>Primary Pat</b></div>');
+    expect(html).not.toContain("data:");
+  });
+
+  it("a signature that cannot be read never stops a default draft, but fails one asked for", async () => {
+    const { ownerId } = await setup({ signature: 1 });
+    const calls = installGoogleRoutes([
+      { url: `${SIG}/work%40example.com`, reply: () => googleJson(500, { error: { code: 500 } }) },
+      createRoute(),
+    ]);
+    expect((await create(ownerId)).isError).toBe(false);
+    expect(bodies(uploaded(calls)?.body ?? "")).toEqual(["line one"]);
+    expect((await create(ownerId, { includeSignature: true })).isError).toBe(true);
+  });
+
+  describe("update_draft", () => {
+    const withSig = (html: string) => `${html}<br>\n<div class="gmail_signature"><b>Pat</b></div>`;
+    const existing = (text: string, html?: string) =>
+      googleJson(200, {
+        id: "d1",
+        message: {
+          id: "m1",
+          threadId: "t1",
+          payload: payload(
+            { From: "work@example.com", To: "bob@example.com", Subject: "S" },
+            text,
+            html,
+          ),
+        },
+      });
+    const routes = (draft: () => Response): GoogleRoute[] => [
+      sigRoute("work@example.com", "<b>Pat</b>"),
+      { url: `${BASE}/drafts/d1`, reply: draft },
+      { method: "PUT", url: `${UPLOAD}/d1`, reply: () => draftAnswer() },
+    ];
+    const puts = (calls: GoogleCall[]) => calls.filter((c) => c.method === "PUT");
+    const count = (s: string | undefined, needle: string) => (s ?? "").split(needle).length - 1;
+
+    it("a new body gets exactly one signature when the setting is on", async () => {
+      const { ownerId } = await setup({ signature: 1 });
+      const calls = installGoogleRoutes(
+        routes(() => existing("old\n\n-- \nPat", withSig("<p>old</p>"))),
+      );
+      const res = await call(ownerId, "update_draft", { draftId: "d1", body: "new text" });
+      expect(res.isError).toBe(false);
+      const [text, html] = bodies(puts(calls)[0]?.body ?? "");
+      expect(text).toContain("new text\r\n\r\n-- \r\nPat");
+      expect(count(text, "-- ")).toBe(1);
+      expect(count(html, "gmail_signature")).toBe(1);
+      expect(text).not.toContain("old");
+    });
+
+    it("a new body that already carries the signature is not doubled", async () => {
+      const { ownerId } = await setup({ signature: 1 });
+      const calls = installGoogleRoutes(routes(() => existing("old")));
+      await call(ownerId, "update_draft", { draftId: "d1", htmlBody: withSig("<p>fresh</p>") });
+      expect(count(bodies(puts(calls)[0]?.body ?? "")[1], "gmail_signature")).toBe(1);
+      await call(ownerId, "update_draft", { draftId: "d1", body: "mine\n\n-- \nPat" });
+      const [text, html] = bodies(puts(calls)[1]?.body ?? "");
+      expect(count(text, "-- ")).toBe(1);
+      expect(html).toBeUndefined();
+    });
+
+    it("an edit that leaves the body alone keeps it with its one signature", async () => {
+      const { ownerId } = await setup({ signature: 1 });
+      const calls = installGoogleRoutes(
+        routes(() => existing("old\n\n-- \nPat", withSig("<p>old</p>"))),
+      );
+      await call(ownerId, "update_draft", { draftId: "d1", subject: "New" });
+      const [text, html] = bodies(puts(calls)[0]?.body ?? "");
+      expect(count(text, "-- ")).toBe(1);
+      expect(count(html, "gmail_signature")).toBe(1);
+      expect(sigCalls(calls)).toHaveLength(0);
+    });
+
+    it("false leaves a new body unsigned; true signs an unchanged unsigned draft", async () => {
+      const { ownerId } = await setup({ signature: 1 });
+      const calls = installGoogleRoutes(routes(() => existing("plain")));
+      await call(ownerId, "update_draft", { draftId: "d1", body: "x", includeSignature: false });
+      expect(bodies(puts(calls)[0]?.body ?? "")).toEqual(["x"]);
+      await call(ownerId, "update_draft", { draftId: "d1", subject: "N" });
+      expect(bodies(puts(calls)[1]?.body ?? "")).toEqual(["plain"]);
+      await call(ownerId, "update_draft", { draftId: "d1", subject: "N", includeSignature: true });
+      const [text, html] = bodies(puts(calls)[2]?.body ?? "");
+      expect(text).toContain("plain\r\n\r\n-- \r\nPat");
+      expect(count(html, "gmail_signature")).toBe(1);
+    });
+  });
+});
 
 // ---- update_draft --------------------------------------------------------------------------------
 

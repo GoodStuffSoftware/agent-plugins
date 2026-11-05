@@ -24,6 +24,7 @@ import {
   fromParam,
   htmlBodyParam,
   replyToMessageIdParam,
+  signatureChoice,
   subjectParam,
   toParam,
 } from "./mail-common";
@@ -101,7 +102,7 @@ const createDraft = defineTool({
   name: "create_draft",
   title: "Create a draft",
   description:
-    "Creates a draft email in the account. Nothing is sent. With `replyToMessageId` the draft is a reply: it is threaded under that message, the subject and To default from it (the original sender, minus the account's own addresses) and the original is quoted below your text. `includeSignature: true` appends the account's Gmail signature (omitted adds none; unlike send_message, a draft ignores the account's signature setting). The body is plain text (`body`), HTML (`htmlBody`) or both; HTML alone gets a text alternative made from it. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit).",
+    "Creates a draft email in the account. Nothing is sent. With `replyToMessageId` the draft is a reply: it is threaded under that message, the subject and To default from it (the original sender, minus the account's own addresses) and the original is quoted below your text. The account's Gmail signature is added as for send_message: omitted follows the account's 'Add my Gmail signature' setting (on by default), `includeSignature` true or false overrides it. The signature is part of the draft, so sending the draft by `draftId` adds nothing more. The body is plain text (`body`), HTML (`htmlBody`) or both; HTML alone gets a text alternative made from it. `attachments` adds files (base64 `content`, optional `filename` and `mimeType`; all files together within the server's send size limit).",
   component: "mail",
   scopes: ["mail.write"],
   endpoints: ["full", "ro"],
@@ -125,7 +126,7 @@ const createDraft = defineTool({
       .boolean()
       .optional()
       .describe(
-        "Drafts do not follow the account's 'Add my Gmail signature' setting: omitted or false adds no signature, true appends the From address's Gmail signature.",
+        "Omit to follow the account's 'Add my Gmail signature' setting (on by default); true or false overrides it for this draft. The signature is the From address's (an alias with no signature of its own uses the account's main one).",
       ),
     attachments: attachmentsParam,
   }),
@@ -144,7 +145,7 @@ const createDraft = defineTool({
       ...(args.body === undefined ? {} : { body: args.body }),
       ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
       ...(args.from === undefined ? {} : { from }),
-      ...(args.includeSignature ? { includeSignature: true } : {}),
+      ...(await signatureChoice(ctx, a, args.includeSignature)),
       ...(reply ? { replyToMessageId: reply.providerId } : {}),
       selfAddresses: self,
       ...(attached.files.length ? { attachments: attached.files } : {}),
@@ -262,7 +263,7 @@ const updateDraft = defineTool({
   name: "update_draft",
   title: "Update a draft",
   description:
-    "Changes a draft. Fields you leave out or pass empty keep their value. Sending `body` alone replaces the text and removes the HTML; sending `htmlBody` alone replaces the HTML and rebuilds the text from it. The draft's attachments are kept unless you pass `attachments`, which replaces all of them (an empty list keeps them). A reply draft stays in its thread.",
+    "Changes a draft. Fields you leave out or pass empty keep their value. Sending `body` alone replaces the text and removes the HTML; sending `htmlBody` alone replaces the HTML and rebuilds the text from it. The draft's attachments are kept unless you pass `attachments`, which replaces all of them (an empty list keeps them). A reply draft stays in its thread. The Gmail signature is kept to exactly one: a new `body` or `htmlBody` gets the signature appended (per `includeSignature` or the account's setting) unless it already carries one (a `gmail_signature` div in the HTML or a `-- ` line in the text); a draft whose body you do not change is left as it is, unless `includeSignature` is true and it has none.",
   component: "mail",
   scopes: ["mail.write"],
   endpoints: ["full", "ro"],
@@ -282,6 +283,12 @@ const updateDraft = defineTool({
     body: bodyParam,
     htmlBody: htmlBodyParam,
     from: fromParam,
+    includeSignature: z
+      .boolean()
+      .optional()
+      .describe(
+        "Omit to follow the account's 'Add my Gmail signature' setting (on by default) for a new `body` or `htmlBody`; true or false overrides it. A signature already in the text is never doubled. True also adds it to a draft whose body you leave unchanged and that has none.",
+      ),
     attachments: attachmentsParam,
   }),
   async handler(args, ctx) {
@@ -304,6 +311,7 @@ const updateDraft = defineTool({
       ...(args.body ? { body: args.body } : {}),
       ...(args.htmlBody ? { htmlBody: args.htmlBody } : {}),
       ...(from ? { from } : {}),
+      ...(await signatureChoice(ctx, a, args.includeSignature)),
       ...(attached.files.length ? { attachments: attached.files } : {}),
       maxAttachmentBytes: config(ctx.env).maxSendAttachmentBytes,
     });
