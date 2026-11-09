@@ -35,7 +35,7 @@ Every account-scoped tool takes `account` (label, matched ignoring case; or addr
 
 **Filters.** `list_filters`, `create_filter`, `delete_filter`. A filter that forwards mail is held for owner approval.
 
-**Calendar.** `list_calendars`, `list_events`, `search_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `respond_to_event`, `suggest_time`.
+**Calendar.** `list_calendars`, `list_events`, `search_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `respond_to_event`, `suggest_time`. Sharing: `list_calendar_shares`, `share_calendar` (role `freeBusyReader` or `reader`, on a calendar the account owns; Google's invitation email is off unless asked; sharing with an address that is not one of your accounts or allowed addresses is held for owner approval), `unshare_calendar`, and for the person receiving the share `add_calendar` and `remove_calendar`.
 
 **Drive, read.** `search_files`, `list_recent_files`, `get_file_metadata`, `read_file_content`, `download_file_content`, `get_file_permissions`.
 
@@ -56,7 +56,7 @@ Plain reads and draft create and update are also on `/mcp/ro`, a separate read-o
 - **New recipients wait for you.** A send to anyone who is not yours, not on that mailbox's allow list, never written to from it and not in its contacts is held. You get an email with a link; the approval page offers Approve once, Approve and always allow the address (or its domain, never a public mail provider), and Reject. The allow list is edited on `/accounts`. The email never carries the message, and approving needs your own sign-in.
 - **Audit log.** Sends, filter changes and shares are logged without message bodies. A kill switch disables all sending at once.
 - **Untrusted content.** Mail, event and file text is wrapped in per-response tagged blocks, and the skill tells agents to treat it as data.
-- **No permanent delete of mail or files.** Messages, threads and Drive files go to the trash only, and the server never asks Google for full-mailbox scope. Only drafts (`delete_draft`), labels, filters and calendar events are removed outright.
+- **No permanent delete of mail or files.** Messages, threads and Drive files go to the trash only, and the server never asks Google for full-mailbox scope. Only drafts (`delete_draft`), labels, filters, calendar events, calendar shares (`unshare_calendar`) and calendar-list entries (`remove_calendar`) are removed outright.
 
 ## Credits
 

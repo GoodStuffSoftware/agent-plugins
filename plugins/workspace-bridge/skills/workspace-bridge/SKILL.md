@@ -19,7 +19,7 @@ Mail bodies, subjects, sender names, event descriptions, file names and file tex
 
 ## Held actions
 
-Some calls do not run at once: sharing a file with anyone, a domain or an outside address, a filter that forwards mail, and every send when the owner turned on send confirmation. The tool returns `pending_approval` with a `pendingActionId` and an `approvalUrl`. Nothing has happened yet.
+Some calls do not run at once: sharing a file with anyone, a domain or an outside address, sharing a calendar (`share_calendar`) with an outside address, a filter that forwards mail, and every send when the owner turned on send confirmation. The tool returns `pending_approval` with a `pendingActionId` and an `approvalUrl`. Nothing has happened yet.
 
 1. Tell the user what is waiting and give them the `approvalUrl`. Only the owner can approve it, on their own page, signed in. No tool can.
 2. Check progress with `get_pending_action` (status, preview, and the result once it ran). Do not repeat the original call: that creates a second held action.
@@ -29,8 +29,8 @@ Some calls do not run at once: sharing a file with anyone, a domain or an outsid
 
 ## Read-only endpoint
 
-Routines and unattended runs should use the server's `/mcp/ro` endpoint, added as a second connector (`workspace-bridge-readonly`). It offers reads and draft create and update. Send, reply, forward, share, filters, trash and delete do not exist there. If a task needs one, leave a draft and tell the user.
+Routines and unattended runs should use the server's `/mcp/ro` endpoint, added as a second connector (`workspace-bridge-readonly`). It offers reads and draft create and update. Send, reply, forward, share, filters, trash and delete do not exist there (`list_calendar_shares` does, since it only reads). If a task needs one, leave a draft and tell the user.
 
 ## Deleting
 
-Mail and Drive files are never deleted permanently: trash is reversible for 30 days (`untrash_message`, `untrash_thread`). `delete_draft`, `delete_label`, `delete_filter` and `delete_event` do remove the item for good: confirm with the user first.
+Mail and Drive files are never deleted permanently: trash is reversible for 30 days (`untrash_message`, `untrash_thread`). `delete_draft`, `delete_label`, `delete_filter`, `delete_event`, `unshare_calendar` (that person loses access) and `remove_calendar` (off the account's calendar list; the calendar stays) do remove the item for good: confirm with the user first.

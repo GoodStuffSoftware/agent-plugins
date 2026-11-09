@@ -4,6 +4,7 @@ import { ToolError } from "../../core/errors";
 import type {
   CalendarInfo,
   CalendarService,
+  CalendarShare,
   EventAttendee,
   EventInfo,
   EventInput,
@@ -261,6 +262,29 @@ const enc = encodeURIComponent;
 const eventUrl = (cal: string, id?: string): string =>
   `${BASE}/calendars/${enc(cal)}/events${id === undefined ? "" : `/${enc(id)}`}`;
 
+const aclUrl = (cal: string, ruleId?: string): string =>
+  `${BASE}/calendars/${enc(cal)}/acl${ruleId === undefined ? "" : `/${enc(ruleId)}`}`;
+
+const LIST_FIELDS =
+  "id,summary,summaryOverride,description,primary,accessRole,timeZone,selected,hidden,backgroundColor";
+const ACL_FIELDS = "id,role,scope(type,value)";
+/** A calendar with more than 5000 rules is not a thing; the cap keeps a runaway answer bounded. */
+const MAX_ACL_PAGES = 20;
+
+interface GAclRule {
+  id: string;
+  role: string;
+  scope?: { type?: string; value?: string };
+}
+
+function toShare(r: GAclRule): CalendarShare {
+  return {
+    id: r.id,
+    role: r.role,
+    scope: defined({ type: r.scope?.type ?? "unknown", value: r.scope?.value }),
+  };
+}
+
 export const googleCalendar: CalendarService = {
   async listCalendars(a, q) {
     const r = await gjson<{ nextPageToken?: string; items?: CalendarInfo[] }>(
@@ -268,8 +292,7 @@ export const googleCalendar: CalendarService = {
       `${BASE}/users/me/calendarList`,
       {},
       {
-        fields:
-          "nextPageToken,items(id,summary,summaryOverride,description,primary,accessRole,timeZone,selected,hidden,backgroundColor)",
+        fields: `nextPageToken,items(${LIST_FIELDS})`,
         query: { maxResults: q.pageSize, pageToken: q.pageToken },
       },
     );
@@ -279,6 +302,66 @@ export const googleCalendar: CalendarService = {
     };
     if (r?.nextPageToken) page.nextPageToken = r.nextPageToken;
     return page;
+  },
+
+  async getCalendar(a, calendarId) {
+    const r = await gjson<CalendarInfo>(
+      a,
+      `${BASE}/users/me/calendarList/${enc(calendarId)}`,
+      {},
+      { fields: LIST_FIELDS },
+    );
+    if (!r) throw new ToolError("upstream_error", "Google answered with an empty body.");
+    return defined(r);
+  },
+
+  async addCalendar(a, calendarId) {
+    const r = await gjson<CalendarInfo>(
+      a,
+      `${BASE}/users/me/calendarList`,
+      { method: "POST", json: { id: calendarId } },
+      { fields: LIST_FIELDS },
+    );
+    if (!r) throw new ToolError("upstream_error", "Google answered with an empty body.");
+    return defined(r);
+  },
+
+  async removeCalendar(a, calendarId) {
+    await gjson<undefined>(a, `${BASE}/users/me/calendarList/${enc(calendarId)}`, {
+      method: "DELETE",
+    });
+  },
+
+  async listShares(a, calendarId) {
+    const out: CalendarShare[] = [];
+    let pageToken: string | undefined;
+    for (let i = 0; i < MAX_ACL_PAGES; i++) {
+      const r = await gjson<{ nextPageToken?: string; items?: GAclRule[] }>(
+        a,
+        aclUrl(calendarId),
+        {},
+        { fields: `nextPageToken,items(${ACL_FIELDS})`, query: { maxResults: 250, pageToken } },
+      );
+      out.push(...(r?.items ?? []).map(toShare));
+      pageToken = r?.nextPageToken;
+      if (!pageToken) break;
+    }
+    return out;
+  },
+
+  async shareCalendar(a, calendarId, share, sendNotifications) {
+    const r = await gjson<GAclRule>(
+      a,
+      aclUrl(calendarId),
+      { method: "POST", json: { role: share.role, scope: { type: "user", value: share.email } } },
+      { fields: ACL_FIELDS, query: { sendNotifications } },
+    );
+    if (!r) throw new ToolError("upstream_error", "Google answered with an empty body.");
+    return toShare(r);
+  },
+
+  async unshareCalendar(a, calendarId, ruleId) {
+    await gjson<undefined>(a, aclUrl(calendarId, ruleId), { method: "DELETE" });
   },
 
   async calendarTimeZone(a, calendarId) {

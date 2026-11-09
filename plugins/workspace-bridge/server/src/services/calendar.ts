@@ -137,11 +137,41 @@ export interface FreeBusyAnswer {
   calendars: Record<string, { busy: { start: string; end: string }[]; unavailable: boolean }>;
 }
 
+/** One access rule of a calendar (Google's ACL rule). */
+export interface CalendarShare {
+  /** The rule id, such as `user:someone@example.com`. */
+  id: string;
+  /** `none`, `freeBusyReader`, `reader`, `writer` or `owner`. */
+  role: string;
+  /** Who the rule is for: `user`, `group`, `domain` or `default` (public); `value` is absent for `default`. */
+  scope: { type: string; value?: string };
+}
+
+/** The roles `share_calendar` may grant. */
+export type ShareRole = "freeBusyReader" | "reader";
+
 export interface CalendarService {
   listCalendars(
     a: AccountRef,
     q: { pageSize: number; pageToken?: string | null },
   ): Promise<Page<CalendarInfo>>;
+  /** The account's own calendar-list entry for a calendar, with the account's `accessRole` on it. */
+  getCalendar(a: AccountRef, calendarId: string): Promise<CalendarInfo>;
+  /** Adds a calendar (one shared with the account) to the account's calendar list. */
+  addCalendar(a: AccountRef, calendarId: string): Promise<CalendarInfo>;
+  /** Removes a calendar from the account's calendar list; the calendar and its events stay. */
+  removeCalendar(a: AccountRef, calendarId: string): Promise<void>;
+  /** Every access rule of a calendar. */
+  listShares(a: AccountRef, calendarId: string): Promise<CalendarShare[]>;
+  /** Grants a user `role` on a calendar. `sendNotifications` decides whether Google emails them. */
+  shareCalendar(
+    a: AccountRef,
+    calendarId: string,
+    share: { email: string; role: ShareRole },
+    sendNotifications: boolean,
+  ): Promise<CalendarShare>;
+  /** Deletes one access rule of a calendar. */
+  unshareCalendar(a: AccountRef, calendarId: string, ruleId: string): Promise<void>;
   /** The IANA time zone of a calendar ("primary" works). */
   calendarTimeZone(a: AccountRef, calendarId: string): Promise<string>;
   listEvents(a: AccountRef, calendarId: string, q: ListEventsQuery): Promise<Page<EventInfo>>;

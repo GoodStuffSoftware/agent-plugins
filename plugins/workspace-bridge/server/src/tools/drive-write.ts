@@ -421,12 +421,19 @@ const recipient = (s: DriveShare): string =>
 async function shareRisk(ctx: ToolContext, s: DriveShare): Promise<string | null> {
   if (s.type === "anyone") return "Anyone with the link would get access.";
   if (s.type === "domain") return `Everyone at ${s.domain} would get access.`;
+  return addressRisk(ctx, s.emailAddress ?? "");
+}
+
+/**
+ * Why sharing with this (lowercase) address needs the owner's approval, or null when it is one of
+ * the owner's linked accounts or allowed addresses (OWNER_EMAILS, LINKABLE_EMAILS). `share_calendar`
+ * holds on the same rule.
+ */
+export async function addressRisk(ctx: ToolContext, email: string): Promise<string | null> {
   const cfg = config(ctx.env);
-  const own = (await loadAccountRefs(ctx.env.DB, ctx.ownerId)).map((x) => x.address);
+  const own = (await loadAccountRefs(ctx.env.DB, ctx.ownerId)).map((x) => x.address.toLowerCase());
   const allowed = new Set([...own, ...cfg.ownerEmails, ...cfg.linkableEmails]);
-  return allowed.has(s.emailAddress ?? "")
-    ? null
-    : `${s.emailAddress} is not one of your accounts or allowed addresses.`;
+  return allowed.has(email) ? null : `${email} is not one of your accounts or allowed addresses.`;
 }
 
 const shareFile = defineTool({

@@ -15,7 +15,9 @@ import { googleCalendar } from "../providers/google/calendar";
 import { defineTool, type Family, type ToolContext } from "../registry/types";
 import {
   CALENDAR,
+  type CalendarInfo,
   type CalendarService,
+  type CalendarShare,
   type EventAttendee,
   type EventInfo,
   type EventInput,
@@ -26,12 +28,14 @@ import {
   type ParsedTime,
   parseTimeInput,
   type SendUpdates,
+  type ShareRole,
   toInstantMs,
   zonedParts,
   zonedToMs,
 } from "../services/calendar";
 import { provide } from "../services/capability";
 import type { AccountRef } from "../services/types";
+import { addressRisk } from "./drive-write";
 
 const DAY_MS = 86_400_000;
 const MAX_DESCRIPTION_CHARS = 8000;
@@ -262,6 +266,24 @@ function view(
   return out;
 }
 
+/** A calendar-list entry as the tools answer it; its names are written by other people, so wrapped. */
+function calendarView(ctx: ToolContext, a: AccountRef, c: CalendarInfo): Record<string, unknown> {
+  const key = accountKey(a.shortId);
+  const w = (t?: string) =>
+    t === undefined ? undefined : ctx.untrusted.wrap(t, { source: "calendar", account: key });
+  return defined({
+    id: ctx.ids.encode(a, c.id),
+    summary: w(c.summary),
+    summaryOverride: c.summaryOverride,
+    description: w(c.description),
+    primary: c.primary,
+    accessRole: c.accessRole,
+    timeZone: c.timeZone,
+    selected: c.selected,
+    hidden: c.hidden,
+  });
+}
+
 /** The start of the local day containing `now`, so a default window stays put across pages. */
 function startOfToday(now: number, tz: string): number {
   const p = zonedParts(now, tz);
@@ -291,23 +313,8 @@ const listCalendars = defineTool({
     const page = await ctx
       .use(CALENDAR, a)
       .listCalendars(a, { pageSize: args.pageSize ?? 100, pageToken: args.pageToken });
-    const key = accountKey(a.shortId);
-    const w = (t?: string) =>
-      t === undefined ? undefined : ctx.untrusted.wrap(t, { source: "calendar", account: key });
     return {
-      calendars: page.items.map((c) =>
-        defined({
-          id: ctx.ids.encode(a, c.id),
-          summary: w(c.summary),
-          summaryOverride: c.summaryOverride,
-          description: w(c.description),
-          primary: c.primary,
-          accessRole: c.accessRole,
-          timeZone: c.timeZone,
-          selected: c.selected,
-          hidden: c.hidden,
-        }),
-      ),
+      calendars: page.items.map((c) => calendarView(ctx, a, c)),
       nextPageToken: page.nextPageToken,
     };
   },
@@ -1525,6 +1532,345 @@ const respondToEvent = defineTool({
   },
 });
 
+// ---- Sharing a calendar and the calendar list ------------------------------------------------
+// `share_calendar` follows `share_file` (drive-write.ts): the same hold for an address that is not
+// one of the owner's linked accounts or allowed addresses, and an audit row for every share (held,
+// done, refused or failed). Google's own invitation mail is off unless the caller asks. Removing
+// access (`unshare_calendar`) and changing the account's own calendar list (`add_calendar`,
+// `remove_calendar`) are audited but never held, like `delete_filter`: they open nothing up.
+
+type AclTool = "share_calendar" | "unshare_calendar" | "add_calendar" | "remove_calendar";
+
+const SHARE_ROLES = ["freeBusyReader", "reader"] as const;
+const SHARE_EMAIL = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
+
+const requiredCalendarId = z
+  .string()
+  .min(1)
+  .describe("Required. Calendar id (an email address) from list_calendars.");
+
+/** A valid, lowercase email address; `invalid_argument` otherwise. */
+function shareEmail(text: string, field: string): string {
+  const email = text.trim().toLowerCase();
+  if (email.length > 320 || !SHARE_EMAIL.test(email)) {
+    throw new ToolError("invalid_argument", `${field} must be an email address.`);
+  }
+  return email;
+}
+
+interface ShareArgs {
+  calendarId: string;
+  email: string;
+  role?: ShareRole | undefined;
+  sendNotifications?: boolean | undefined;
+  account?: string | undefined;
+}
+
+/** What a `share_calendar` call asks for, with the defaults filled in. */
+function shareSpec(args: ShareArgs): { email: string; role: ShareRole; notify: boolean } {
+  return {
+    email: shareEmail(args.email, "email"),
+    role: args.role ?? "freeBusyReader",
+    notify: args.sendNotifications === true,
+  };
+}
+
+/** Writes an audit row for a sharing call; a failing log never changes the answer. */
+async function auditAcl(
+  ctx: ToolContext,
+  tool: AclTool,
+  a: AccountRef,
+  to: readonly string[],
+  result: "ok" | "refused" | "error" | "pending",
+  detail: string,
+  providerRef?: string,
+): Promise<void> {
+  try {
+    await ctx.audit.write({
+      tool,
+      account: a,
+      to,
+      providerRef: providerRef ?? null,
+      result,
+      detail,
+    });
+  } catch {
+    console.error(`${tool}: the audit row could not be written`);
+  }
+}
+
+/**
+ * Refuses (audited, nothing shared) a calendar the account does not own. Google lists the access
+ * role of the account's own calendar-list entry; only `owner` may change who a calendar is shared
+ * with. A calendar missing from the account's list is `not_found`. Its own failures are audited here.
+ */
+async function assertOwner(
+  ctx: ToolContext,
+  t: { a: AccountRef; cal: string },
+  to: readonly string[],
+  detail: string,
+): Promise<void> {
+  let info: CalendarInfo;
+  try {
+    info = await ctx.use(CALENDAR, t.a).getCalendar(t.a, t.cal);
+  } catch (e) {
+    await auditAcl(ctx, "share_calendar", t.a, to, "error", `${errorCode(e)}: ${detail}`);
+    throw e;
+  }
+  if (info.accessRole === "owner") return;
+  await auditAcl(ctx, "share_calendar", t.a, to, "refused", `not_owner: ${detail}`);
+  throw new ToolError(
+    "invalid_argument",
+    `This account does not own that calendar (its access role is ${info.accessRole ?? "unknown"}), so it cannot share it. Only a calendar the account owns can be shared.`,
+  );
+}
+
+const shareView = (r: CalendarShare) => ({ id: r.id, role: r.role, scope: r.scope });
+
+const listCalendarShares = defineTool({
+  name: "list_calendar_shares",
+  title: "List who a calendar is shared with",
+  description:
+    "Returns the access rules of a calendar: each rule's id, role (freeBusyReader, reader, writer or owner) and scope type (user, group, domain or default) with its value (an email address or domain). Use a rule id with unshare_calendar. Needs the account to own the calendar.",
+  component: "calendar",
+  scopes: ["calendar"],
+  endpoints: ["full", "ro"],
+  annotations: { readOnlyHint: true, openWorldHint: false },
+  input: z.object({ calendarId: requiredCalendarId, account }),
+  async handler(args, ctx) {
+    const t = await target(ctx, args.account, args.calendarId, undefined);
+    const shares = await ctx.use(CALENDAR, t.a).listShares(t.a, t.cal);
+    return {
+      calendarId: ctx.ids.encode(t.a, t.cal),
+      account: accountKey(t.a.shortId),
+      shares: shares.map(shareView),
+    };
+  },
+});
+
+const shareCalendar = defineTool({
+  name: "share_calendar",
+  title: "Share a calendar",
+  description:
+    "Shares a calendar the account owns with one person. role is freeBusyReader (sees only when the calendar is busy; the default) or reader (sees event details); no other role can be granted. Only a calendar the account owns can be shared; otherwise the call is refused. sendNotifications (default false) decides whether Google emails the person an invitation. Sharing with an address that is not one of the owner's linked accounts or allowed addresses is held: the answer is a pending_approval with an approvalUrl, nothing is shared until the owner approves it there, and get_pending_action shows the result. Every share is written to the audit log. The person can then subscribe with add_calendar.",
+  component: "calendar",
+  scopes: ["calendar"],
+  endpoints: ["full"],
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  input: z.object({
+    calendarId: requiredCalendarId,
+    email: z.string().min(3).max(320).describe("Required. The email address of the person."),
+    role: z
+      .enum(SHARE_ROLES)
+      .optional()
+      .describe("freeBusyReader (the default) sees only busy times; reader sees event details."),
+    sendNotifications: z
+      .boolean()
+      .optional()
+      .describe("Whether Google emails the person about the share. Default false."),
+    account,
+  }),
+  approval: {
+    async when(args, ctx) {
+      const spec = shareSpec(args);
+      const risk = await addressRisk(ctx, spec.email);
+      if (risk === null) return false;
+      // Refused now rather than queued: an approval for a share that could never be made.
+      const t = await target(ctx, args.account, args.calendarId, undefined);
+      await assertOwner(ctx, t, [spec.email], `role=${spec.role}`);
+      return true;
+    },
+    async preview(args, ctx) {
+      const spec = shareSpec(args);
+      const t = await target(ctx, args.account, args.calendarId, undefined);
+      return {
+        action: "Share a calendar",
+        account: t.a.label,
+        calendarId: ctx.ids.encode(t.a, t.cal),
+        role: spec.role,
+        to: spec.email,
+        notify: spec.notify,
+        reason: await addressRisk(ctx, spec.email),
+      };
+    },
+    // After the pending action exists, so a failed hold leaves no row, and with its id.
+    async onHeld(args, ctx, held) {
+      const spec = shareSpec(args);
+      const cal = ctx.ids.parse(args.calendarId)?.providerId ?? args.calendarId;
+      await ctx.audit.write({
+        tool: "share_calendar",
+        account: held.account,
+        to: [spec.email],
+        providerRef: null,
+        result: "pending",
+        detail: `pending action ${held.pendingActionId}: approval requested, role=${spec.role} notify=${spec.notify} calendar=${cal}`,
+      });
+    },
+  },
+  async handler(args, ctx) {
+    const spec = shareSpec(args);
+    const t = await target(ctx, args.account, args.calendarId, undefined);
+    const detail = `role=${spec.role} notify=${spec.notify} calendar=${t.cal}`;
+    await assertOwner(ctx, t, [spec.email], detail);
+    let rule: CalendarShare;
+    try {
+      rule = await ctx
+        .use(CALENDAR, t.a)
+        .shareCalendar(t.a, t.cal, { email: spec.email, role: spec.role }, spec.notify);
+    } catch (e) {
+      await auditAcl(
+        ctx,
+        "share_calendar",
+        t.a,
+        [spec.email],
+        "error",
+        `${errorCode(e)}: ${detail}`,
+      );
+      throw e;
+    }
+    await auditAcl(ctx, "share_calendar", t.a, [spec.email], "ok", detail, rule.id);
+    return {
+      calendarId: ctx.ids.encode(t.a, t.cal),
+      account: accountKey(t.a.shortId),
+      rule: shareView(rule),
+      notified: spec.notify,
+    };
+  },
+});
+
+const unshareCalendar = defineTool({
+  name: "unshare_calendar",
+  title: "Stop sharing a calendar",
+  description:
+    "Removes one access rule from a calendar the account owns, so that person or group loses access. Give ruleId (from list_calendar_shares, for example user:someone@example.com) or email for a person. Nobody is emailed. Every removal is written to the audit log.",
+  component: "calendar",
+  scopes: ["calendar"],
+  endpoints: ["full"],
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  input: z.object({
+    calendarId: requiredCalendarId,
+    ruleId: z
+      .string()
+      .min(1)
+      .max(400)
+      .optional()
+      .describe("The rule id from list_calendar_shares. Give this or email, not both."),
+    email: z
+      .string()
+      .max(320)
+      .optional()
+      .describe("The email address of a person the calendar is shared with, instead of ruleId."),
+    account,
+  }),
+  async handler(args, ctx) {
+    if ((args.ruleId === undefined) === (args.email === undefined)) {
+      throw new ToolError(
+        "invalid_argument",
+        "Give exactly one of ruleId (from list_calendar_shares) or email.",
+      );
+    }
+    const ruleId =
+      args.email === undefined
+        ? (args.ruleId as string).trim()
+        : `user:${shareEmail(args.email, "email")}`;
+    const t = await target(ctx, args.account, args.calendarId, undefined);
+    const to = [ruleId.startsWith("user:") ? ruleId.slice(5) : ruleId];
+    const detail = `rule=${ruleId} calendar=${t.cal}`;
+    try {
+      await ctx.use(CALENDAR, t.a).unshareCalendar(t.a, t.cal, ruleId);
+    } catch (e) {
+      await auditAcl(ctx, "unshare_calendar", t.a, to, "error", `${errorCode(e)}: ${detail}`);
+      throw e;
+    }
+    await auditAcl(ctx, "unshare_calendar", t.a, to, "ok", detail, ruleId);
+    return {
+      calendarId: ctx.ids.encode(t.a, t.cal),
+      account: accountKey(t.a.shortId),
+      unshared: ruleId,
+    };
+  },
+});
+
+const addCalendar = defineTool({
+  name: "add_calendar",
+  title: "Add a calendar to the list",
+  description:
+    "Adds a calendar that was shared with this account to its calendar list, so list_calendars and the event tools can use it. Give the calendar's id (usually the owner's email address). The calendar must already be shared with the account (the owner uses share_calendar); undo with remove_calendar. Returns the calendar as list_calendars shows it. Every add is written to the audit log.",
+  component: "calendar",
+  scopes: ["calendar"],
+  endpoints: ["full"],
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  untrusted: true,
+  input: z.object({
+    calendarId: z
+      .string()
+      .min(1)
+      .describe("Required. Id of the calendar shared with this account (an email address)."),
+    account,
+  }),
+  async handler(args, ctx) {
+    const t = await target(ctx, args.account, args.calendarId, undefined);
+    const detail = `calendar=${t.cal}`;
+    let entry: CalendarInfo;
+    try {
+      entry = await ctx.use(CALENDAR, t.a).addCalendar(t.a, t.cal);
+    } catch (e) {
+      await auditAcl(ctx, "add_calendar", t.a, [], "error", `${errorCode(e)}: ${detail}`);
+      throw e;
+    }
+    await auditAcl(ctx, "add_calendar", t.a, [], "ok", detail, entry.id);
+    return { calendar: calendarView(ctx, t.a, entry) };
+  },
+});
+
+const removeCalendar = defineTool({
+  name: "remove_calendar",
+  title: "Remove a calendar from the list",
+  description:
+    "Removes a calendar from this account's calendar list, the undo for add_calendar. The calendar itself and its events are not deleted, and other people keep their access. The primary calendar cannot be removed. Every removal is written to the audit log.",
+  component: "calendar",
+  scopes: ["calendar"],
+  endpoints: ["full"],
+  annotations: {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  input: z.object({ calendarId: requiredCalendarId, account }),
+  async handler(args, ctx) {
+    const t = await target(ctx, args.account, args.calendarId, undefined);
+    const detail = `calendar=${t.cal}`;
+    try {
+      await ctx.use(CALENDAR, t.a).removeCalendar(t.a, t.cal);
+    } catch (e) {
+      await auditAcl(ctx, "remove_calendar", t.a, [], "error", `${errorCode(e)}: ${detail}`);
+      throw e;
+    }
+    await auditAcl(ctx, "remove_calendar", t.a, [], "ok", detail, t.cal);
+    return {
+      calendarId: ctx.ids.encode(t.a, t.cal),
+      account: accountKey(t.a.shortId),
+      removed: true,
+    };
+  },
+});
+
 export const calendar: Family = {
   id: "calendar",
   tools: [
@@ -1537,6 +1883,11 @@ export const calendar: Family = {
     updateEvent,
     deleteEvent,
     respondToEvent,
+    listCalendarShares,
+    shareCalendar,
+    unshareCalendar,
+    addCalendar,
+    removeCalendar,
   ] as unknown as Family["tools"],
   bindings: { google: [provide(CALENDAR, googleCalendar)] },
   parityPending: [],
