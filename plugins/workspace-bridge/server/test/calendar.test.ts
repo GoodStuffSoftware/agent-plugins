@@ -1631,6 +1631,34 @@ describe("calendar sharing", () => {
       expect(calls).toHaveLength(0);
     });
 
+    it("rejects blank and dot-segment ids before any request goes out", async () => {
+      const { ownerId } = await setup();
+      const calls = installGoogleRoutes([]);
+      const token = await mintToken({ kind: "full", scopes: SCOPES.full, ownerId });
+      // Schema rejections come back as plain text, so read `isError` from the raw result.
+      const rejected = async (name: string, args: Record<string, unknown>) => {
+        const { result } = await mcpRpc(token, "full", "tools/call", { name, arguments: args });
+        return (result as { isError?: boolean }).isError === true;
+      };
+      const bad = [".", "..", " .. ", "  "];
+      for (const v of bad) {
+        expect(await rejected("unshare_calendar", { calendarId: WORK, ruleId: v })).toBe(true);
+        for (const name of [
+          "unshare_calendar",
+          "add_calendar",
+          "remove_calendar",
+          "list_calendar_shares",
+        ]) {
+          const args = name === "unshare_calendar" ? { ruleId: "user:a@example.com" } : {};
+          expect(await rejected(name, { calendarId: v, ...args })).toBe(true);
+        }
+        expect(await rejected("share_calendar", { calendarId: v, email: "a@example.org" })).toBe(
+          true,
+        );
+      }
+      expect(calls).toHaveLength(0);
+    });
+
     it("audits a failure and maps a 404", async () => {
       const { ownerId } = await setup();
       installGoogleRoutes([

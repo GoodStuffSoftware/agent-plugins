@@ -1544,9 +1544,17 @@ type AclTool = "share_calendar" | "unshare_calendar" | "add_calendar" | "remove_
 const SHARE_ROLES = ["freeBusyReader", "reader"] as const;
 const SHARE_EMAIL = /^[^\s@,;<>]+@[^\s@,;<>]+\.[^\s@,;<>]+$/;
 
+/** An id that goes into a Google URL path: not blank and not a dot segment (`.` or `..`). */
+const pathSafe = (v: string): boolean => {
+  const s = v.trim();
+  return s !== "" && s !== "." && s !== "..";
+};
+const PATH_SAFE_MESSAGE = "Must not be blank, `.` or `..`.";
+
 const requiredCalendarId = z
   .string()
   .min(1)
+  .refine(pathSafe, PATH_SAFE_MESSAGE)
   .describe("Required. Calendar id (an email address) from list_calendars.");
 
 /** A valid, lowercase email address; `invalid_argument` otherwise. */
@@ -1763,6 +1771,7 @@ const unshareCalendar = defineTool({
       .string()
       .min(1)
       .max(400)
+      .refine(pathSafe, PATH_SAFE_MESSAGE)
       .optional()
       .describe("The rule id from list_calendar_shares. Give this or email, not both."),
     email: z
@@ -1820,6 +1829,7 @@ const addCalendar = defineTool({
     calendarId: z
       .string()
       .min(1)
+      .refine(pathSafe, PATH_SAFE_MESSAGE)
       .describe("Required. Id of the calendar shared with this account (an email address)."),
     account,
   }),

@@ -724,3 +724,58 @@ describe("the held-action notice", () => {
     expect(body.split("\n").filter((l) => l.startsWith("Bcc:"))).toEqual([]);
   });
 });
+
+describe("an approved calendar share", () => {
+  const CAL = "https://www.googleapis.com/calendar/v3";
+  const WORK = "work%40example.com";
+  const entry = (accessRole: string): GoogleRoute => ({
+    url: `${CAL}/users/me/calendarList/${WORK}`,
+    reply: () => googleJson(200, { id: "work@example.com", accessRole }),
+  });
+  const insert: GoogleRoute = {
+    method: "POST",
+    url: `${CAL}/calendars/${WORK}/acl`,
+    reply: () =>
+      googleJson(200, {
+        id: "user:pat@example.org",
+        role: "freeBusyReader",
+        scope: { type: "user", value: "pat@example.org" },
+      }),
+  };
+  const holdShare = async (ownerId: string) => {
+    installGoogleRoutes([entry("owner")]);
+    const res = await call(E(), ownerId, "share_calendar", {
+      calendarId: "work@example.com",
+      email: "pat@example.org",
+    });
+    expect(res.json.status).toBe("pending_approval");
+    return res.json.pendingActionId as string;
+  };
+
+  it("runs once the owner approves, with the default role and no invitation email", async () => {
+    const { ownerId } = await setup();
+    const id = await holdShare(ownerId);
+    const browser = await owner(E(), ownerId);
+    const calls = installGoogleRoutes([entry("owner"), insert]);
+    await browser.post(approvalPath(id), { decision: "approve" });
+    expect((await pending(id))?.status).toBe("executed");
+    const post = calls.find((c) => c.method === "POST");
+    expect(JSON.parse(post?.body ?? "{}")).toEqual({
+      role: "freeBusyReader",
+      scope: { type: "user", value: "pat@example.org" },
+    });
+    expect(new URL(post?.url ?? "https://x.invalid/").searchParams.get("sendNotifications")).toBe(
+      "false",
+    );
+  });
+
+  it("checks ownership again when approved, and shares nothing if it was lost meanwhile", async () => {
+    const { ownerId } = await setup();
+    const id = await holdShare(ownerId);
+    const browser = await owner(E(), ownerId);
+    const calls = installGoogleRoutes([entry("reader"), insert]);
+    await browser.post(approvalPath(id), { decision: "approve" });
+    expect((await pending(id))?.status).toBe("failed");
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+  });
+});

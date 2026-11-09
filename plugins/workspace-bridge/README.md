@@ -45,7 +45,7 @@ Every account-scoped tool takes `account` (label, matched ignoring case; or addr
 
 **Accounts and meta.** `list_accounts`, `link_account_url`, `whoami`, `get_pending_action`.
 
-Plain reads and draft create and update are also on `/mcp/ro`, a separate read-only endpoint for routines. Send, forward, share, filter and trash tools are not registered there.
+Plain reads and draft create and update are also on `/mcp/ro`, a separate read-only endpoint for routines. Send, forward, share, filter and trash tools are not registered there (`list_calendar_shares` is, since it only reads).
 
 ## Security model
 
