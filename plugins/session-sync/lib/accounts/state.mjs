@@ -10,7 +10,7 @@
 
 import {
   readFileSync, mkdirSync, existsSync, openSync, writeSync, fsyncSync, closeSync,
-  renameSync, copyFileSync, unlinkSync,
+  renameSync, copyFileSync, unlinkSync, utimesSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -109,12 +109,15 @@ export function serializeJson(obj, fmt = {}) {
  * them would be one more place for them to sit). The temp name matches OURTMP:
  * not a record name, not *.json.tmp, excluded from push, cleaned up after 1 h.
  */
-export function writeTextAtomic(file, text, { guard } = {}) {
+export function writeTextAtomic(file, text, { guard, mtimeMs } = {}) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = join(dirname(file), `.session-sync-link-${randomBytes(6).toString('hex')}`);
   const fd = openSync(tmp, 'wx');
   try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
-  try { guard?.(); renameRetry(tmp, file); } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
+  try {
+    if (mtimeMs !== undefined) utimesSync(tmp, mtimeMs / 1000, mtimeMs / 1000);
+    guard?.(); renameRetry(tmp, file);
+  } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
 }
 
 export function loadState(ctx) {
