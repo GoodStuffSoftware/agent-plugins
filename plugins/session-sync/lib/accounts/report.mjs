@@ -102,7 +102,7 @@ function countFolder(path) {
 }
 
 /** split = ids whose names in the group point at more than one inode; missing = absent names. */
-function groupHealth(group) {
+export function groupHealth(group) {
   const byId = new Map();
   for (const f of group) {
     let names = [];
@@ -160,6 +160,7 @@ export function collectStatus(ctx, o = {}) {
     lastPass: readJson(accPath(ctx, 'last-pass.json'), null),
     backupId: state.backupId ?? null,
     rollbackActive: rollbackActive(ctx),
+    goLive: readJson(accPath(ctx, 'go-live-result.json'), null),
     remote: remoteList ? { checkedAt: remoteList.at ?? null, ids: Object.keys(remoteList.ids ?? {}).length, duplicates: dups } : null,
     lists,
     tasksDue,
@@ -181,6 +182,7 @@ export function formatStatus(st, { all = false } = {}) {
   out.push(`Waiter: ${st.waiter.alive ? `armed (pid ${st.waiter.pid}; ${st.waiter.reasons.join(', ') || 'no reason'})` : 'none'}.`);
   if (st.rollbackActive) out.push('A rollback is running or was interrupted: no pass runs until it finishes (run: accounts rollback again).');
   if (st.lastPass) out.push(`Last pass: ${st.lastPass.op} ${st.lastPass.ok ? 'ok' : `failed (${st.lastPass.reason ?? st.lastPass.error ?? 'unknown'})`} at ${st.lastPass.at}.`);
+  if (st.goLive) out.push(formatGoLive(st.goLive));
   out.push(`Remote duplicates: ${st.remote ? `${st.remote.duplicates} (checked ${st.remote.checkedAt})` : 'not checked (run: accounts status --remote)'}.`);
   if (st.unknownKeys.length) out.push(`Unknown per-account settings keys (not synced): ${st.unknownKeys.length}.`);
   if (st.tasksDue) {
@@ -199,6 +201,15 @@ export function formatStatus(st, { all = false } = {}) {
     if (v.pluginsMissing.length) out.push(`Plugins missing${tag}: ${v.pluginsMissing.join(', ')}.`);
   }
   return out;
+}
+
+/** One status line for the go-live result file. */
+export function formatGoLive(g) {
+  const last = (g.messages ?? []).slice(-1)[0];
+  const phase = g.status === 'waiting' ? ` (phase ${g.phase})` : '';
+  const done = g.finishedAt ? `, finished ${g.finishedAt}` : '';
+  const paused = g.status !== 'ok' && g.push?.pausedByGoLive && !g.push?.reEnabled ? ' Push is paused by go-live and stays off until it finishes or you run: config enabled true.' : '';
+  return `Go-live: ${g.status}${phase}, started ${g.startedAt}${done}.${last ? ` ${last}` : ''}${paused} Log: ${g.log}`;
 }
 
 /** The final text of a command result. */

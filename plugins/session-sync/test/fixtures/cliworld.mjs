@@ -56,7 +56,7 @@ export function cworld({ config = {}, accounts = 2, records = 2 } = {}) {
       return spawnSync(process.execPath, [CLI, ...args], {
         env: {
           ...process.env, USERPROFILE: home, HOME: home, APPDATA: join(home, 'AppData', 'Roaming'), XDG_CONFIG_HOME: join(home, '.config'),
-          CLAUDE_SESSION_SYNC_REMOTE: remote, SESSION_SYNC_TEST_APP_STATE: appFile, SESSION_SYNC_TEST_POLL_MS: '100', ...env,
+          CLAUDE_SESSION_SYNC_REMOTE: remote, SESSION_SYNC_TEST_APP_STATE: appFile, SESSION_SYNC_TEST_POLL_MS: '100', SESSION_SYNC_TEST_LAUNCH: 'spawn', ...env,
         },
         encoding: 'utf8', timeout: 30000, windowsHide: true,
       });

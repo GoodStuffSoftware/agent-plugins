@@ -79,6 +79,38 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config accountLink off    # ask (defaul
 
 `ask` asks once per account pair, `auto` links without asking, `off` never asks and never touches the per-account folders. The environment variable `CLAUDE_PLUGIN_OPTION_ACCOUNTLINK` overrides the file.
 
+### The whole go-live in one command
+
+This is the route when the user wants the link done end to end. Run it yourself, in this order:
+
+1. Run `accounts status` and tell the user in plain words what will be linked. Ask for a clear yes. Do not run the next command without it.
+2. Run:
+
+   ```bash
+   node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts go-live --yes --quit-app
+   ```
+
+   Add `--no-relaunch` only if the user wants to start Claude themselves. The command records the answer, starts ONE hidden background runner that survives the quit, and returns at once.
+3. Tell the user, before anything else happens: Claude will close and open again by itself, **this session stops when Claude closes**, and the result is shown at the start of their next session. Mention the log path the command printed.
+
+What the runner does after you are gone: a few seconds later it asks Claude to quit, waits for it to stop (up to 30 minutes), takes the backup, links, verifies that every folder holds every conversation (0 split, 0 missing), starts Claude again, waits for every copy of session-sync (the app's own and the one terminal sessions run) to be able to link, runs a rectify pass and checks the remote for duplicates. A link or verify failure rolls back by itself. If a copy cannot filter mirrored records yet, push is paused and switched back on once every copy can. The app refreshes its own copies when it starts; a terminal copy needs `claude plugin update session-sync@<marketplace> --scope user`.
+
+Asking Claude to quit works on macOS. On Windows and Linux it is not available (on Windows an outside quit ends the app before its own shutdown has saved everything, so it is not offered). The command then says so: ask the user to quit Claude from the tray icon (Windows) or the app menu. Closing the window only hides it. The runner waits for that.
+
+When the user's next session starts, the plugin adds the result to your context once (status, counts, anything that needs them, the log path). If the runner is still busy it says so. Tell the user the result in one or two plain lines. To follow it yourself: `accounts status` (the `Go-live:` line), or `go-live-result.json` and `go-live.log` in the accounts folder. Running the command again resumes an unfinished go-live.
+
+### After the go-live: the checklist
+
+The link moves what is on this machine. Work through this yourself where you can, and give the user only what needs their hands. Start from `accounts status --all`.
+
+1. **Connectors the other account had.** If the mcp-registry search and suggest tools are available, use them for each connector listed under "Connectors missing" so the user gets Connect buttons. Otherwise name each one and say where to add it (claude.ai, Settings, Connectors).
+2. **Custom connectors.** The registry cannot offer these. List each URL for the user to add themselves.
+3. **Artifact shares.** List the artifacts under "Artifacts from other accounts" so the user can share them with this account or republish them.
+4. **Chat memory, profile and custom instructions.** The user copies these by hand from the other account's settings. Say so once, briefly.
+5. **The other account from the terminal.** Run `claude auth status`. If the terminal CLI is signed in as the other account, you can read that account's sessions and routines without switching anything: `claude -p --resume <session id> --allowedTools "Read,Grep,Glob" "<question>"`. Keep the allow-list read-only: never let it edit files or run commands.
+
+Step 6 below covers the rest of the claude.ai-only list.
+
 ## 4. Undo: unlink
 
 ```bash

@@ -203,6 +203,8 @@ export async function remoteRecordList(remote) {
   const { code, stdout } = await runRclone([
     'lsf', '-R', '--files-only', '--include', '/*/*/local_*.json', `${remote}/claude-code-sessions`, '--log-level', 'ERROR',
   ]);
+  // rclone exit 3 = "directory not found": nothing was ever pushed here, so there are 0 records and 0 duplicates.
+  if (code === 3) return { ok: true, ids: {}, duplicates: {}, count: 0, neverPushed: true };
   if (code !== 0) return { ok: false, ids: {}, duplicates: {}, count: 0 };
   const ids = {};
   for (const line of String(stdout).split(/\r?\n/)) {
