@@ -9,71 +9,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { spawnSync } from 'node:child_process';
-import { emptyState, saveState, readJson } from '../lib/accounts/state.mjs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { readJson } from '../lib/accounts/state.mjs';
 import { pairKey } from '../lib/accounts/folders.mjs';
-import { addFolder, putRecord, recordName, uuid, nlinkOf, makeClock } from './fixtures/store.mjs';
+import { recordName, nlinkOf } from './fixtures/store.mjs';
+import { cworld, cleanupWorlds, waitFor, CLI, A, B } from './fixtures/cliworld.mjs';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-const CLI = join(HERE, '..', 'lib', 'cli.mjs');
-const A = uuid('a', 1); const B = uuid('b', 1);
-const OA = uuid('1', 1); const OB = uuid('2', 2);
-
-const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-function waitFor(pred, { timeoutMs = 15000, intervalMs = 100 } = {}) {
-  const end = Date.now() + timeoutMs;
-  while (Date.now() < end) { if (pred()) return true; sleepMs(intervalMs); }
-  return pred();
-}
-
-const worlds = [];
-/** A sandbox home with two accounts (or one) in the desktop store and an app-state file. */
-function cworld({ config = {}, accounts = 2, records = 2 } = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'ss-acli-home-'));
-  const remote = mkdtempSync(join(tmpdir(), 'ss-acli-remote-'));
-  const stateDir = join(home, '.claude', 'session-sync');
-  mkdirSync(join(home, '.claude'), { recursive: true });
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(join(stateDir, 'sender-registered.txt'), new Date().toISOString());
-  writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ notifications: false, ...config }, null, 2));
-  const userData = join(home, 'AppData', 'Roaming', 'Claude');
-  const store = join(userData, 'claude-code-sessions');
-  mkdirSync(store, { recursive: true });
-  const clock = makeClock();
-  const fA = addFolder(store, A, OA);
-  const folders = [fA];
-  if (accounts > 1) folders.push(addFolder(store, B, OB));
-  for (let i = 1; i <= records; i++) putRecord(fA.path, i, { title: `A ${i}` }, clock.tick());
-  if (accounts > 1) for (let i = records + 1; i <= records * 2; i++) putRecord(folders[1].path, i, { title: `B ${i}` }, clock.tick());
-  const appFile = join(home, 'app.json');
-  const w = {
-    home, remote, stateDir, userData, store, fA, fB: folders[1], appFile, acc: join(stateDir, 'accounts'),
-    setApp(o) { writeFileSync(appFile, JSON.stringify(o)); },
-    state: () => readJson(join(stateDir, 'accounts', 'state.json'), null),
-    putState(mut) { const s = emptyState(store); mut(s); saveState({ acc: join(stateDir, 'accounts') }, s); },
-    run(args, env = {}) {
-      return spawnSync(process.execPath, [CLI, ...args], {
-        env: {
-          ...process.env, USERPROFILE: home, HOME: home, APPDATA: join(home, 'AppData', 'Roaming'), XDG_CONFIG_HOME: join(home, '.config'),
-          CLAUDE_SESSION_SYNC_REMOTE: remote, SESSION_SYNC_TEST_APP_STATE: appFile, SESSION_SYNC_TEST_POLL_MS: '100', ...env,
-        },
-        encoding: 'utf8', timeout: 30000, windowsHide: true,
-      });
-    },
-    cleanup() {
-      waitFor(() => !existsSync(join(stateDir, 'accounts', 'waiter.claim')), { timeoutMs: 5000 });
-      for (const d of [home, remote]) { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ } }
-    },
-  };
-  w.setApp({ running: false });
-  worlds.push(w);
-  return w;
-}
-test.after(() => { for (const w of worlds) w.cleanup(); });
+test.after(() => cleanupWorlds());
 
 const askedPair = pairKey(A, B);
 const daysAgo = (n) => new Date(Date.now() - n * 24 * 3600 * 1000).toISOString();
