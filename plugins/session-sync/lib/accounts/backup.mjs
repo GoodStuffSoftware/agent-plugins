@@ -15,6 +15,7 @@ import { createHash } from 'node:crypto';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { accPath, writeJsonAtomic, readJson, tickMutation } from './state.mjs';
+import { OURTMP } from './folders.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const ROLLBACK_SRC = join(HERE, 'rollback-standalone.mjs');
@@ -166,6 +167,7 @@ export function takeBackup(ctx, o = {}) {
     const root = join(ctx.userData, 'local-agent-mode-sessions', F.acct, F.org, 'agent', 'memory');
     if (!existsSync(root)) continue;
     for (const f of walkTree(root).files) {
+      if (OURTMP.test(f.rel.split('/').pop())) continue;   // a crashed write of ours is not a memory file (N4)
       const rel = `${F.key}/${f.rel}`;
       const m = copyWithMeta(f.abs, join(dir, 'files', 'cowork-memory', ...rel.split('/')));
       pending.push({ area: 'cowork-memory', rel, dest: f.abs, ...m });

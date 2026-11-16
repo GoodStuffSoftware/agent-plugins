@@ -4,13 +4,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { linkSync, writeFileSync } from 'node:fs';
+import { linkSync, writeFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { accountsPushFilter } from '../lib/sync.mjs';
 import { scanTree } from '../lib/manifest.mjs';
 import { emptyState } from '../lib/accounts/state.mjs';
 import { pairKey, answerPairs } from '../lib/accounts/folders.mjs';
-import { makeRoot, addFolder, putRecord, recordName, recordId, uuid } from './fixtures/store.mjs';
+import { makeRoot, addFolder, putRecord, putTombstone, recordName, recordId, uuid } from './fixtures/store.mjs';
 
 const A = uuid('a', 1); const B = uuid('b', 1); const C = uuid('c', 1);
 const OA = uuid('1', 1); const OB = uuid('2', 2); const OC = uuid('3', 3);
@@ -64,6 +64,21 @@ test('push filter: without a stored home the remote list decides, then the first
   assert.equal(noRemote(`${A}/${OA}/${recordName(1)}`), true, 'smallest folder key');
   const vanished = accountsPushFilter({ ctx: w.r.ctx, state: { ...w.state, records: { [recordId(2)]: { home: w.fA.key } } } });
   assert.equal(vanished(`${B}/${OB}/${recordName(2)}`), true, 'home name is gone: upload from the folder that has it, never nowhere');
+});
+
+test('S2: a record the app deleted in its home folder is not uploaded from the mirror (uuid and cliSessionId tombstones)', () => {
+  for (const key of [uuid('c', 1), uuid('d', 1)]) {          // bare uuid, then the record's cliSessionId
+    const w = world();
+    unlinkSync(join(w.fA.path, recordName(1)));              // the app removed the home name ...
+    putTombstone(w.fA.path, key, 2000);                      // ... and wrote the tombstone; the full pass has not run yet
+    const f = accountsPushFilter({ ctx: w.r.ctx, state: w.state });
+    assert.equal(f(`${B}/${OB}/${recordName(1)}`), false, `tombstone ${key}: the mirror must not upload`);
+    assert.equal(f(`${B}/${OB}/${recordName(2)}`), true, 'an unrelated record still uploads');
+  }
+  // no tombstone: the existing fallback (upload from the holder) is unchanged
+  const w = world();
+  unlinkSync(join(w.fA.path, recordName(1)));
+  assert.equal(accountsPushFilter({ ctx: w.r.ctx, state: w.state })(`${B}/${OB}/${recordName(1)}`), true);
 });
 
 test('push filter: scanTree skips filtered names so they never reach the manifest or the file list', () => {

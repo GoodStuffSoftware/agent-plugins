@@ -153,7 +153,7 @@ export function collectStatus(ctx, o = {}) {
     linked: !!state.linked,
     group: group.map((f) => `${id8(f.acct)}/${id8(f.org)}`),
     health,
-    app: { running: app.running, stopped: app.fullAllowed, signedIn: id8(app.signedIn), s1: app.s1, s2: app.s2 },
+    app: { running: app.running, stopped: app.fullAllowed, staleLock: !!app.stale, signedIn: id8(app.signedIn), s1: app.s1, s2: app.s2 },
     owed: owed.owed, owedParts: owed.parts, fullPassOwed: !!state.fullPassOwed,
     waiter: waiterStatus(ctx),
     lastFullPass: state.lastFullPass ?? null, lastRectify: state.lastRectify ?? null,
@@ -177,6 +177,7 @@ export function formatStatus(st, { all = false } = {}) {
   out.push(`Linked: ${st.linked ? `yes, ${plural(st.group.length, 'folder')}` : 'no'}${st.lastFullPass ? `; last full pass ${st.lastFullPass}` : ''}.`);
   if (st.health) out.push(`Conversations: ${st.health.ids}; ${st.health.split} split; ${st.health.missing} missing a name.`);
   out.push(`App: ${st.app.running ? 'running' : st.app.stopped ? 'stopped' : 'unknown'}${st.app.signedIn ? `, signed in ${st.app.signedIn}` : ''}. Owed: ${st.owed ? 'yes' : 'no'}.`);
+  if (st.app.staleLock) out.push('A Claude lock marker is left behind with no Claude process running (a crash or power loss). Start Claude once and quit it from the tray icon; the marker is then removed and the link can run.');
   out.push(`Waiter: ${st.waiter.alive ? `armed (pid ${st.waiter.pid}; ${st.waiter.reasons.join(', ') || 'no reason'})` : 'none'}.`);
   if (st.rollbackActive) out.push('A rollback is running or was interrupted: no pass runs until it finishes (run: accounts rollback again).');
   if (st.lastPass) out.push(`Last pass: ${st.lastPass.op} ${st.lastPass.ok ? 'ok' : `failed (${st.lastPass.reason ?? st.lastPass.error ?? 'unknown'})`} at ${st.lastPass.at}.`);

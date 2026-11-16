@@ -143,7 +143,10 @@ export function readSignedIn(userData) {
 /**
  * Pure decision rule for "running" (plan 5.2). `rec` is lock-stale.json
  * ({firstSeenAt, count}) or null; returns the new record to persist.
- * stale: S1 true and S2 false on >= 3 checks spanning >= 3 minutes.
+ * stale: S1 true and S2 false on >= 3 checks spanning >= 3 minutes. It is INFORMATIONAL only (N1): a lock marker
+ * with no process (crash, power loss) still counts as running and still blocks a full pass, because the S1 guard
+ * aborts at the first mutation while the marker exists and a path-regex miss on S2 must never make a running app look
+ * stopped. `status` tells the user to start Claude once and quit it from the tray icon, which clears the marker.
  */
 export function evaluateRunning(s1, s2, rec, now) {
   let next = rec ? { ...rec } : null;
@@ -152,8 +155,8 @@ export function evaluateRunning(s1, s2, rec, now) {
     next = next ? { firstSeenAt: next.firstSeenAt, count: next.count + 1 } : { firstSeenAt: now, count: 1 };
   }
   const stale = !!(s1 && s2 === false && next && next.count >= STALE_MIN_CHECKS && now - next.firstSeenAt >= STALE_MIN_SPAN_MS);
-  const running = s2 === true || (!!s1 && !stale);
-  const fullAllowed = (!s1 || stale) && s2 === false;
+  const running = s2 === true || !!s1;
+  const fullAllowed = !s1 && s2 === false;
   return { running, stale, fullAllowed, rec: next };
 }
 

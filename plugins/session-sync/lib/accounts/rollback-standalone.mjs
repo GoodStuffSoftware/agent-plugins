@@ -32,7 +32,7 @@
 
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, statSync, lstatSync, linkSync, renameSync,
-  unlinkSync, utimesSync, copyFileSync, openSync, writeSync, fsyncSync, closeSync,
+  unlinkSync, utimesSync, copyFileSync, openSync, writeSync, fsyncSync, closeSync, fchmodSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { dirname, join, resolve, relative, sep } from 'node:path';
@@ -260,8 +260,13 @@ const delAt = (obj, path) => { const p = getAt(obj, path.slice(0, -1)); if (isPl
 function writeTextAtomic(file, text, tmpName) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = join(dirname(file), tmpName());
-  const fd = openSync(tmp, 'w');
-  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  let mode = null;
+  try { mode = statSync(file).mode & 0o777; } catch { /* new file */ }
+  const fd = openSync(tmp, 'w', mode ?? 0o666);
+  try {
+    if (mode !== null && process.platform !== 'win32') { try { fchmodSync(fd, mode); } catch { /* best effort */ } }   // keep a 0600 file 0600
+    writeSync(fd, text); fsyncSync(fd);
+  } finally { closeSync(fd); }
   try { renameRetry(tmp, file); } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
 }
 

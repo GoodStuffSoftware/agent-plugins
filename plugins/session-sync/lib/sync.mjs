@@ -21,7 +21,7 @@ import { classifyReplacement, lostCount } from './transcript.mjs';
 import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote, isLocalRemote } from './rclone.mjs';
 import { notify } from './notify.mjs';
 import { makeCtx, loadState, accPath, readJson, journalRead, ACC } from './accounts/state.mjs';
-import { listFolders, groupOf, homeOf, RECORD, UUID, OURTMP } from './accounts/folders.mjs';
+import { listFolders, groupOf, homeOf, RECORD, TOMB, UUID, OURTMP } from './accounts/folders.mjs';
 
 const MARKER = '.last-push';
 const MANIFEST_FILE = join(homedir(), '.claude', 'session-sync', 'manifest.json');
@@ -93,6 +93,23 @@ function writeFileList(files) {
   return f;
 }
 
+/** Does `folder` hold a `deleted_<key>` tombstone for the uuid, the stored keys or the record's cliSessionId? */
+function homeTombstoned(folder, uuid, storedKeys, recordPath) {
+  if (!folder) return false;
+  const keys = new Set([String(uuid).toLowerCase(), ...(storedKeys ?? []).map((k) => String(k).toLowerCase())]);
+  try {
+    const cli = JSON.parse(readFileSync(recordPath, 'utf8'))?.cliSessionId;
+    if (typeof cli === 'string') keys.add(cli.toLowerCase());
+  } catch { /* unreadable record: the uuid and stored keys still count */ }
+  try {
+    for (const n of readdirSync(folder.path)) {
+      const t = TOMB.exec(n);
+      if (t && keys.has(t[1].toLowerCase())) return true;
+    }
+  } catch { /* unreadable home folder: no tombstone known */ }
+  return false;
+}
+
 /**
  * The home-only push filter for the Code-tab store when accounts are linked
  * (plan 5.11): a record `<acct>/<org>/local_<id>.json` is uploaded only from its
@@ -144,7 +161,13 @@ export function accountsPushFilter({ ctx = makeCtx(), state = null, remoteList =
         if (!present) build();
         const here = (present.get(id) ?? []).sort();
         let home = homeOf(id, here, st, rl, [...groupKeys]);
-        if (here.length && !here.includes(home)) home = here[0];   // home name gone: upload from the first holder, never nowhere
+        if (here.length && !here.includes(home)) {
+          // Home name gone: upload from the first holder, never nowhere, UNLESS the home folder holds a tombstone for
+          // one of the record's keys (uuid or cliSessionId): the app deleted it and the full pass has not yet removed
+          // the mirrors, so uploading one would resurrect a deleted conversation on the remote (S2).
+          const holder = group.find((f) => f.key === here[0]);
+          home = homeTombstoned(group.find((f) => f.key === home), m[1], st.records?.[id]?.keys, holder && join(holder.path, parts[2])) ? null : here[0];
+        }
         homes.set(id, home);
       }
       return homes.get(id) === key;

@@ -7,7 +7,7 @@
 
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, statSync, existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import {
@@ -329,6 +329,20 @@ test('T14 nothing is written while the app runs (live pass), and an app that sta
   assert.throws(() => w.merge({ guard: () => { throw new AppRunningError('started'); } }), AppRunningError);
   for (const n of Object.keys(hashes)) assert.equal(sha(w.file(n)), hashes[n], `${n} untouched after the abort`);
   assert.deepEqual(readdirSync(w.r.userData).filter((n) => n.startsWith('.session-sync-link-')), [], 'no temp name left behind');
+});
+
+test('N3 a full pass sweeps a stale temp copy of ours from USERDATA and leaves a recent one', () => {
+  const w = world();
+  const stale = join(w.r.userData, '.session-sync-link-aaaaaaaaaaaa');
+  const fresh = join(w.r.userData, '.session-sync-link-bbbbbbbbbbbb');
+  writeFileSync(stale, 'x'); writeFileSync(fresh, 'x');
+  utimesSync(stale, (w.r.ctx.now() - 2 * 3600e3) / 1000, (w.r.ctx.now() - 2 * 3600e3) / 1000);
+  utimesSync(fresh, (w.r.ctx.now() - 1000) / 1000, (w.r.ctx.now() - 1000) / 1000);
+  w.merge({ mode: 'live' });
+  assert.equal(existsSync(stale), true, 'a live pass writes nothing');
+  w.merge();
+  assert.equal(existsSync(stale), false);
+  assert.equal(existsSync(fresh), true);
 });
 
 test('T14 an injected failure mid-merge leaves every file whole', () => {

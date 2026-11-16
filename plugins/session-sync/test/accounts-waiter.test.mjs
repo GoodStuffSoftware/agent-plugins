@@ -7,7 +7,7 @@
 
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { runWaiter, ensureWaiter, waiterStatus, claimWaiter } from '../lib/accounts/waiter.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations } from '../lib/accounts/state.mjs';
@@ -179,6 +179,31 @@ test('T21 waiter: an unlink reason unlinks, and the toast says so', async () => 
   assert.equal(out.exit, 'done');
   assert.equal(loadState(w.ctx).linked, false);
   assert.match(toasts[0], /unlinked/);
+});
+
+test('S4 waiter: a claim whose pid was reused by an unrelated live process is taken over; a backed claim is kept', async () => {
+  const w = world();
+  const now = w.ctx.now();
+  const reused = process.ppid;                                  // alive, but not a waiter
+  const claim = (at) => writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: reused, at }));
+  const beatFile = (pid, hbMs) => writeFileSync(join(w.acc, 'waiter.json'), JSON.stringify({ pid, armedAt: new Date(now).toISOString(), heartbeatAt: new Date(hbMs).toISOString(), reasons: ['link'] }));
+  claim(now - 2 * 3600 * 1000);                                 // old claim, no waiter.json
+  assert.equal(waiterStatus(w.ctx).alive, false, 'status already says not alive');
+  assert.equal(claimWaiter(w.ctx), true, 'no heartbeat for that pid: the claim is stale');
+  assert.equal(readJson(join(w.acc, 'waiter.claim'), null).pid, process.pid);
+  claim(now - 2 * 3600 * 1000); beatFile(reused + 1, now);      // waiter.json belongs to another pid
+  assert.equal(claimWaiter(w.ctx), true);
+  claim(now - 2 * 3600 * 1000); beatFile(reused, now - 10 * 60 * 1000);   // heartbeat 10 min old
+  assert.equal(claimWaiter(w.ctx), true);
+  claim(now - 2 * 3600 * 1000); beatFile(reused, now - 1000);   // a real, beating waiter
+  assert.equal(claimWaiter(w.ctx), false, 'old claim backed by a fresh heartbeat of the same pid is kept');
+  claim(now - 5000); try { unlinkSync(join(w.acc, 'waiter.json')); } catch { /* none */ }
+  assert.equal(claimWaiter(w.ctx), false, 'a fresh claim (start-up window) is kept');
+  // and a spawned waiter runs instead of exiting already-running
+  claim(now - 2 * 3600 * 1000);
+  const s = stepper();
+  const out = await runWaiter(w.ctx, { ...common, reason: 'link', clock: s.clock, sleep: s.sleep, notify: () => {} });
+  assert.equal(out.exit, 'done');
 });
 
 test('T21 waiter: a stale claim from a dead pid is taken over', async () => {

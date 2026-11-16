@@ -151,9 +151,12 @@ export async function livePass(ctx, o = {}) {
       const rec = rectify(group, { mode: 'live', live, ctx, state, locked: true, remoteList: o.remoteList });
       rep.rectify = rec;
       if (rec.skipped) return { ...rep, skipped: rec.skipped };
-      const common = { mode: 'live', ctx, state, live };
-      rep.tasks = mergeTasks(group, common);
-      rep.backlog = mergeBacklog(group, common);
+      // The scheduler holds ONE task file (the signed-in account's) and drops it on a switch, so for
+      // scheduled-tasks.json only the signed-in account's folders are live. The sticky set (parked sessions that keep
+      // writing records) must not keep a switched-away account's task file stale (S5: a catch-up would fire twice).
+      const taskLive = app.signedIn ? new Set(group.filter((f) => f.acct === app.signedIn).map((f) => f.key)) : live;
+      rep.tasks = mergeTasks(group, { mode: 'live', ctx, state, live: taskLive });
+      rep.backlog = mergeBacklog(group, { mode: 'live', ctx, state, live });
       rep.settings = mergeSettings(group, { mode: 'live', ctx, state, signedIn: app.signedIn });
       rep.memory = mergeCoworkMemory(group, { mode: 'live', ctx, state });
       const owed = rec.owed.length > 0 || rep.tasks.owed.length > 0 || rep.backlog.owed.length > 0

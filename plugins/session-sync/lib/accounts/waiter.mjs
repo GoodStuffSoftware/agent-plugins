@@ -41,7 +41,7 @@ export function waiterStatus(ctx) {
   const hb = Date.parse(w?.heartbeatAt ?? '') || 0;
   const alive = !!w && pidAlive(w.pid) && now - hb < HEARTBEAT_STALE_MS;
   // a freshly spawned waiter holds the claim before it has written waiter.json
-  const starting = !alive && !!claim && pidAlive(claim.pid) && now - (claim.at || 0) < 60 * 1000;
+  const starting = !alive && !!claim && pidAlive(claim.pid) && now - (claim.at || 0) < CLAIM_STARTING_MS;
   return { alive: alive || starting, pid: (alive ? w?.pid : claim?.pid) ?? null, armedAt: w?.armedAt ?? null, heartbeatAt: w?.heartbeatAt ?? null, reasons: w?.reasons ?? [] };
 }
 
@@ -64,6 +64,22 @@ export function ensureWaiter(ctx, reason, spawnWaiter) {
   }
 }
 
+const CLAIM_STARTING_MS = 60 * 1000;
+
+/**
+ * Is this claim held by a waiter that is really running? A live pid is not enough: after a reboot or a kill the pid
+ * can belong to an unrelated process (S4). Past the 60 s start-up window the claim must be backed by waiter.json for
+ * the same pid with a fresh heartbeat, the rule waiterStatus uses.
+ */
+function claimHeld(ctx, cur) {
+  const now = ctx.now();
+  if (!pidAlive(cur.pid) || now - (cur.at || 0) >= MAX_LIFETIME_MS) return false;
+  if (now - (cur.at || 0) < CLAIM_STARTING_MS) return true;
+  const w = readJson(waiterFile(ctx), null);
+  const hb = Date.parse(w?.heartbeatAt ?? '') || 0;
+  return !!w && w.pid === cur.pid && now - hb < HEARTBEAT_STALE_MS;
+}
+
 /** Take the single-instance claim. False when a live waiter holds it. */
 export function claimWaiter(ctx) {
   const file = claimFile(ctx);
@@ -76,7 +92,7 @@ export function claimWaiter(ctx) {
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
       const cur = readJson(file, null);
-      if (cur && pidAlive(cur.pid) && ctx.now() - (cur.at || 0) < MAX_LIFETIME_MS) return false;
+      if (cur && claimHeld(ctx, cur)) return false;
       const again = readJson(file, null);            // only remove the stale claim we actually read
       if (JSON.stringify(again) === JSON.stringify(cur)) { try { unlinkSync(file); } catch { /* raced */ } }
     }

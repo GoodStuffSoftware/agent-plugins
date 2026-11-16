@@ -10,7 +10,7 @@
 
 import {
   readFileSync, mkdirSync, existsSync, openSync, writeSync, fsyncSync, closeSync,
-  renameSync, copyFileSync, unlinkSync, utimesSync,
+  renameSync, copyFileSync, unlinkSync, utimesSync, statSync, fchmodSync, readdirSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -112,12 +112,37 @@ export function serializeJson(obj, fmt = {}) {
 export function writeTextAtomic(file, text, { guard, mtimeMs } = {}) {
   mkdirSync(dirname(file), { recursive: true });
   const tmp = join(dirname(file), `.session-sync-link-${randomBytes(6).toString('hex')}`);
-  const fd = openSync(tmp, 'wx');
-  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  let mode = null;
+  try { mode = statSync(file).mode & 0o777; } catch { /* new file: default mode */ }
+  const fd = openSync(tmp, 'wx', mode ?? 0o666);
+  try {
+    // keep the old file's permissions (a 0600 config must not become 0644); umask applies to openSync, fchmod does not (N3)
+    if (mode !== null && process.platform !== 'win32') { try { fchmodSync(fd, mode); } catch { /* best effort */ } }
+    writeSync(fd, text); fsyncSync(fd);
+  } finally { closeSync(fd); }
   try {
     if (mtimeMs !== undefined) utimesSync(tmp, mtimeMs / 1000, mtimeMs / 1000);
     guard?.(); renameRetry(tmp, file);
   } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
+}
+
+const OUR_TMP = /^\.session-sync-link-[0-9a-f]{12}$/;
+
+/**
+ * Remove our own leftover temp names (a crash between the write and the rename) older than an hour from `dir`;
+ * `recursive` also walks sub-folders (the Cowork memory roots). Returns how many were removed (N3).
+ */
+export function sweepOurTmp(dir, now, { recursive = false, maxAgeMs = 60 * 60 * 1000 } = {}) {
+  let ents;
+  try { ents = readdirSync(dir, { withFileTypes: true }); } catch { return 0; }
+  let n = 0;
+  for (const e of ents) {
+    const p = join(dir, e.name);
+    if (e.isFile() && OUR_TMP.test(e.name)) {
+      try { if (now - statSync(p).mtimeMs > maxAgeMs) { unlinkSync(p); n++; } } catch { /* gone */ }
+    } else if (recursive && e.isDirectory()) n += sweepOurTmp(p, now, { recursive, maxAgeMs });
+  }
+  return n;
 }
 
 export function loadState(ctx) {

@@ -16,8 +16,18 @@
  *      simulated app saves from both accounts (a split) then rectify, a delete then rectify, push
  *      and the remote duplicate check, unlink, a re-link with an injected mid-link failure, and
  *      rollback checked byte for byte against the tree as it was just before that re-link.
- *   4. Prints a PASS/FAIL table, asserts the SOURCE tree is unchanged, and exits 0 only when
- *      every check passed. The scratch folder is kept for inspection; delete it by hand.
+ *   4. Prints a PASS/FAIL/WARN/INFO table (INFO rows give the record count of every account folder
+ *      before and after the link), asserts the SOURCE tree was not changed BY THIS SCRIPT, and exits 0
+ *      only when every check passed. The scratch folder is kept for inspection; delete it by hand.
+ *
+ * Options
+ *   --expect <sessionId>   (repeatable; `local_<uuid>` or the bare uuid) after the link, check that this
+ *                          record exists in every account folder: one PASS/FAIL row per id.
+ *
+ * The source is snapshotted before the copy. The desktop app may be running and rewriting records (tmp +
+ * rename) while the script runs: a source file whose mtime moved forward is a WARN naming it, never a
+ * failure. Only a change this script could have made fails: a new, deleted or linked name, or a changed
+ * file whose mtime did not move forward.
  *
  * Safety
  *   - Refuses when --scratch is inside (or equal to) %APPDATA%\Claude, the desktop app's data
@@ -44,6 +54,8 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CLI = join(HERE, '..', 'lib', 'cli.mjs');
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const RECORD = /^local_([0-9a-f-]{36})\.json$/i;
+/** The app's own save temp name; it comes and goes while the app runs. */
+const APP_TMP = /\.json\.tmp$/;
 /** Names the rollback leaves alone (invariant I3): skipped when comparing trees after a rollback. */
 const ROLLBACK_UNTOUCHED = /(^|\/)(waiting-input\/|owed-bridge-delete_|archived-sessions\.idx$|imported-staging)|\.tmp$|\.bak-|\.partial$/;
 
@@ -51,10 +63,16 @@ const ROLLBACK_UNTOUCHED = /(^|\/)(waiting-input\/|owed-bridge-delete_|archived-
 
 const argv = process.argv.slice(2);
 const opt = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
+const optAll = (n) => argv.flatMap((a, i) => (a === n && argv[i + 1] !== undefined ? [argv[i + 1]] : []));
 if (argv.includes('--help') || argv.includes('-h') || !opt('--source') || !opt('--scratch')) {
-  console.log('Usage: node scripts/verify-accounts-scratch.mjs --source <claude-code-sessions dir or its parent> --scratch <new dir>');
+  console.log('Usage: node scripts/verify-accounts-scratch.mjs --source <claude-code-sessions dir or its parent> --scratch <new dir> [--expect <sessionId>]...');
+  console.log('  --expect <sessionId>  (repeatable) after the link, check that this record exists in every account folder; PASS/FAIL per id');
   process.exit(argv.includes('--help') || argv.includes('-h') ? 0 : 2);
 }
+/** `--expect` ids: `local_<uuid>` or the bare uuid, normalised to the bare lowercase uuid. */
+const EXPECT = optAll('--expect').map((s) => s.trim().replace(/^local_/i, '').toLowerCase());
+const badExpect = EXPECT.filter((s) => !UUID.test(s));
+if (badExpect.length) { console.error(`Refusing: --expect takes a session id (local_<uuid> or the uuid); not valid: ${badExpect.join(', ')}`); process.exit(2); }
 
 const norm = (p) => (platform() === 'win32' ? resolve(p).toLowerCase() : resolve(p));
 const isInside = (child, parent) => {
@@ -94,6 +112,8 @@ if (isInside(SCRATCH, SOURCE) || isInside(SOURCE, SCRATCH)) { console.error('Ref
 
 const results = [];
 const check = (name, ok, detail = '') => { results.push({ name, ok: !!ok, detail: String(detail) }); };
+/** A line in the table that is neither a pass nor a failure: a WARN (needs a look) or an INFO (facts). */
+const note = (level, name, detail = '') => { results.push({ name, ok: true, level, detail: String(detail) }); };
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
 const inoOf = (p) => { const s = statSync(p, { bigint: true }); return `${s.dev}:${s.ino}`; };
 
@@ -113,11 +133,34 @@ function walk(root) {
 }
 const rel = (root, p) => relative(root, p).split(sep).join('/');
 
-/** names, sizes and mtimes of a tree (the "source unchanged" proof). */
+/** names, sizes, mtimes and link counts of a tree (the "source unchanged" proof). */
 function treeShape(root) {
   const m = new Map();
-  for (const p of walk(root)) { const s = lstatSync(p); m.set(rel(root, p), `${s.size}:${Math.round(s.mtimeMs)}`); }
+  for (const p of walk(root)) { const s = lstatSync(p); m.set(rel(root, p), { size: s.size, mtimeMs: s.mtimeMs, nlink: s.nlink }); }
   return m;
+}
+/**
+ * Compare the source before and after. The desktop app may be running and rewrite records (tmp + rename) while the
+ * script runs, so a file whose mtime moved FORWARD is only a warning. A failure is a change the script itself could
+ * have made: a deleted, new or linked name, or a changed file whose mtime did not move forward.
+ */
+function compareSource(before, after) {
+  const fails = []; const warns = [];
+  for (const [k, b] of before) {
+    const a = after.get(k);
+    if (!a && APP_TMP.test(k)) { warns.push(`app save in flight finished (temp name gone): ${k}`); continue; }
+    if (!a) { fails.push(`deleted: ${k}`); continue; }
+    if (a.nlink > b.nlink) { fails.push(`linked: ${k}`); continue; }
+    if (a.size === b.size && a.mtimeMs === b.mtimeMs) continue;
+    if (a.mtimeMs > b.mtimeMs) warns.push(`rewritten by the app (mtime moved forward): ${k}`);
+    else fails.push(`changed with ${a.mtimeMs < b.mtimeMs ? 'an older' : 'the same'} mtime: ${k}`);
+  }
+  for (const k of after.keys()) if (!before.has(k)) (APP_TMP.test(k) ? warns : fails).push(`${APP_TMP.test(k) ? 'app save in flight (temp name)' : 'new name'}: ${k}`);
+  return { fails, warns };
+}
+/** Record count per `<acct>/<org>` folder, as text. */
+function folderCounts(store) {
+  return listFolders(store).map((f) => `${f.acct.slice(0, 8)}/${f.org.slice(0, 8)}=${readdirSync(f.path).filter((x) => RECORD.test(x)).length}`).join('  ');
 }
 /** names and sha256 of a tree (the byte-for-byte proof). */
 function treeHashes(root, skip = null) {
@@ -280,13 +323,22 @@ try {
 
   // 3. the app stopped: link
   setApp(false);
+  note('INFO', 'records per account folder before the link', folderCounts(STORE));
   const lk = cli(['accounts', 'link', '--now', '--json']);
+  note('INFO', 'records per account folder after the link', folderCounts(STORE));
   linked = lk.code === 0 && !!state()?.linked;
   check('link --now succeeds', linked, `exit ${lk.code}${lk.json?.reason ? ` ${lk.json.reason}` : ''}${lk.err ? ` ${lk.err.trim().split('\n')[0]}` : ''}`);
   if (!linked) throw new Error('the link failed; the rest of the flow is skipped');
   const inv1 = inventory(STORE);
   check('every conversation is in every folder', [...inv1.values()].every((m) => m.size === nFolders) && inv1.size === ids0.size, `${inv1.size} of ${ids0.size}, ${nFolders} folders`);
   check('one inode per conversation', unlinkedIds(inv1, nFolders).length === 0, `${unlinkedIds(inv1, nFolders).length} not linked`);
+  // --expect: each named record must exist in every account folder after the link
+  for (const id of EXPECT) {
+    const missing = folders0.filter((f) => !existsSync(join(f.path, `local_${id}.json`))).map((f) => `${f.acct.slice(0, 8)}/${f.org.slice(0, 8)}`);
+    const inSource = ids0.has(id);
+    check(`expected record local_${id} is in every account folder`, missing.length === 0,
+      missing.length ? `missing from ${missing.length} of ${nFolders}: ${missing.join(', ')}${inSource ? '' : ' (it was not in the source either)'}` : `${nFolders} of ${nFolders} folders`);
+  }
   const bk = state()?.backupId;
   check('a verified backup and the standalone rollback exist', !!bk && existsSync(join(ACC, 'backup', bk, 'manifest.json')) && existsSync(join(ACC, 'backup', bk, 'rollback.mjs')), bk ?? 'no backup id');
   const hl = cli(['accounts', 'status', '--json']);
@@ -391,13 +443,17 @@ try {
 /* ------------------------------------------------------------------ source untouched, report */
 
 const sourceAfter = treeShape(SOURCE);
-const sd = diffMaps(sourceBefore, sourceAfter);
-check('the source tree is unchanged (names, sizes, mtimes)', sd.length === 0, sd.length ? `${sd.length} differences, first: ${sd.slice(0, 3).join('; ')}` : `${sourceBefore.size} files`);
+const sd = compareSource(sourceBefore, sourceAfter);
+for (const x of sd.warns) note('WARN', 'the source tree changed while the script ran (the app is probably running)', x);
+check('the source tree is unchanged by this script (no new, deleted or linked name, no older mtime)', sd.fails.length === 0,
+  sd.fails.length ? `${sd.fails.length} differences, first: ${sd.fails.slice(0, 3).join('; ')}` : `${sourceBefore.size} files${sd.warns.length ? `, ${sd.warns.length} rewritten by the app (WARN)` : ''}`);
 
 const w = Math.max(...results.map((r) => r.name.length));
 console.log('');
-for (const r of results) console.log(`${r.ok ? 'PASS' : 'FAIL'}  ${r.name.padEnd(w)}${r.detail ? `  ${r.detail}` : ''}`);
+for (const r of results) console.log(`${(r.level ?? (r.ok ? 'PASS' : 'FAIL')).padEnd(4)}  ${r.name.padEnd(w)}${r.detail ? `  ${r.detail}` : ''}`);
 const failed = results.filter((r) => !r.ok).length;
-console.log(`\n${results.length - failed} passed, ${failed} failed. Accounts ${accounts.length}, folders ${nFolders}, conversations ${ids0.size}; signed in ${SIGNED_IN.slice(0, 8)}.`);
+const warned = results.filter((r) => r.level === 'WARN').length;
+const passed = results.filter((r) => r.ok && !r.level).length;
+console.log(`\n${passed} passed, ${failed} failed${warned ? `, ${warned} warning(s)` : ''}. Accounts ${accounts.length}, folders ${nFolders}, conversations ${ids0.size}; signed in ${SIGNED_IN.slice(0, 8)}.`);
 console.log(`Scratch kept at ${SCRATCH} (delete it by hand).`);
 process.exit(failed ? 1 : 0);

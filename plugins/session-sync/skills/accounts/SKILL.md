@@ -101,6 +101,8 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts rollback
 
 It restores the backup taken before the link, keeping task run times at their newest so nothing fires twice (add `--exact` to restore the task files byte for byte instead), puts any conversation created since the backup back in its home folder as a single file, and resets the pairs to "no". It always uses the backup taken before the first link (a safety copy taken when another account joins later is never the target). It holds `accounts.lock` while it runs: exit 3 can also mean a pass is running right now, so wait a minute and run it again. If it stops part way (exit 1), no pass or unlink runs until a rollback has finished: fix the cause and run it again. Exit 3 also means there is no backup to roll back to.
 
+Rollback also brings back what was deleted after the link: a conversation or scheduled task that existed when the backup was taken and was deleted since returns (the tombstones that came later are removed), and a restored task keeps the backup's last run time, so its catch-up can run once. Edits made after the link are reverted too; the newer copies stay in a `pre-rollback-<stamp>` folder in `~/.claude/session-sync/accounts/`.
+
 **If the plugin itself is broken**, the backup folder carries its own copy of the rollback that needs no plugin, only Node. The folder is `~/.claude/session-sync/accounts/backup/<stamp>/` (on Windows `%USERPROFILE%\.claude\session-sync\accounts\backup\<stamp>\`); `accounts status --json` shows the stamp as `backupId`.
 
 ```bash

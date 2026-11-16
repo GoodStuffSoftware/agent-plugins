@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, statSync, readdirSync, lstatSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { mergeCoworkMemory, memoryRoot } from '../lib/accounts/cowork-memory.mjs';
-import { emptyState, readJson } from '../lib/accounts/state.mjs';
+import { emptyState, readJson, writeTextAtomic, sweepOurTmp } from '../lib/accounts/state.mjs';
 import { AppRunningError } from '../lib/accounts/appstate.mjs';
 import { makeRoot, addFolder, setMtime, uuid, sha256 } from './fixtures/store.mjs';
 
@@ -59,6 +59,35 @@ test('T15 first link: files are copied to the side that lacks them, with mtime, 
   // nothing left behind, second pass is a no-op
   assert.deepEqual(readdirSync(dirname(w.path(w.B, 'top.md'))).filter((n) => n.startsWith('.session-sync-link-')), []);
   assert.equal(w.merge().pending, false);
+});
+
+test('N3/N4 a crashed write\'s temp name in a memory root is never merged or copied, and a stale one is swept', () => {
+  const w = world();
+  w.put(w.A, 'm.md', 'v1', T0);
+  const tmpName = '.session-sync-link-0123456789ab';
+  const now = w.r.ctx.now();
+  const staleTmp = w.put(w.A, `notes/${tmpName}`, 'half-written copy', now - 2 * 3600e3);   // older than an hour
+  const freshTmp = w.put(w.A, tmpName, 'in flight', now - 1000);
+  const rep = w.merge();
+  assert.equal(existsSync(staleTmp), false, 'a stale temp is swept');
+  assert.equal(existsSync(freshTmp), true, 'a recent temp is left');
+  assert.equal(existsSync(w.path(w.B, tmpName)), false, 'a temp is never copied to the other account');
+  assert.equal(existsSync(w.path(w.B, `notes/${tmpName}`)), false);
+  assert.deepEqual(Object.keys(readJson(join(w.r.acc, 'memory-base.json')).files), ['m.md']);
+  assert.equal(rep.copied.length, 1);
+});
+
+test('N3 writeTextAtomic keeps the old file\'s permissions (posix); sweepOurTmp stays inside the directory it is given', { skip: process.platform === 'win32' }, () => {
+  const w = world();
+  const f = join(w.r.root, 'claude_desktop_config.json');
+  writeFileSync(f, '{}', { mode: 0o600 });
+  writeTextAtomic(f, '{"a":1}');
+  assert.equal(statSync(f).mode & 0o777, 0o600);
+  assert.equal(readFileSync(f, 'utf8'), '{"a":1}');
+  const nested = join(w.r.root, 'sub'); mkdirSync(nested);
+  writeFileSync(join(nested, '.session-sync-link-0123456789ab'), 'x'); setMtime(join(nested, '.session-sync-link-0123456789ab'), T0);
+  assert.equal(sweepOurTmp(w.r.root, w.r.ctx.now()), 0, 'not recursive by default');
+  assert.equal(sweepOurTmp(w.r.root, w.r.ctx.now(), { recursive: true, maxAgeMs: 1000 }), 1);
 });
 
 test('T15 an edit on one side spreads; the displaced old version goes to backup', () => {

@@ -193,6 +193,26 @@ test('live pass with an unknown signed-in account treats every folder as live: n
   assert.equal(rep.owed, true);
 });
 
+test('S5 live pass: after an in-app switch A -> B, B\'s task run reaches A\'s file, so switching back does not re-fire the catch-up', async () => {
+  const w = world();
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const started = w.clock.tick();
+  w.sim.setApp({ running: true, signedIn: A, startedAtMs: started });
+  assert.equal((await livePass(w.ctx, {})).ok, true);                         // A becomes part of the sticky live set
+  w.sim.setApp({ running: true, signedIn: B, startedAtMs: started });         // in-app switch to B
+  const now = w.clock.tick();
+  const d = new Date(now); d.setUTCHours(5, 20, 0, 0);
+  const slot = d.getTime() > now ? d.getTime() - 86400000 : d.getTime();
+  w.sim.runTask(w.fB, 'tA', slot);                                            // the scheduler runs tA under B
+  const rep = await livePass(w.ctx, {});
+  assert.equal(rep.ok, true, JSON.stringify(rep));
+  assert.ok(rep.live.includes(w.fA.key), 'the sticky set still holds A for records');
+  assert.equal(rep.tasks.skipped.some((x) => x.folder === w.fA.key), false, 'A\'s task file is not live once B is signed in');
+  w.sim.setApp({ running: true, signedIn: A, startedAtMs: started });         // switch back: the scheduler re-reads A's file
+  const fired = w.sim.catchUp(join(w.fA.path, 'scheduled-tasks.json'), now) ?? [];
+  assert.equal(fired.includes('tA'), false, 'the slot B already ran must not fire again');   // tB never ran anywhere: it may fire
+});
+
 /* ---------------------------------------------------------------- unlink (T16) */
 
 test('T16 unlink: each record only in its home with the newest bytes; tasks and backlog only in their origin; run-times at max', async () => {

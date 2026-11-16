@@ -331,6 +331,28 @@ test('T9 the same tombstone DOES delete when this very record was seen in that f
   for (const f of s.group) assert.ok(!existsSync(join(f.path, recordName(1))));
 });
 
+test('N2 a copy next to its own cliSessionId-keyed tombstone in a folder where it was seen is deleted again; a stranger folder is not', () => {
+  const s = scenario();
+  const cli = uuid('9', 8);
+  putRecord(s.fA.path, 1, { cliSessionId: cli }, s.clock.tick());
+  s.full();                                                              // linked everywhere, home A
+  // the app deleted it in A (rm record, write tombstone keyed by cliSessionId); a live ADD put the record back in the gap
+  putTombstone(s.fA.path, cli, s.clock.tick(5000));
+  const rep = s.full();
+  assert.equal(rep.counts.delete, 1);
+  for (const f of s.group) assert.ok(!existsSync(join(f.path, recordName(1))), `${f.key} no longer holds it`);
+  // a tombstone with that key in a folder where this record was never seen does not delete it (T9 guard)
+  const t = scenario();
+  putRecord(t.fA.path, 2, { cliSessionId: uuid('9', 7) }, t.clock.tick());
+  t.full();
+  const stranger = addFolder(t.r.store, uuid('d', 1), ORG);
+  putTombstone(stranger.path, uuid('9', 7), t.clock.tick(5000));
+  putRecord(stranger.path, 3, {}, t.clock.tick());
+  const group = [...t.group, stranger];
+  rectify(group, { mode: 'full', ctx: t.ctx, state: t.state });
+  assert.ok(existsSync(join(t.fA.path, recordName(2))), 'record 2 stays in A');
+});
+
 /* ------------------------------------------------------------------ T10 */
 
 test('T10 sidecars are byte-identical before and after every pass', () => {

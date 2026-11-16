@@ -185,8 +185,12 @@ export function classify(inv, state, o) {
       else plan.tombstonedHere.push(F);
     }
     for (const F of P.keys()) {
-      const own = tombsOf(F).get(lower(uuid));   // a stale copy next to its own tombstone (for example pulled back)
-      if (own) plan.del.set(F, [own]);
+      // a stale copy next to its own tombstone (for example pulled back, or put back by a live ADD between the app's
+      // "rm record" and "write tombstone"). The uuid key always counts; a cliSessionId key only in a folder where the
+      // record was seen before (T9), as in the absent-folder rule above (N2).
+      const seen = F === home || rec?.folders?.includes(F);
+      const own = [...keys].filter((k) => k === lower(uuid) || seen).map((k) => tombsOf(F).get(k)).filter(Boolean);
+      if (own.length) plan.del.set(F, own);
     }
     if (plan.del.size) {
       const tMax = Math.max(...[...plan.del.values()].flat().map((t) => t.ms));

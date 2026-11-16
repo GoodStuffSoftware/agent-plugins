@@ -25,7 +25,7 @@ import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import {
-  accPath, readJson, writeJsonAtomic, detectFormat, serializeJson, writeTextAtomic, tickMutation,
+  accPath, readJson, writeJsonAtomic, detectFormat, serializeJson, writeTextAtomic, tickMutation, sweepOurTmp,
 } from './state.mjs';
 import { backupCopy } from './backup.mjs';
 import { merge3, deepEqual, isPlain } from './merge3.mjs';
@@ -356,6 +356,7 @@ export function mergeSettings(group, o) {
   const newSlots = structuredClone(oldSlots);
 
   const rank = (acct) => Date.parse(state?.lastSignedIn?.[acct] ?? '') || 0;
+  if (!dry && ctx.userData) rep.sweptTmp = sweepOurTmp(ctx.userData, ctx.now());   // a crashed write leaves a full copy here (N3)
 
   for (const name of FILES) {
     const file = join(ctx.userData, name);

@@ -45,8 +45,8 @@ test('T2 stale lockfile rule: S1 true and S2 false on >=3 checks spanning >=3 mi
   r = evaluateRunning(true, false, rec, 2.5 * MIN); rec = r.rec;   assert.equal(r.stale, false);   // 3 checks, span < 3 min
   r = evaluateRunning(true, false, rec, 3 * MIN); rec = r.rec;
   assert.equal(r.stale, true);
-  assert.equal(r.running, false, 'a stale lockfile is not "running"');
-  assert.equal(r.fullAllowed, true);
+  assert.equal(r.running, true, 'N1: a stale lockfile is reported, but still blocks a full pass (the S1 guard would abort at the first mutation)');
+  assert.equal(r.fullAllowed, false);
   // an unknown process state neither counts nor resets
   r = evaluateRunning(true, null, rec, 4 * MIN); assert.equal(r.rec.count, rec.count);
   // a process appearing resets the counter
@@ -66,7 +66,7 @@ test('T2 appState via the seam persists and clears lock-stale.json', () => {
   appState({ ctx: r.ctx, now: 2.5 * MIN });
   st = appState({ ctx: r.ctx, now: 3 * MIN });
   assert.equal(st.stale, true);
-  assert.equal(st.fullAllowed, true);
+  assert.equal(st.fullAllowed, false);
   sim.setApp({ running: true });
   st = appState({ ctx: r.ctx, now: 4 * MIN });
   assert.equal(st.running, true);

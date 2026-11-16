@@ -21,8 +21,9 @@
 import { readFileSync, statSync, mkdirSync, unlinkSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname } from 'node:path';
-import { accPath, readJson, writeJsonAtomic, writeTextAtomic, tickMutation } from './state.mjs';
+import { accPath, readJson, writeJsonAtomic, writeTextAtomic, tickMutation, sweepOurTmp } from './state.mjs';
 import { backupCopy, walkTree } from './backup.mjs';
+import { OURTMP } from './folders.mjs';
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
@@ -36,6 +37,7 @@ function scan(ctx, group) {
     const files = new Map();
     if (existsSync(root)) {
       for (const f of walkTree(root).files) {
+        if (OURTMP.test(f.rel.split('/').pop())) continue;   // our own crashed-write temp is never a memory file (N4)
         try {
           files.set(f.rel, { abs: f.abs, sha: sha256(readFileSync(f.abs)), mtimeMs: statSync(f.abs).mtimeMs });
         } catch { /* unreadable or gone: treated as absent */ }
@@ -58,6 +60,7 @@ export function mergeCoworkMemory(group, o) {
   const rep = { mode, dry, copied: [], deleted: [], conflicts: [], unchanged: 0, files: 0, pending: false };
   if (group.length < 2) return rep;
 
+  if (!dry) for (const F of group) sweepOurTmp(memoryRoot(ctx, F), ctx.now(), { recursive: true });   // N3
   const sides = scan(ctx, group);
   const keys = Object.keys(sides);
   const baseDoc = readJson(accPath(ctx, 'memory-base.json'), null);
