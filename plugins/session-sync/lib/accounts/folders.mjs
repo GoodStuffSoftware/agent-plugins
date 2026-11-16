@@ -74,14 +74,17 @@ export function groupOf(state, folders) {
   return folders.filter((f) => accts.has(f.acct));
 }
 
-/** Every unordered account pair with no recorded answer. */
+/**
+ * Every unordered account pair with no recorded answer. An entry that only carries
+ * ask bookkeeping (`askedAt`, `askCount`, no `answer`) is still pending.
+ */
 export function pendingPairs(state, accts) {
   const list = [...accts].sort();
   const out = [];
   for (let i = 0; i < list.length; i++) {
     for (let j = i + 1; j < list.length; j++) {
       const k = pairKey(list[i], list[j]);
-      if (!state?.pairs?.[k]) out.push(k);
+      if (!state?.pairs?.[k]?.answer) out.push(k);
     }
   }
   return out;

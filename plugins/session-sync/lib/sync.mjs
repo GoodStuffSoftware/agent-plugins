@@ -20,6 +20,8 @@ import { planIncremental, commitManifest } from './manifest.mjs';
 import { classifyReplacement, lostCount } from './transcript.mjs';
 import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote, isLocalRemote } from './rclone.mjs';
 import { notify } from './notify.mjs';
+import { makeCtx, loadState, accPath, readJson, ACC } from './accounts/state.mjs';
+import { listFolders, groupOf, homeOf, RECORD, UUID, OURTMP } from './accounts/folders.mjs';
 
 const MARKER = '.last-push';
 const MANIFEST_FILE = join(homedir(), '.claude', 'session-sync', 'manifest.json');
@@ -91,6 +93,64 @@ function writeFileList(files) {
   return f;
 }
 
+/**
+ * The home-only push filter for the Code-tab store when accounts are linked
+ * (plan 5.11): a record `<acct>/<org>/local_<id>.json` is uploaded only from its
+ * HOME folder, so a mirrored name (a hard link to the same inode) never uploads and
+ * the remote holds each conversation once. Our own temp names never upload.
+ *
+ * Returns `(rel) => boolean`, or null when no group is linked (single-account
+ * machines keep the unfiltered behaviour). The record-to-folders map is built on
+ * the first call. It fails OPEN: if the filter cannot be built the push uploads
+ * everything (duplicates on the remote are reported and harmless; a skipped
+ * backup is not).
+ */
+export function accountsPushFilter({ ctx = makeCtx(), state = null, remoteList = null } = {}) {
+  try {
+    if (!ctx.store) return null;
+    const st = state ?? loadState(ctx);
+    if (!st.linked) return null;
+    const group = groupOf(st, listFolders(ctx.store));
+    if (group.length < 2) return null;
+    const groupKeys = new Set(group.map((f) => f.key));
+    const rl = remoteList ?? readJson(accPath(ctx, 'remote-list.json'), null);
+    let present = null;
+    const build = () => {
+      present = new Map();
+      for (const f of group) {
+        let names = [];
+        try { names = readdirSync(f.path); } catch { /* unreadable folder: no names */ }
+        for (const n of names) {
+          const m = RECORD.exec(n);
+          if (!m) continue;
+          const id = `local_${m[1].toLowerCase()}`;
+          if (!present.has(id)) present.set(id, []);
+          present.get(id).push(f.key);
+        }
+      }
+    };
+    const homes = new Map();
+    return (rel) => {
+      const parts = rel.split('/');
+      if (parts.length !== 3 || !UUID.test(parts[0]) || !UUID.test(parts[1])) return true;
+      const key = `${parts[0]}/${parts[1]}`;
+      if (!groupKeys.has(key)) return true;
+      if (OURTMP.test(parts[2])) return false;
+      const m = RECORD.exec(parts[2]);
+      if (!m) return true;
+      const id = `local_${m[1].toLowerCase()}`;
+      if (!homes.has(id)) {
+        if (!present) build();
+        const here = (present.get(id) ?? []).sort();
+        let home = homeOf(id, here, st, rl, [...groupKeys]);
+        if (here.length && !here.includes(home)) home = here[0];   // home name gone: upload from the first holder, never nowhere
+        homes.set(id, home);
+      }
+      return homes.get(id) === key;
+    };
+  } catch { return null; }
+}
+
 /** Build the local<->remote mapping for whatever this machine actually has. */
 export function buildMap(remote) {
   const r = resolveAll();
@@ -99,10 +159,39 @@ export function buildMap(remote) {
   ];
   for (const name of SESSION_DIRS) {
     if (r.sessionStores[name]) {
-      map.push({ local: r.sessionStores[name], remote: `${remote}/${name}`, excludes: [], label: name });
+      const entry = { local: r.sessionStores[name], remote: `${remote}/${name}`, excludes: [], label: name };
+      if (name === 'claude-code-sessions') {
+        const fileFilter = accountsPushFilter({ ctx: makeCtx({ store: r.sessionStores[name] }) });
+        if (fileFilter) entry.fileFilter = fileFilter;
+      }
+      map.push(entry);
     }
   }
   return { map, resolved: r };
+}
+
+/**
+ * One listing of the remote's Code-tab records, grouped by id (plan 5.11): an id
+ * under more than one `<acct>/<org>` is a duplicate. REPORTED, never deleted.
+ * Returns `{ok, ids:{<id>:[folderKey]}, duplicates:{<id>:[folderKey]}, count}`.
+ */
+export async function remoteRecordList(remote) {
+  const { code, stdout } = await runRclone([
+    'lsf', '-R', '--files-only', '--include', '/*/*/local_*.json', `${remote}/claude-code-sessions`, '--log-level', 'ERROR',
+  ]);
+  if (code !== 0) return { ok: false, ids: {}, duplicates: {}, count: 0 };
+  const ids = {};
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const parts = line.trim().replace(/\\/g, '/').split('/');
+    if (parts.length !== 3 || !UUID.test(parts[0]) || !UUID.test(parts[1])) continue;
+    const m = RECORD.exec(parts[2]);
+    if (!m) continue;
+    const id = `local_${m[1].toLowerCase()}`;
+    (ids[id] ||= []).push(`${parts[0]}/${parts[1]}`);
+  }
+  const duplicates = {};
+  for (const [id, keys] of Object.entries(ids)) { keys.sort(); if (keys.length > 1) duplicates[id] = keys; }
+  return { ok: true, ids, duplicates, count: Object.keys(ids).length };
 }
 
 function withExcludes(args, excludes) {
@@ -148,7 +237,18 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
   let failed = 0;
   for (const m of todo) {
     let args;
-    if (!m.full && m.files.length) {
+    // A filtered entry (account-link home-only filter) always goes through
+    // --files-from, full mode included: a plain `copy` of the tree would upload the
+    // mirrored names the filter exists to keep out. `m.full` (and `force` with
+    // nothing changed) uses every key of the filtered scan.
+    let list = null;
+    if (m.fileFilter) {
+      list = (m.full || (force && !m.files.length)) ? Object.keys(nextForRemote[m.label] || {}) : m.files;
+      if (!list.length) { onLog(`ok: ${m.label} (nothing to send after the home-only filter)`); continue; }
+    } else if (!m.full && m.files.length) {
+      list = m.files;
+    }
+    if (list) {
       // Hand rclone the exact paths instead of making it walk and compare the
       // whole tree against a rate-limited remote.
       //
@@ -159,14 +259,14 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
       // applied the SAME exclusions when building it — an excluded file can
       // never appear in the list. (Its match is by basename, so it is if
       // anything stricter than the rclone patterns.)
-      const listFile = writeFileList(m.files);
+      const listFile = writeFileList(list);
       args = ['copy', m.local, m.remote, ...copyFlags({ paced }), '--files-from', listFile, '--no-traverse'];
     } else {
       args = withExcludes(['copy', m.local, m.remote, ...copyFlags({ paced })], m.excludes);
     }
     const { code, stderr } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
     if (code !== 0) { failed++; onLog(`ERROR (${code}): ${m.label}${stderr ? ' — ' + stderr.trim().split('\n')[0] : ''}`); }
-    else onLog(`ok: ${m.label}${m.full ? ' (full)' : ` (${m.files.length} file(s))`}`);
+    else onLog(`ok: ${m.label}${list ? ` (${list.length} file(s))` : m.full ? ' (full)' : ` (${m.files.length} file(s))`}`);
   }
 
   const mins = ((Date.now() - t0) / 60000).toFixed(1);
@@ -197,7 +297,19 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
  * stores (IndexedDB, Local Storage) are never synced, so there is no database
  * to corrupt. Worst case a brand-new chat needs an app restart to appear.
  */
-export async function pull(remote, { quiet = false, onLog = () => {}, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER } = {}) {
+export async function pull(remote, opts = {}) {
+  // Tell the account-link engine a pull is in flight: rectify stands down while a live
+  // `pull-active` is younger than 6 h (plan 5.11). Always removed on the way out.
+  const pullActive = join(ACC, 'pull-active');
+  try { mkdirSync(ACC, { recursive: true }); writeFileSync(pullActive, JSON.stringify({ pid: process.pid, at: Date.now() })); } catch { /* best effort */ }
+  try {
+    return await pullImpl(remote, opts);
+  } finally {
+    try { unlinkSync(pullActive); } catch { /* already gone */ }
+  }
+}
+
+async function pullImpl(remote, { quiet = false, onLog = () => {}, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER } = {}) {
   const { map } = buildMap(remote);
   const paced = !isLocalRemote(remote);
   if (!quiet) notify('Restoring your conversations…', 'Pulling the latest from your remote. Please wait before asking anything — history is still loading.', { persist: true, tag: 'sync' });

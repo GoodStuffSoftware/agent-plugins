@@ -37,7 +37,7 @@ import { join, relative, sep, dirname } from 'node:path';
  * the tree — a marketplace checkout, a user's own skill or project folder — is
  * REAL USER DATA and must be backed up. Anchored 2026-09-07.
  */
-export function scanTree(root, { excludeDirs = [], excludeFiles = [], excludeRootDirs = [] } = {}) {
+export function scanTree(root, { excludeDirs = [], excludeFiles = [], excludeRootDirs = [], fileFilter = null } = {}) {
   const out = {};
   if (!existsSync(root)) return out;
 
@@ -56,12 +56,15 @@ export function scanTree(root, { excludeDirs = [], excludeFiles = [], excludeRoo
         walk(full, false);
       } else if (e.isFile()) {
         if (skipFile.has(e.name)) continue;
+        // `fileFilter(rel)` false = never part of this tree's sync (account-link mirrors).
+        const rel = relative(root, full).split(sep).join('/');
+        if (fileFilter && !fileFilter(rel)) continue;
         try {
           const st = statSync(full);
           // size + mtime is what rclone itself compares by default. Hashing
           // 5 GB every sync to catch a same-size same-mtime edit would cost
           // far more than the rare miss it prevents.
-          out[relative(root, full).split(sep).join('/')] = `${st.size}:${Math.floor(st.mtimeMs)}`;
+          out[rel] = `${st.size}:${Math.floor(st.mtimeMs)}`;
         } catch { /* vanished mid-walk — next sync catches it */ }
       }
     }
@@ -115,7 +118,7 @@ export function planIncremental(map, manifestFile, remote, { excludeDirs, exclud
   const nextForRemote = {};
 
   for (const m of map) {
-    const curr = scanTree(m.local, { excludeDirs, excludeFiles, excludeRootDirs });
+    const curr = scanTree(m.local, { excludeDirs, excludeFiles, excludeRootDirs, fileFilter: m.fileFilter ?? null });
     nextForRemote[m.label] = curr;
 
     const prev = prevForRemote[m.label];
