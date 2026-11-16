@@ -34,7 +34,10 @@ export function cworld({ config = {}, accounts = 2, records = 2 } = {}) {
   writeFileSync(join(home, '.claude', 'CLAUDE.md'), 'rules');
   writeFileSync(join(stateDir, 'sender-registered.txt'), new Date().toISOString());
   writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ notifications: false, ...config }, null, 2));
-  const userData = join(home, 'AppData', 'Roaming', 'Claude');
+  // The desktop app's userData dir per platform, as lib/paths.mjs desktopDataRoots resolves it.
+  const userData = process.platform === 'win32' ? join(home, 'AppData', 'Roaming', 'Claude')
+    : process.platform === 'darwin' ? join(home, 'Library', 'Application Support', 'Claude')
+    : join(home, '.config', 'Claude');
   const store = join(userData, 'claude-code-sessions');
   mkdirSync(store, { recursive: true });
   const clock = makeClock();
