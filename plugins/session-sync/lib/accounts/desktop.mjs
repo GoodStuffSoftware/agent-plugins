@@ -5,6 +5,11 @@
  *                        each judged by CAPABILITY (has the account engine and the home-only push
  *                        filter), never by its version label: the app's copy can hold 0.4.0 code
  *                        while its label still says 0.3.0.
+ *   cliCopies(ctx)       the copies the terminal `claude` runs: the install paths in
+ *                        `~/.claude/plugins/installed_plugins.json` (else the newest version under
+ *                        `~/.claude/plugins/cache/<marketplace>/session-sync/`). A terminal session pushes the
+ *                        same desktop store, and `claude plugin update` refreshes these independently of the app.
+ *   sessionSyncCopies()  both lists; go-live judges them all.
  *   resolveAumid()       Windows: the MSIX app id, read from the installed package.
  *   relaunchApp(ctx)     start the app: `explorer.exe shell:AppsFolder\<AUMID>` on Windows,
  *                        `open -a Claude` on macOS.
@@ -14,7 +19,8 @@
  */
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { spawn as nodeSpawn, spawnSync } from 'node:child_process';
 
 const CAPABILITY_FILES = ['lib/accounts/pass.mjs', 'lib/accounts/waiter.mjs', 'lib/accounts/folders.mjs'];
@@ -43,12 +49,50 @@ export function desktopCopies(ctx) {
         let meta = null;
         try { meta = JSON.parse(readFileSync(join(root, '.claude-plugin', 'plugin.json'), 'utf8')); } catch { /* not a plugin */ }
         if (meta?.name !== 'session-sync') continue;
-        out.push({ path: root, version: String(meta.version ?? ''), ...copyCapability(root) });
+        out.push({ path: root, version: String(meta.version ?? ''), kind: 'desktop', ...copyCapability(root) });
       }
     }
   }
   return out;
 }
+
+const readJsonSafe = (f) => { try { return JSON.parse(readFileSync(f, 'utf8')); } catch { return null; } };
+const semverKey = (v) => String(v).split(/[.+-]/).slice(0, 3).map((n) => Number.parseInt(n, 10) || 0);
+const semverCmp = (a, b) => { const x = semverKey(a); const y = semverKey(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
+
+/**
+ * The copies of session-sync that terminal `claude` sessions run:
+ * [{path, version, kind:'cli', marketplace, ...capability}]. `o.home` (tests) overrides the home folder.
+ */
+export function cliCopies(ctx, o = {}) {
+  const plugins = join(o.home ?? ctx?.home ?? homedir(), '.claude', 'plugins');
+  const roots = new Map(); // resolved path -> marketplace
+  const inst = readJsonSafe(join(plugins, 'installed_plugins.json'));
+  if (inst && typeof inst.plugins === 'object' && inst.plugins) {
+    for (const [key, entries] of Object.entries(inst.plugins)) {
+      const [name, mp] = key.split('@');
+      if (name !== 'session-sync') continue;
+      for (const e of Array.isArray(entries) ? entries : []) if (e?.installPath) roots.set(resolve(String(e.installPath)), mp ?? null);
+    }
+  } else {
+    // no install list: the newest cached version under each marketplace is the one a session would load
+    const cache = join(plugins, 'cache');
+    for (const mp of subdirs(cache)) {
+      const vers = subdirs(join(cache, mp, 'session-sync')).sort(semverCmp);
+      if (vers.length) roots.set(resolve(join(cache, mp, 'session-sync', vers[vers.length - 1])), mp);
+    }
+  }
+  const out = [];
+  for (const [root, marketplace] of roots) {
+    const meta = readJsonSafe(join(root, '.claude-plugin', 'plugin.json'));
+    if (meta?.name !== 'session-sync') continue;
+    out.push({ path: root, version: String(meta.version ?? ''), kind: 'cli', marketplace, ...copyCapability(root) });
+  }
+  return out;
+}
+
+/** Every copy a push could come from: the desktop app's and the terminal's. */
+export const sessionSyncCopies = (ctx, o = {}) => [...desktopCopies(ctx), ...cliCopies(ctx, o)];
 
 const AUMID_SCRIPT = [
   "$ErrorActionPreference = 'SilentlyContinue'",

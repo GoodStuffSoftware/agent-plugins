@@ -208,7 +208,8 @@ export function formatGoLive(g) {
   const last = (g.messages ?? []).slice(-1)[0];
   const phase = g.status === 'waiting' ? ` (phase ${g.phase})` : '';
   const done = g.finishedAt ? `, finished ${g.finishedAt}` : '';
-  return `Go-live: ${g.status}${phase}, started ${g.startedAt}${done}.${last ? ` ${last}` : ''} Log: ${g.log}`;
+  const paused = g.status !== 'ok' && g.push?.pausedByGoLive && !g.push?.reEnabled ? ' Push is paused by go-live and stays off until it finishes or you run: config enabled true.' : '';
+  return `Go-live: ${g.status}${phase}, started ${g.startedAt}${done}.${last ? ` ${last}` : ''}${paused} Log: ${g.log}`;
 }
 
 /** The final text of a command result. */

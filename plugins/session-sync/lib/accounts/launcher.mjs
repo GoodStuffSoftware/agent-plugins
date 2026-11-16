@@ -18,7 +18,7 @@
  */
 
 import { spawn as nodeSpawn, spawnSync } from 'node:child_process';
-import { appendFileSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
+import { appendFileSync, mkdirSync, writeFileSync, unlinkSync, readdirSync, statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -81,11 +81,41 @@ export function launchDetached(args, o = {}) {
   }
 }
 
+/**
+ * For a SessionStart hook, which must stay fast: no PowerShell and no wait. It starts a tiny detached node
+ * (`cli.mjs accounts launch-detached <args>`) that makes the real launch above and exits. Returns at once.
+ * With the log seam set nothing is started, so it records the request directly.
+ * @returns {{ok:boolean, pid:number|null, method:string, error?:string}}  never throws
+ */
+export function launchViaHelper(args, o = {}) {
+  const env = o.env ?? process.env;
+  if (env.SESSION_SYNC_TEST_LAUNCH_LOG) return launchDetached(args, o);
+  try {
+    const spawnFn = o.spawnFn ?? nodeSpawn;
+    const child = spawnFn(o.execPath ?? process.execPath, [o.cli ?? CLI_PATH, 'accounts', 'launch-detached', ...args], { detached: true, stdio: 'ignore', windowsHide: true, env });
+    child.on?.('error', () => {});
+    child.unref?.();
+    return { ok: !!child.pid, pid: null, method: 'helper', helperPid: child.pid ?? null };
+  } catch (e) {
+    return { ok: false, pid: null, method: 'none', error: String(e?.message ?? e) };
+  }
+}
+
 function launchSpawn(args, { env, execPath, cli, spawnFn = nodeSpawn }) {
   const child = spawnFn(execPath, [cli, ...args], { detached: true, stdio: 'ignore', windowsHide: true, env });
   child.on?.('error', () => {});
   child.unref?.();
   return { ok: !!child.pid, pid: child.pid ?? null, method: 'detached-spawn' };
+}
+
+/** A launch whose node never started leaves its env file behind; the preload deletes it on a normal start. */
+function sweepOldEnvFiles(dir, maxAgeMs = 60 * 60 * 1000) {
+  try {
+    for (const n of readdirSync(dir)) {
+      if (!/^launch-env-[0-9a-f]{12}\.json$/.test(n)) continue;
+      try { if (Date.now() - statSync(join(dir, n)).mtimeMs > maxAgeMs) unlinkSync(join(dir, n)); } catch { /* gone */ }
+    }
+  } catch { /* no dir */ }
 }
 
 function launchCim(args, { ctx, env, execPath, cli, spawnSyncFn = spawnSync }) {
@@ -95,6 +125,7 @@ function launchCim(args, { ctx, env, execPath, cli, spawnSyncFn = spawnSync }) {
   if (Object.keys(forward).length) {
     const dir = ctx?.acc ?? env.TEMP ?? env.TMP ?? '.';
     mkdirSync(dir, { recursive: true });
+    sweepOldEnvFiles(dir);
     const file = join(dir, `launch-env-${randomBytes(6).toString('hex')}.json`);
     writeFileSync(file, JSON.stringify(forward));
     envFile = file;

@@ -41,6 +41,8 @@ export async function requestAppQuit(deps = {}) {
   } catch (e) {
     return { supported: true, requested: false, reason: String(e?.message ?? e) };
   }
+  // the app's quit cleanup can hold the reply for up to 75 s; a timeout means the quit is most likely under way
+  if (r?.error?.code === 'ETIMEDOUT') return { supported: true, requested: true, slow: true };
   if (r?.error) return { supported: true, requested: false, reason: String(r.error.message ?? r.error) };
   if (r?.status !== 0) return { supported: true, requested: false, reason: String(r?.stderr ?? '').trim() || `osascript exited with ${r?.status}` };
   return { supported: true, requested: true };

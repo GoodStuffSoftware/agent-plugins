@@ -37,8 +37,8 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
-import { launchDetached } from './accounts/launcher.mjs';
-import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
+import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
+import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus } from './accounts/report.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, writeSync } from 'node:fs';
@@ -324,8 +324,10 @@ function writeStdout(text) {
 }
 
 // The waiter must outlive the app quit AND an archive or account switch of the launching session: the one launcher (accounts/launcher.mjs).
+// The hook step calls this, and the hook must stay fast and free of PowerShell: launchViaHelper only spawns a tiny
+// detached node (`accounts launch-detached`) that makes the real launch (CIM on Windows) and exits.
 const spawnWaiter = (reason) => {
-  const r = launchDetached(['accounts', 'wait', '--reason', reason], { ctx: makeCtx() });
+  const r = launchViaHelper(['accounts', 'wait', '--reason', reason], { ctx: makeCtx() });
   if (!r.ok) throw new Error(r.error ?? 'could not start the waiter');
   return r.pid;
 };
@@ -447,7 +449,7 @@ async function accountsHookStepInner(parts) {
   if (accts.length < 2) return;
   const state = loadState(ctx);
   // an unfinished go-live whose runner died (reboot, kill) is picked up again here
-  try { resumeIfDead(ctx, (a) => launchDetached(a, { ctx })); } catch { /* never block a session */ }
+  try { resumeIfDead(ctx, (a) => launchViaHelper(a, { ctx })); } catch { /* never block a session */ }
   const pend = pendingPairs(state, accts);
   if (pend.length) {
     if (CFG.accountLink === 'auto') {
@@ -506,6 +508,7 @@ async function goLiveCommand(ctx, args) {
   const deps = goLiveDeps();
   const refuse = (reason, text, code = 3) => { emit({ ok: false, command: 'go-live', reason }, [text]); return code; };
   const launchRunner = () => launchDetached(['accounts', 'golive-run'], { ctx });
+  const weak = (r) => (r.method === 'spawn-fallback' ? [`Warning: the runner could not be started outside Claude (${r.note ?? 'the Windows launch failed'}). It stops if this session is archived or the account is switched; if that happens, run: accounts go-live`] : []);
   const tail = ['The rest runs by itself, with no window. Follow it with: accounts status', `Log: ${goLiveLogFile(ctx)}`, `Result: ${goLiveResultFile(ctx)}`];
 
   const prog = goLiveInProgress(ctx);
@@ -519,7 +522,7 @@ async function goLiveCommand(ctx, args) {
     }
     const r = launchRunner();
     if (!r.ok) return refuse('launch-failed', `Could not start the background runner: ${r.error}. Run: accounts go-live again.`, 1);
-    emit({ ok: true, command: 'go-live', resumed: true, runner: { pid: r.pid, method: r.method } }, ['Resumed the go-live.', ...tail]);
+    emit({ ok: true, command: 'go-live', resumed: true, runner: { pid: r.pid, method: r.method } }, ['Resumed the go-live.', ...weak(r), ...tail]);
     return 0;
   }
 
@@ -530,8 +533,8 @@ async function goLiveCommand(ctx, args) {
     `Accounts: ${plan.accounts}; folders: ${plan.folders}; conversations: ${plan.conversations}.`,
     `After the link every folder holds all ${plan.expected} conversations (plus any that arrive before you quit Claude).`,
     plan.copies.length
-      ? (plan.stale.length ? `${plan.stale.length} of ${plan.copies.length} desktop copy(ies) of session-sync cannot filter mirrored records. Push will be paused until every copy can.` : `All ${plan.copies.length} desktop copy(ies) of session-sync can link.`)
-      : 'No desktop copy of session-sync was found.',
+      ? (plan.stale.length ? `${copyWords(plan.stale)} of session-sync cannot filter mirrored records (${plan.copies.length} copy(ies) found). Push will be paused until every copy can.` : `All ${plan.copies.length} copy(ies) of session-sync (desktop and terminal) can link.`)
+      : 'No copy of session-sync was found to check.',
     `What happens: a backup is taken and checked, the accounts are linked and every folder is verified, Claude starts again${opts.noRelaunch ? ' (not with --no-relaunch: you start it)' : ''}, then a pass and the remote duplicate check run. A failed check rolls back by itself.`,
     app.fullAllowed ? 'Claude does not look like it is running, so the link starts at once.' : 'Claude is running: finish or stop running sessions first. The link starts when it is fully stopped.',
   ];
@@ -552,7 +555,7 @@ async function goLiveCommand(ctx, args) {
       : `Claude cannot be quit from here (${q.reason}). Quit it from the tray icon or the app menu. Closing the window only hides it.`;
   }
   emit({ ok: true, command: 'go-live', started: true, expected: plan.expected, runner: { pid: r.pid, method: r.method }, paused: plan.stale.length > 0, quit: quitNote },
-    [...(jsonOut ? [] : ['Recorded: sharing. The background runner is started and survives the app quit.']), ...(quitNote ? [quitNote] : []), ...tail]);
+    [...(jsonOut ? [] : [`Recorded: sharing. The background runner is started${r.method === 'spawn-fallback' ? '.' : ' and survives the app quit.'}`]), ...weak(r), ...(quitNote ? [quitNote] : []), ...tail]);
   return 0;
 }
 
@@ -561,7 +564,7 @@ async function accountsCommand(sub, args) {
   const ctx = makeCtx();
   const hook = args.includes('--from-hook');
   const has = (f) => args.includes(f);
-  if (!ctx.store && sub !== 'wait') {
+  if (!ctx.store && sub !== 'wait' && sub !== 'launch-detached') {
     emit({ ok: false, reason: 'no-store' }, ['The Claude desktop session store was not found on this machine.']);
     return 3;
   }
@@ -668,6 +671,14 @@ async function accountsCommand(sub, args) {
   }
 
   if (sub === 'go-live') return goLiveCommand(ctx, args);
+
+  // hidden: the helper the SessionStart hook starts (detached, hidden). Only the two long-lived entries may be launched.
+  if (sub === 'launch-detached') {
+    const ok = args[0] === 'accounts' && (args[1] === 'wait' || args[1] === 'golive-run');
+    const r = ok ? launchDetached(args, { ctx }) : { ok: false, method: 'none', error: 'not a launchable command' };
+    log(`accounts launch-detached ${args.slice(1, 2).join('')}: ${r.method}${r.ok ? ` pid ${r.pid ?? '?'}` : ` failed (${r.error})`}`);
+    return r.ok ? 0 : 1;
+  }
 
   if (sub === 'golive-run') {
     const out = await runGoLive(ctx, goLiveDeps());

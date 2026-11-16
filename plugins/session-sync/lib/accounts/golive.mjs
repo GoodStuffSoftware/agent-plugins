@@ -3,7 +3,7 @@
  *
  *   planGoLive()     read-only preflight and the summary to confirm
  *   beginGoLive()    record consent, save the before-state and the expected set, pause push when a
- *                    desktop copy cannot filter it, write the first result
+ *                    copy of session-sync (desktop or terminal) cannot filter it, write the first result
  *   runGoLive()      the RUNNER: a persisted, resumable, idempotent state machine that runs in ONE
  *                    detached process (launcher.mjs). Every phase saves go-live.json before the next.
  *   resumeIfDead()   relaunch the runner when a go-live is in progress and no runner lives
@@ -16,21 +16,21 @@
  * A link or verify failure rolls back automatically (the app is closed by then).
  *
  * Every side effect the runner has is a dependency (`deps`), so tests run it with no real app:
- *   link, rollback, relaunch, rectify, remoteCheck, copies, getPush, setPush, appStatus, sleep, clock.
+ *   link, fullPass, rollback, relaunch, rectify, remoteCheck, copies, getPush, setPush, appStatus, sleep, clock.
  */
 
 import { appendFileSync, mkdirSync, readdirSync, unlinkSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { pidAlive } from '../lock.mjs';
 import {
   accPath, readJson, writeJsonAtomic, loadState, saveState, rollbackActive, LOCK_TTL_MS,
 } from './state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs, RECORD, TOMB } from './folders.mjs';
 import { appState, lockfilePresent } from './appstate.mjs';
-import { link } from './pass.mjs';
+import { link, fullPass } from './pass.mjs';
 import { groupHealth } from './report.mjs';
-import { desktopCopies, relaunchApp } from './desktop.mjs';
+import { sessionSyncCopies, relaunchApp } from './desktop.mjs';
 import { requestAppQuit } from './appquit.mjs';
 
 export const PHASES = ['wait-stop', 'relist', 'link', 'verify', 'relaunch', 'wait-start', 'wait-capability', 'rectify', 'remote', 'finish'];
@@ -41,11 +41,30 @@ export const goLiveResultFile = (ctx) => accPath(ctx, 'go-live-result.json');
 export const goLiveLogFile = (ctx) => accPath(ctx, 'go-live.log');
 const claimFile = (ctx) => accPath(ctx, 'go-live.claim');
 
-const CLAIM_STALE_MS = 5 * 60 * 1000;
+// A timer beats every HEARTBEAT_MS and the rollback runs as an async child, so only a synchronous link or rectify can
+// hold the beat back; the stale window is longer than any of those.
+const CLAIM_STALE_MS = 15 * 60 * 1000;
+const HEARTBEAT_MS = 20 * 1000;
 const MIN = 60 * 1000;
 export const DEFAULT_TIMEOUTS = Object.freeze({ stopMs: 30 * MIN, startMs: 10 * MIN, startNoRelaunchMs: 30 * MIN, capabilityMs: 20 * MIN, lockMs: 15 * MIN });
 
 const id8 = (s) => String(s).slice(0, 8);
+
+/** "2 desktop copy(ies) and 1 installed terminal copy(ies)" for a list of session-sync copies. */
+export function copyWords(list) {
+  const cli = list.filter((c) => c.kind === 'cli').length;
+  const desk = list.length - cli;
+  return [desk ? `${desk} desktop copy(ies)` : null, cli ? `${cli} installed terminal copy(ies)` : null].filter(Boolean).join(' and ');
+}
+
+/** What to do about copies that cannot filter: the desktop app refreshes its own at start; the terminal one needs an update. */
+function copyHints(list) {
+  const h = [];
+  if (list.some((c) => c.kind !== 'cli')) h.push('Disable and enable session-sync in the app plugin manager');
+  const cli = list.filter((c) => c.kind === 'cli');
+  if (cli.length) h.push(`Update the terminal copy: claude plugin update session-sync@${cli[0].marketplace ?? '<marketplace>'} --scope user`);
+  return h.join('. ');
+}
 
 /* ------------------------------------------------------------------ listings and the expected set */
 
@@ -157,7 +176,14 @@ function claimRunner(ctx) {
   }
   return false;
 }
-const beatClaim = (ctx) => { try { writeFileSync(claimFile(ctx), JSON.stringify({ pid: process.pid, at: ctx.now(), beatAt: ctx.now() })); } catch { /* best effort */ } };
+/** Refresh the claim, but only while it is ours: a runner that lost its claim must not overwrite the new holder's. */
+const beatClaim = (ctx) => {
+  try {
+    const c = readJson(claimFile(ctx), null);
+    if (!c || c.pid !== process.pid) return;
+    writeFileSync(claimFile(ctx), JSON.stringify({ pid: process.pid, at: c.at ?? ctx.now(), beatAt: ctx.now() }));
+  } catch { /* best effort */ }
+};
 const releaseClaim = (ctx) => { const c = readJson(claimFile(ctx), null); if (!c || c.pid === process.pid) { try { unlinkSync(claimFile(ctx)); } catch { /* none */ } } };
 
 /* ------------------------------------------------------------------ preflight, consent and the first state */
@@ -173,7 +199,7 @@ export function planGoLive(ctx, deps = {}) {
   const listing = readListing(ctx);
   const exp = expectedSet(listing);
   if (exp.expected.length === 0) return { ok: false, reason: 'empty', text: 'The store holds no conversations; nothing to link.' };
-  const copies = (deps.copies ?? desktopCopies)(ctx);
+  const copies = (deps.copies ?? sessionSyncCopies)(ctx);
   return {
     ok: true, accounts: accts.length, folders: folders.length, conversations: exp.union, expected: exp.expected.length,
     undetermined: exp.undetermined, copies, stale: copies.filter((c) => !c.capable), listing, exp,
@@ -181,7 +207,7 @@ export function planGoLive(ctx, deps = {}) {
 }
 
 /**
- * Record consent (same effect as `accounts answer yes`), pause push when a desktop copy lacks the
+ * Record consent (same effect as `accounts answer yes`), pause push when a copy of session-sync lacks the
  * capability, save the before-state and the expected set, write the first result (`waiting`).
  */
 export function beginGoLive(ctx, plan, opts = {}, deps = {}) {
@@ -208,7 +234,9 @@ export function beginGoLive(ctx, plan, opts = {}, deps = {}) {
     expected: plan.exp.expected,
     counts: { accounts: plan.accounts, folders: plan.folders, conversations: plan.conversations, expected: plan.expected },
   };
-  if (pausedPush) gl.messages.push(`Push is paused: ${plan.stale.length} desktop copy(ies) of session-sync cannot filter mirrored records. It is switched back on when every copy has the capability.`);
+  if (pausedPush) gl.messages.push(`Push is paused: ${copyWords(plan.stale)} of session-sync cannot filter mirrored records. It is switched back on when every copy has the capability.`);
+  // reports of earlier go-lives are not needed any more
+  try { for (const n of readdirSync(dirname(goLiveFile(ctx)))) if (n.startsWith('go-live-reported-') && !n.startsWith(`go-live-reported-${gl.id}-`)) unlinkSync(accPath(ctx, n)); } catch { /* best effort */ }
   saveGoLive(ctx, gl);
   writeResult(ctx, gl, 'waiting');
   glog(ctx, `go-live begun: ${plan.accounts} accounts, ${plan.folders} folders, ${plan.conversations} conversations, ${plan.expected} expected; push ${pausedPush ? 'paused by go-live' : pushEnabled ? 'left on' : 'already off'}`);
@@ -249,7 +277,8 @@ export function goLiveReportText(res) {
     Number.isFinite(c.expected) ? `${c.expected} conversation(s) in ${c.folders ?? '?'} folder(s)` : null,
     Number.isFinite(c.remoteDuplicates) ? `${c.remoteDuplicates} remote duplicate(s)` : null,
   ].filter(Boolean).join(', ');
-  const log = `Log: ${res.log}`;
+  const paused = res.status !== 'ok' && res.push?.pausedByGoLive && !res.push?.reEnabled ? 'Push is paused by go-live and stays off until it finishes or you run: config enabled true.' : '';
+  const log = `${paused ? `${paused} ` : ''}Log: ${res.log}`;
   const first = (list, n) => list.slice(0, n).join(' ');
   if (res.status === 'failed' && res.resumable) {
     return `session-sync: the account go-live stopped at phase "${res.phase}". ${first((res.messages ?? []).slice(-1), 1)} Run: accounts go-live (it resumes). ${log}`.replace(/\s+/g, ' ');
@@ -304,7 +333,8 @@ export async function runGoLive(ctx, deps = {}) {
   const doRelaunch = deps.relaunch ?? ((c) => relaunchApp(c));
   const getPush = deps.getPush ?? (() => true);
   const setPush = deps.setPush ?? (() => {});
-  const copies = deps.copies ?? desktopCopies;
+  const copies = deps.copies ?? sessionSyncCopies;
+  const doFullPass = deps.fullPass ?? fullPass;
 
   let gl = readGoLive(ctx);
   if (!gl) return { exit: 'no-go-live' };
@@ -312,6 +342,9 @@ export async function runGoLive(ctx, deps = {}) {
   if (prev && prev.id === gl.id && FINAL_STATUSES.includes(prev.status) && prev.status !== 'failed') return { exit: 'done', status: prev.status };
   if (!claimRunner(ctx)) return { exit: 'already-running' };
 
+  // true only when THIS process ran the link and has not seen the app since; a resume or a link by another pass
+  // (the waiter) means the app may have saved a record since, so the verify step runs a pass first
+  let linkedThisRun = false;
   const log = (line) => glog(ctx, line);
   const note = (msg) => { gl.messages.push(msg); log(msg); };
   const save = () => saveGoLive(ctx, gl);
@@ -351,16 +384,30 @@ export async function runGoLive(ctx, deps = {}) {
     }
   }
 
+  /** Wait while another process holds accounts.lock (and lives). 'free' | 'timeout'. */
+  async function waitLockFree(lockDl) {
+    for (;;) {
+      beat();
+      const h = readJson(accPath(ctx, 'accounts.lock'), null);
+      const alive = !!h && h.pid !== process.pid && pidAlive(h.pid) && Date.now() - (h.at ?? 0) < LOCK_TTL_MS; // the lock file is stamped with the real clock (lock.mjs)
+      if (!alive) return 'free';
+      if (clock() >= lockDl) return 'timeout';
+      await sleep(pollMs);
+    }
+  }
+
   async function rollbackFlow(why) {
     note(`PROBLEM: ${why}. Rolling back.`);
     const st = loadState(ctx);
     if (!st.backupId) return finalize('failed', 'There is no backup to roll back to. Nothing more was done.');
     gl.backupId = st.backupId; save();
     for (let attempt = 1; attempt <= 3; attempt++) {
+      if (!stopped()) gl.appSeenSinceLink = true;
       const w = await waitStopped('rollback-stop', T.stopMs);
       if (w === 'timeout') return finalize('failed', `The app did not stop, so the rollback did not run. Quit Claude from the tray icon, then run: accounts rollback`);
       let r;
-      try { r = await doRollback(ctx); } catch (e) { r = { ok: false, error: String(e?.message ?? e) }; }
+      // --exact (task files byte for byte, checked) whenever the app has not run since the link
+      try { r = await doRollback(ctx, { exact: !gl.appSeenSinceLink }); } catch (e) { r = { ok: false, error: String(e?.message ?? e) }; }
       log(`rollback attempt ${attempt}: ${r.ok ? 'ok' : `failed (${r.code ?? r.error ?? 'unknown'})`}`);
       if (r.ok) {
         note('Rollback finished. The store is back to its pre-link state; nothing is linked.');
@@ -371,6 +418,12 @@ export async function runGoLive(ctx, deps = {}) {
         }
         return finalize('rolled_back', null);
       }
+      if (r.errors?.length) {
+        // the script finished and reset its state, so another run cannot help: say what does not match
+        return finalize('failed', `The rollback finished, but ${r.errors.length} file(s) do not match the backup (first: ${r.errors.slice(0, 3).join(', ')}). The state before the rollback is saved${r.snapshot ? ` in ${r.snapshot}` : ''}. Nothing more was done; look at those files before anything else.`);
+      }
+      // a run that stopped part way keeps its state and a second run finishes it; once the state is reset it cannot
+      if (!loadState(ctx).backupId) break;
     }
     return finalize('failed', `The rollback did not finish. Quit Claude from the tray icon, then run: accounts rollback  (standalone copy: ${accPath(ctx, 'backup', gl.backupId, 'rollback.mjs')})`);
   }
@@ -383,7 +436,7 @@ export async function runGoLive(ctx, deps = {}) {
         let q;
         try { q = await (deps.requestQuit ?? requestAppQuit)(); } catch (e) { q = { supported: true, requested: false, reason: String(e?.message ?? e) }; }
         gl.quitRequested = true; save();
-        if (q?.requested) note('Asked Claude to quit.');
+        if (q?.requested) note(q.slow ? 'Asked Claude to quit; it is still closing down.' : 'Asked Claude to quit.');
         else note(`Claude could not be asked to quit (${q?.reason ?? 'unknown'}). Quit it from the tray icon or the app menu. Closing the window only hides it.`);
       } else note('Waiting for the Claude app to stop. Quit it from the tray icon or the app menu.');
       const r = await waitStopped('wait-stop', T.stopMs);
@@ -406,10 +459,16 @@ export async function runGoLive(ctx, deps = {}) {
       for (;;) {
         beat();
         const st0 = loadState(ctx);
-        if (st0.linked) { gl.backupId = st0.backupId; note('The accounts are already linked (another pass did it); verifying.'); return 'verify'; }
+        if (st0.linked) {
+          gl.backupId = st0.backupId; gl.appSeenSinceLink = true; save();
+          note('The accounts are already linked (another pass did it); verifying.');
+          return 'verify';
+        }
         let res;
         try { res = await doLink(ctx, { reasons: ['go-live'] }); } catch (e) { return rollbackFlow(`the link threw: ${e?.message ?? e}`); }
+        beat();
         if (res.ok) {
+          linkedThisRun = true; gl.appSeenSinceLink = false;
           gl.backupId = res.backupId ?? loadState(ctx).backupId; save();
           log(`linked (backup ${gl.backupId})`);
           await deps.afterLink?.(ctx);
@@ -419,14 +478,7 @@ export async function runGoLive(ctx, deps = {}) {
         if (why === 'app-running' || why === 'app-started') { note('The app came back during the link; waiting for it to stop again.'); return 'wait-stop'; }
         if (why === 'locked') {
           log('another pass holds the accounts lock; waiting while its holder lives');
-          for (;;) {
-            beat();
-            const h = readJson(accPath(ctx, 'accounts.lock'), null);
-            const alive = !!h && h.pid !== process.pid && pidAlive(h.pid) && Date.now() - (h.at ?? 0) < LOCK_TTL_MS; // the lock file is stamped with the real clock (lock.mjs)
-            if (!alive) break;
-            if (clock() >= lockDl) return finalize('failed', 'Another pass held the accounts lock for too long. Run: accounts go-live (it resumes).');
-            await sleep(pollMs);
-          }
+          if (await waitLockFree(lockDl) === 'timeout') return finalize('failed', 'Another pass held the accounts lock for too long. Run: accounts go-live (it resumes).');
           continue;
         }
         if (why === 'rollback-active') return finalize('failed', 'A rollback is active or was interrupted. Quit Claude and run: accounts rollback');
@@ -436,7 +488,39 @@ export async function runGoLive(ctx, deps = {}) {
     },
 
     async verify() {
-      const v = verifyLinked(ctx, gl.expected, gl.counts.folders);
+      // The app's own save breaks a hard link, so a split seen while the app runs says nothing about the link. Judge (and
+      // roll back) only with the app stopped, after one full pass when the app may have run since the link (a resume,
+      // or another pass such as the waiter did the link).
+      if (!linkedThisRun) gl.appSeenSinceLink = true;
+      let needPass = !!gl.appSeenSinceLink;
+      const lockDl = clock() + T.lockMs;
+      let v;
+      for (let round = 0; ; round++) {
+        beat();
+        if (round > 5) return finalize('failed', 'The app kept starting while the link was being checked. The link is in place and was not rolled back. Quit Claude, then run: accounts go-live (it resumes).');
+        if (!stopped()) {
+          gl.appSeenSinceLink = true; needPass = true; save();
+          note('The app is running; the check waits until it has stopped.');
+          if (await waitStopped('verify-stop', T.stopMs) === 'timeout') return finalize('failed', 'Timed out waiting for the app to stop before the check. The link is in place and was not rolled back. Quit Claude, then run: accounts go-live (it resumes).');
+          continue;
+        }
+        if (needPass) {
+          let p;
+          try { p = await doFullPass(ctx, { reasons: ['go-live'] }); } catch (e) { p = { ok: false, reason: String(e?.message ?? e) }; }
+          beat();
+          log(`verify: pass ${p?.ok ? 'ok' : `did not finish (${p?.reason ?? 'unknown'})`}`);
+          if (!p?.ok && (p?.reason === 'app-running' || p?.reason === 'app-started')) { gl.appSeenSinceLink = true; continue; }
+          if (!p?.ok && p?.reason === 'locked') {
+            if (await waitLockFree(lockDl) === 'timeout') return finalize('failed', 'Another pass held the accounts lock for too long. Run: accounts go-live (it resumes).');
+            continue;
+          }
+          if (!p?.ok && p?.reason === 'rollback-active') return finalize('failed', 'A rollback is active or was interrupted. Quit Claude and run: accounts rollback');
+          needPass = false;   // any other result: the check below judges the store itself
+        }
+        v = verifyLinked(ctx, gl.expected, gl.counts.folders);
+        if (v.problems.length && !stopped()) { gl.appSeenSinceLink = true; needPass = true; continue; }   // the app started while we looked
+        break;
+      }
       if (v.problems.length) { for (const p of v.problems) log(`verify: ${p}`); return rollbackFlow(`the post-link check failed: ${v.problems.slice(0, 3).join('; ')}`); }
       gl.counts.ids = v.ids; gl.counts.split = v.health.split; gl.counts.missing = v.health.missing;
       note(`Verified: all ${gl.expected.length} expected conversations are in all ${v.folders} folders, 0 split, 0 missing.`);
@@ -464,18 +548,20 @@ export async function runGoLive(ctx, deps = {}) {
 
     async 'wait-capability'() {
       const lacking = () => copies(ctx).filter((c) => !c.capable);
-      if (gl.appStarted !== false && lacking().length) {
-        note(`Waiting for ${lacking().length} desktop copy(ies) of session-sync to refresh (the app does this at start).`);
+      // the app refreshes its own copies at start; a terminal copy changes only when someone updates it, so it is not waited for
+      const lackingDesktop = () => lacking().filter((c) => c.kind !== 'cli');
+      if (gl.appStarted !== false && lackingDesktop().length) {
+        note(`Waiting for ${copyWords(lackingDesktop())} of session-sync to refresh (the app does this at start).`);
         const dl = deadline('wait-capability', T.capabilityMs);
-        while (lacking().length && clock() < dl) { beat(); await sleep(pollMs); }
+        while (lackingDesktop().length && clock() < dl) { beat(); await sleep(pollMs); }
         delete gl.deadlines['wait-capability'];
       }
       const stillLacking = lacking();
       if (stillLacking.length) {
-        if (gl.pausedPush) attention(`Push stays PAUSED: ${stillLacking.length} desktop copy(ies) still lack the account feature. Disable and enable session-sync in the app plugin manager, then run: config enabled true`);
-        else attention(`${stillLacking.length} desktop copy(ies) still lack the account feature. Update them in the app plugin manager.`);
+        if (gl.pausedPush) attention(`Push stays PAUSED: ${copyWords(stillLacking)} of session-sync still lack the account feature. ${copyHints(stillLacking)}, then run: config enabled true`);
+        else attention(`${copyWords(stillLacking)} of session-sync still lack the account feature. ${copyHints(stillLacking)}.`);
       } else if (gl.pausedPush) {
-        try { setPush(true); gl.pushReEnabled = true; note('Every desktop copy has the account feature. Push is switched back on.'); } catch (e) { attention(`Could not switch push back on: ${e?.message ?? e}. Run: config enabled true`); }
+        try { setPush(true); gl.pushReEnabled = true; note('Every copy of session-sync has the account feature. Push is switched back on.'); } catch (e) { attention(`Could not switch push back on: ${e?.message ?? e}. Run: config enabled true`); }
       } else if (getPush() === false) {
         note('Push was already paused before go-live, so it stays paused. Switch it on with: config enabled true');
       }
@@ -484,7 +570,9 @@ export async function runGoLive(ctx, deps = {}) {
 
     async rectify() {
       try {
+        beat();
         const r = await deps.rectify?.(ctx);
+        beat();
         if (r && !r.ok && !r.skipped) attention(`The rectify pass did not finish (${r.reason ?? 'unknown'}). Run: accounts rectify`);
         else log(`rectify: ${r ? (r.skipped ? `skipped (${r.skipped})` : 'ok') : 'not wired'}`);
       } catch (e) { attention(`The rectify pass failed: ${e?.message ?? e}. Run: accounts rectify`); }
@@ -493,7 +581,9 @@ export async function runGoLive(ctx, deps = {}) {
 
     async remote() {
       let r = null;
+      beat();
       try { r = await deps.remoteCheck?.(ctx); } catch (e) { r = { checked: false, reason: String(e?.message ?? e) }; }
+      beat();
       if (!r) { note('The remote duplicate check is not wired.'); return 'finish'; }
       if (!r.checked) {
         if (r.notConfigured) note(`Remote duplicate check skipped: ${r.reason}.`);
@@ -503,6 +593,7 @@ export async function runGoLive(ctx, deps = {}) {
       gl.counts.remoteIds = r.ids; gl.counts.remoteDuplicates = r.duplicates;
       if (Number(r.duplicates) !== 0) {
         try { setPush(false); } catch { /* reported below */ }
+        if (gl.before?.pushEnabled !== false) { gl.pausedPush = true; gl.pushReEnabled = false; }   // the result must not say push is back on
         attention(`The remote holds ${r.duplicates} conversation(s) under more than one folder (expected 0). Push is PAUSED. Nothing was deleted. Look at it before running: config enabled true`);
       } else note(r.neverPushed ? 'Remote: nothing has been pushed yet, so 0 records and 0 duplicates.' : `Remote: ${r.ids} record(s), 0 duplicates.`);
       return 'finish';
@@ -511,6 +602,9 @@ export async function runGoLive(ctx, deps = {}) {
     async finish() { return finalize('ok', null); },
   };
 
+  // a timer keeps the claim fresh while a long step awaits; it cannot fire during a synchronous step, hence the window above
+  const hbTimer = setInterval(beat, deps.heartbeatMs ?? HEARTBEAT_MS);
+  hbTimer.unref?.();
   try {
     if (prev?.id === gl.id && prev.status === 'failed') { gl.deadlines = {}; log('resuming after a stopped run'); }
     log(`runner started (pid ${process.pid}), phase ${gl.phase}`);
@@ -533,15 +627,35 @@ export async function runGoLive(ctx, deps = {}) {
     save(); writeResult(ctx, gl, 'failed');
     return { exit: 'failed', status: 'failed' };
   } finally {
+    clearInterval(hbTimer);
     releaseClaim(ctx);
   }
 }
 
-/** The real rollback: the standalone script of the pre-link backup, run with the app closed. */
-export function defaultRollback(ctx) {
+/**
+ * The real rollback: the standalone script of the pre-link backup, run with the app closed. It runs as an async child
+ * (not spawnSync) so the runner's heartbeat keeps beating for up to 30 minutes. `--json` gives the files that did not
+ * match the backup and the snapshot path. `o`: { exact, spawnFn, timeoutMs }.
+ * @returns {Promise<{ok:boolean, code?:number|null, errors?:string[], snapshot?:string, error?:string}>}
+ */
+export function defaultRollback(ctx, o = {}) {
   const st = loadState(ctx);
   const script = st.backupId ? accPath(ctx, 'backup', st.backupId, 'rollback.mjs') : null;
-  if (!script) return { ok: false, error: 'no backup' };
-  const r = spawnSync(process.execPath, [script], { windowsHide: true, encoding: 'utf8', timeout: 30 * MIN });
-  return { ok: r.status === 0, code: r.status, error: r.error ? String(r.error.message ?? r.error) : undefined };
+  if (!script) return Promise.resolve({ ok: false, error: 'no backup' });
+  return new Promise((resolve) => {
+    let out = ''; let done = false; let timer = null; let child;
+    const finish = (r) => { if (done) return; done = true; clearTimeout(timer); resolve(r); };
+    try {
+      child = (o.spawnFn ?? spawn)(process.execPath, [script, '--json', ...(o.exact ? ['--exact'] : [])], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) { finish({ ok: false, error: String(e?.message ?? e) }); return; }
+    timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish({ ok: false, code: null, error: 'the rollback timed out' }); }, o.timeoutMs ?? 30 * MIN);
+    child.stdout?.on('data', (d) => { out += d; });
+    child.stderr?.on('data', () => {});
+    child.on('error', (e) => finish({ ok: false, error: String(e?.message ?? e) }));
+    child.on('close', (code) => {
+      let parsed = null;
+      try { parsed = JSON.parse(out.trim().split(/\r?\n/).pop()); } catch { /* no JSON: refused or failed part way */ }
+      finish({ ok: code === 0, code, errors: parsed?.errors?.length ? parsed.errors : undefined, snapshot: parsed?.snapshot });
+    });
+  });
 }
