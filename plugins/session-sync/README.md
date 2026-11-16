@@ -110,6 +110,56 @@ A start hook never fires if the app never restarts. `auto-pull` reads a `MACHINE
 
 In practice this matters less than it sounds — transcripts and session records are keyed by session UUID, so two machines write disjoint files and don't collide. The genuinely shared files are small: `CLAUDE.md`, `memory/*.md`, `settings.json`. Edit those on two machines between syncs and one edit can be lost. Nothing corrupts; an edit goes missing.
 
+## Multiple accounts on one machine
+
+The desktop app keeps Code-tab conversations per account and organization, in `claude-code-sessions/<account>/<org>/`. Sign into a second claude.ai account and the sidebar shows only that account's conversations; the others are still on disk, out of sight. session-sync can link the accounts on one machine so every conversation, local scheduled task and per-account setting shows in all of them.
+
+**What is shared:** Code-tab conversations (continue any of them from either account), local scheduled tasks (run history stays in step, so nothing runs twice), per-account settings (backlog, presets, UI and permission preferences, tool toggles, Remote Control folder preferences) and Cowork memory.
+
+**What stays with each account:** the app's sign-in, and everything claude.ai keeps server-side: cloud sessions, cloud routines, projects, chats, artifacts and connectors. `/session-sync:accounts` walks the checklist for those (connectors to add, artifacts to share or republish, chat memory to copy by hand).
+
+**How it works.** Each conversation appears in every linked folder as a hard link to one file, so the app in either account reads the same bytes. The app's own save replaces a file, which breaks that link; a rectify pass then keeps the newest copy, copies the older one to a backup folder and links the name again. Tasks, backlog and settings are kept in step by a three-way merge against the state at the last full pass.
+
+**How it triggers.** Nothing runs until you say so. When a SessionStart finds two or more accounts it asks once per pair (at most three times, a week apart). Answer yes and, if Claude is running, the link waits for you to quit it from the tray icon (Windows) or Cmd+Q (macOS), because closing the window only hides it. The `accountLink` setting controls the question:
+
+| `accountLink` | Effect |
+|---|---|
+| `ask` (default) | ask once per account pair |
+| `auto` | link without asking |
+| `off` | never ask, never touch the per-account folders |
+
+```bash
+node lib/cli.mjs config accountLink off     # ask | auto | off
+```
+
+`CLAUDE_PLUGIN_OPTION_ACCOUNTLINK` overrides the file when set to a valid value.
+
+### Commands
+
+`node lib/cli.mjs accounts <command>`; every command takes `--json`.
+
+| Command | What it does |
+|---|---|
+| `status [--all] [--remote]` | accounts, pairs, link health, app state, tasks due a catch-up, and the claude.ai-only lists; `--remote` checks Drive for duplicates, `--all` lifts the list caps |
+| `answer yes\|no` | answer every pending pair (`yes` also re-answers pairs set to "no", so it links again after an unlink or rollback); yes links now when Claude is stopped, otherwise arms the link for when it exits |
+| `link [--now]` | link; `--now` is refused while Claude is running |
+| `rectify` | one pass by app state (a live pass while Claude runs, a full pass when stopped) plus the remote check |
+| `unlink [--when-app-exits]` | keep the newest content, remove the mirrored copies, end the link |
+| `rollback [--exact] [--dry-run]` | restore the backup taken before the link |
+
+Exit codes: `0` ok, `1` failed, `2` bad arguments, `3` refused (the app is running, nothing linked, no backup).
+
+### Safety
+
+- **The app must be closed for the full pass.** While Claude runs, only a live pass happens: new conversations are linked, and anything else waits. A background waiter finishes the work after the app exits.
+- **A verified backup comes first.** Before the first link (and again before linking after an unlink or rollback) the plugin copies the affected files to `~/.claude/session-sync/accounts/backup/<stamp>/` and checks them. If verification fails, the link does not start.
+- **Nothing is erased.** A displaced or deleted conversation, task or memory file is copied to `accounts/rectify-backups/` first.
+- **Rollback** (`accounts rollback`) restores that backup. The backup folder also holds a standalone `rollback.mjs` that needs only Node, so it works even if the plugin is broken: `node "<backup folder>/rollback.mjs"`. Rollback also brings back conversations and scheduled tasks deleted after the link (a restored task keeps the backup's last run time, so its catch-up can run once) and reverts edits made after the link; the newer copies stay in a `pre-rollback-<stamp>` folder in `~/.claude/session-sync/accounts/`.
+- **Drive uploads each conversation once.** Push sends only the copy in the folder where a conversation first appeared; mirrored names never upload, so the remote has no duplicates. `status --remote` checks that.
+- **Never downgrade to 0.3.0 while linked.** 0.3.0 has no push filter and would upload every mirrored copy. Run `accounts unlink` (or `accounts rollback`) first.
+
+Windows needs no administrator rights and the plugin opens no windows. The macOS and Linux paths follow the app's standard data folders and are untested.
+
 ## Notes from actually running this on Windows
 
 These cost real debugging time. If you're building something similar, they'll save you a day:

@@ -9,7 +9,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --import ./test/sandbox-env.mjs --test test/sandbox.test.mjs test/marker.test.mjs test/exclusions.test.mjs test/manifest.test.mjs test/config.test.mjs test/lock.test.mjs test/defer.test.mjs test/transcript.test.mjs test/notify.test.mjs test/sync.test.mjs test/hooks.test.mjs test/cli.test.mjs",
+    "test": "node --import ./test/sandbox-env.mjs --test test/sandbox.test.mjs test/marker.test.mjs test/exclusions.test.mjs test/manifest.test.mjs test/config.test.mjs test/lock.test.mjs test/defer.test.mjs test/transcript.test.mjs test/notify.test.mjs test/sync.test.mjs test/hooks.test.mjs test/cli.test.mjs test/accounts-folders.test.mjs test/accounts-appstate.test.mjs test/accounts-rectify.test.mjs test/accounts-rollback.test.mjs test/accounts-tasks.test.mjs test/accounts-settings.test.mjs test/accounts-memory.test.mjs test/accounts-pass.test.mjs test/accounts-nowindows.test.mjs test/accounts-pushfilter.test.mjs test/accounts-lists.test.mjs test/accounts-waiter.test.mjs test/accounts-cli.test.mjs test/accounts-sync.test.mjs",
     "status": "node lib/cli.mjs status"
   }
 }

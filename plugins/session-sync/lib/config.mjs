@@ -49,12 +49,26 @@ export const DEFAULTS = Object.freeze({
   debounceMinutes: 5,
   // Extra rclone --exclude patterns, on top of the built-in credential excludes.
   extraExcludes: [],
+  // Several claude.ai accounts signed into the desktop app on this machine:
+  //   'ask'  — ask once (via the SessionStart hook) whether to share conversations,
+  //            tasks and settings between them. DEFAULT.
+  //   'auto' — share without asking.
+  //   'off'  — never ask, never touch the per-account folders.
+  // Env CLAUDE_PLUGIN_OPTION_ACCOUNTLINK overrides the file when set to a valid value.
+  accountLink: 'ask',
 });
+
+export const ACCOUNT_LINK_MODES = Object.freeze(['ask', 'auto', 'off']);
 
 export function loadConfig() {
   let file = {};
   try { file = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')); } catch { /* absent or corrupt -> defaults */ }
   const cfg = { ...DEFAULTS, ...file };
+  const fromEnv = String(process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK ?? '').trim().toLowerCase();
+  const fromFile = String(cfg.accountLink ?? '').trim().toLowerCase();
+  // an unknown value never enables linking: it falls back to the default ('ask')
+  cfg.accountLink = ACCOUNT_LINK_MODES.includes(fromEnv) ? fromEnv
+    : ACCOUNT_LINK_MODES.includes(fromFile) ? fromFile : DEFAULTS.accountLink;
   // env wins, but only when actually set to something
   if (process.env.CLAUDE_SESSION_SYNC_REMOTE) {
     cfg.remote = process.env.CLAUDE_SESSION_SYNC_REMOTE;
@@ -120,6 +134,7 @@ export function describeConfig(cfg = loadConfig()) {
     notifications: cfg.notifications !== false,
     notifyMode: cfg.notifyMode || DEFAULTS.notifyMode,
     debounceMinutes: Number.isFinite(cfg.debounceMinutes) ? cfg.debounceMinutes : DEFAULTS.debounceMinutes,
+    accountLink: cfg.accountLink || DEFAULTS.accountLink,
     extraExcludes: cfg.extraExcludes || [],
     configFile: CONFIG_FILE,
     configExists: existsSync(CONFIG_FILE),

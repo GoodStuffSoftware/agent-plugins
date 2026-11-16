@@ -58,3 +58,23 @@ test('the default remote is itself valid', () => {
   assert.ok(validateRemote(DEFAULTS.remote).ok,
     'shipping a default that fails our own validation would be embarrassing');
 });
+
+test('accountLink: defaults to ask; the plugin option env var wins; an unknown value never enables linking', async () => {
+  const { loadConfig, ACCOUNT_LINK_MODES } = await import('../lib/config.mjs');
+  assert.equal(DEFAULTS.accountLink, 'ask');
+  assert.deepEqual([...ACCOUNT_LINK_MODES], ['ask', 'auto', 'off']);
+  const prior = process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK;
+  try {
+    process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK = ' AUTO ';
+    assert.equal(loadConfig().accountLink, 'auto');
+    process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK = 'off';
+    assert.equal(loadConfig().accountLink, 'off');
+    process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK = 'bogus';
+    assert.notEqual(loadConfig().accountLink, 'bogus');
+    assert.ok(ACCOUNT_LINK_MODES.includes(loadConfig().accountLink));
+    delete process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK;
+    assert.ok(ACCOUNT_LINK_MODES.includes(loadConfig().accountLink));
+  } finally {
+    if (prior === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK; else process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK = prior;
+  }
+});
