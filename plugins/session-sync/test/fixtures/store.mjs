@@ -139,3 +139,36 @@ export const readRecord = (p) => JSON.parse(readFileSync(p, 'utf8'));
 export function tasksJson(tasks) {
   return { scheduledTasks: tasks };
 }
+
+/** A synthetic scheduled task. Daily cron by default (UTC "M H * * *"); pass fireAt for a one-shot. */
+export function makeTask(id, over = {}) {
+  return {
+    id,
+    displayName: `Synthetic task ${id}`,
+    cronExpression: '20 5 * * *',
+    enabled: true,
+    filePath: `C:\\synthetic\\.claude\\scheduled-tasks\\${id}\\SKILL.md`,
+    createdAt: 1_790_000_000_000,
+    cwd: 'C:\\synthetic\\work',
+    notifySessionId: `local_${uuid('f', 1)}`,
+    ...over,
+  };
+}
+
+/** Write a folder's scheduled-tasks.json the way the app does (2-space JSON, no trailing newline). */
+export function putTasks(folderPath, tasks, top = {}, mtimeMs) {
+  const p = join(folderPath, 'scheduled-tasks.json');
+  writeFileSync(p, JSON.stringify({ scheduledTasks: tasks, recordedSkips: [], ...top }, null, 2));
+  if (mtimeMs !== undefined) setMtime(p, mtimeMs);
+  return p;
+}
+
+export function putBacklog(folderPath, items, version = 1, mtimeMs) {
+  mkdirSync(join(folderPath, 'backlog'), { recursive: true });
+  const p = join(folderPath, 'backlog', 'tasks.json');
+  writeFileSync(p, JSON.stringify({ version, items }, null, 2));
+  if (mtimeMs !== undefined) setMtime(p, mtimeMs);
+  return p;
+}
+
+export const readJsonFile = (p) => JSON.parse(readFileSync(p, 'utf8'));

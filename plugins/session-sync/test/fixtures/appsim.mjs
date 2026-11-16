@@ -19,6 +19,7 @@ import {
 import { dirname, join } from 'node:path';
 import { setMtime, recordName } from './store.mjs';
 
+const msOf = (v) => (typeof v === 'number' ? v : Date.parse(v) || 0);
 const folderPath = (f) => (typeof f === 'string' ? f : f.path);
 
 function atomicWrite(path, text) {
@@ -108,8 +109,8 @@ export function createSim({ clock, appFile }) {
         const m = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec(t.cronExpression ?? '');
         if (!m) continue;
         const after = Math.max(
-          Date.parse(t.lastScheduledFor ?? t.lastRunAt ?? t.createdAt ?? 0) || 0,
-          Date.parse(t.missedRunScanFloor ?? 0) || 0,
+          msOf(t.lastScheduledFor ?? t.lastRunAt ?? t.createdAt ?? 0),
+          msOf(t.missedRunScanFloor ?? 0),
           now - 7 * 86400000,
         );
         const d = new Date(now);
