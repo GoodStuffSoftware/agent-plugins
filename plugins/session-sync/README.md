@@ -142,6 +142,7 @@ node lib/cli.mjs config accountLink off     # ask | auto | off
 |---|---|
 | `status [--all] [--remote]` | accounts, pairs, link health, app state, tasks due a catch-up, and the claude.ai-only lists; `--remote` checks Drive for duplicates, `--all` lifts the list caps |
 | `answer yes\|no` | answer every pending pair (`yes` also re-answers pairs set to "no", so it links again after an unlink or rollback); yes links now when Claude is stopped, otherwise arms the link for when it exits |
+| `go-live [--yes] [--no-relaunch] [--quit-app]` | the whole go-live in one command: records your yes, then a hidden background runner waits for Claude to stop, backs up, links, verifies every folder, starts Claude again, runs a pass and checks the remote for duplicates. A failed check rolls back by itself. `--quit-app` has the runner ask Claude to quit a few seconds in (macOS only; on Windows and Linux you quit from the tray icon or the app menu and the runner waits). The next session start reports the result once. Running it again resumes an unfinished go-live |
 | `link [--now]` | link; `--now` is refused while Claude is running |
 | `rectify` | one pass by app state (a live pass while Claude runs, a full pass when stopped) plus the remote check |
 | `unlink [--when-app-exits]` | keep the newest content, remove the mirrored copies, end the link |

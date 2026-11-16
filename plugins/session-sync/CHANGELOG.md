@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+### Features
+
+* **session-sync:** `accounts go-live` does the whole link in one command. It records your yes and starts one hidden background runner that survives quitting Claude. The runner waits for the app to stop, takes the backup, links, verifies that every folder holds every conversation, starts Claude again, waits for every desktop copy of session-sync to be able to link, runs a rectify pass and checks the remote for duplicates. A failed link or check rolls back by itself. Running the command again resumes an unfinished go-live.
+* **session-sync:** `--quit-app` has the runner ask Claude to quit a few seconds after it starts (macOS). On Windows and Linux the command says to quit from the tray icon or the app menu, and the runner waits. A synthetic Windows session-end message was tested on a throwaway Electron app: it ends the process about 100 ms after the event, before the app's own asynchronous shutdown can finish, so it is not used.
+* **session-sync:** the next SessionStart reports a finished go-live once (status, counts, anything that needs you, the log path), and says so while the runner is still working after the restart.
+* **session-sync:** `/session-sync:accounts` has the go-live steps for an agent and an after-go-live checklist (connectors, custom connector URLs, artifact shares, what to copy by hand, reading the other account from the terminal).
+
+### Fixed
+
+* The remote duplicate check treats a remote that was never pushed as 0 records and 0 duplicates, with a note. Only a real rclone error is reported as needing attention.
+
 ## 0.4.0 (2026-11-16)
 
 ### Features
