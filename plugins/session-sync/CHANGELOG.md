@@ -1,8 +1,6 @@
 # Changelog
 
-## 0.4.0 (unreleased)
-
-Written by hand; the version bump and release commit follow the merge (see "Releases" in the repo README).
+## 0.4.0 (2026-11-16)
 
 ### Features
 
