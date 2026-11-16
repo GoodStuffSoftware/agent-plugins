@@ -27,15 +27,22 @@
  *   --quiet       Suppress ALL notifications for this run, hook or not.
  */
 
-import { push, pull, preflight, remoteNewer } from './sync.mjs';
+import { push, pull, preflight, remoteNewer, remoteRecordList } from './sync.mjs';
 import { notify, registerWindowsSender } from './notify.mjs';
-import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE } from './config.mjs';
+import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES } from './config.mjs';
 import { acquireLock } from './lock.mjs';
 import { requestDeferred, refreshDeferred, settleDeferred, readDeferred } from './defer.mjs';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs';
+import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic } from './accounts/state.mjs';
+import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './accounts/folders.mjs';
+import { appState, lockfilePresent } from './accounts/appstate.mjs';
+import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
+import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
+import { collectStatus, summarizePass, formatPass, formatStatus } from './accounts/report.mjs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, writeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
-import { join, dirname } from 'node:path';
-import { spawn } from 'node:child_process';
+import { join, dirname, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
 
 const CFG = loadConfig();
 const REMOTE = CFG.remote;
@@ -140,6 +147,7 @@ async function deferredPushWorker() {
     log(`deferred push -> ${REMOTE} (attempt ${attempt})`);
     let r;
     try {
+      await accountsSync('push');
       r = await push(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
     } finally {
       lock.release();
@@ -148,6 +156,7 @@ async function deferredPushWorker() {
     if (r.ok) {
       ensureState();
       writeFileSync(LAST_PUSH, new Date().toISOString());
+      await accountsDailyRemoteCheck();
       const settled = settleDeferred(DEFER_FILE, claimedAt);
       log(`deferred push ok (${r.mins} min)${settled ? '' : ' — a newer request arrived mid-push, running again for it'}`);
       if (settled) return;
@@ -298,6 +307,279 @@ State: ${home}${p === 'win32' ? '\\.claude\\session-sync' : '/.claude/session-sy
 `;
 }
 
+// ---- several claude.ai accounts: hook step, passes and commands ------------
+// The engine lives in lib/accounts/*; this is only the wiring (plan sections 5.12, 6).
+// Account commands never depend on rclone or `enabled`. Hook-path functions never
+// throw and never write to stdout except the one SessionStart context object.
+
+const jsonOut = process.argv.includes('--json');
+const HOOK_DEBOUNCE_MS = 30 * 1000;
+
+/** Synchronous stdout write (a process.exit right after must not drop it). */
+function writeStdout(text) {
+  try { writeSync(1, text); } catch { try { process.stdout.write(text); } catch { /* no stdout */ } }
+}
+
+const spawnWaiter = (reason) => spawnDetachedSelf(['accounts', 'wait', '--reason', reason]);
+const armWaiter = (ctx, reason) => ensureWaiter(ctx, reason, spawnWaiter);
+
+/** A "done" toast, honouring `notifications` and `notifyMode: failures`. */
+function accountsToast(title, body) {
+  if (CFG.notifications === false || CFG.notifyMode === 'failures') return;
+  notify(title, body, { tag: 'accounts' });
+}
+
+function stampRecent(file, ms, now = Date.now()) {
+  const t = Number(readFileSyncSafe(file));
+  return Number.isFinite(t) && t > 0 && now - t < ms;
+}
+function readFileSyncSafe(file) { try { return readFileSync(file, 'utf8').trim(); } catch { return ''; } }
+function writeStamp(file, now = Date.now()) { try { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, String(now)); } catch { /* best effort */ } }
+
+/** One `accounts` run's output: `--json` prints the facts object, otherwise the text lines. */
+function emit(facts, lines) {
+  if (jsonOut) console.log(JSON.stringify(facts, null, 2));
+  else console.log(lines.join('\n'));
+}
+
+/**
+ * Check the remote once for a record under more than one folder (reported, never
+ * deleted) and save the listing to remote-list.json (it also feeds `homeOf`).
+ */
+async function accountsRemoteCheck(ctx) {
+  const p = preflight(REMOTE);
+  if (!p.rclone || !p.remoteConfigured) return { checked: false, reason: 'rclone or the remote is not configured' };
+  const r = await remoteRecordList(REMOTE);
+  if (!r.ok) return { checked: false, reason: 'the remote could not be listed' };
+  const at = new Date().toISOString();
+  writeJsonAtomic(accPath(ctx, 'remote-list.json'), { at, ids: r.ids });
+  const state = loadState(ctx);
+  state.lastRemoteCheck = at;
+  saveState(ctx, state);
+  return { checked: true, at, ids: r.count, duplicates: Object.keys(r.duplicates).length };
+}
+
+/**
+ * Rectify and merge for a linked group, by app state: a full pass when the app is
+ * stopped, else a live pass. Arms the waiter when work is owed. Never throws.
+ * `sync()` below is what push and pull call.
+ */
+async function accountsPass(ctx, reason) {
+  const state = loadState(ctx);
+  if (!state.linked) return { ok: false, kind: 'pass', skipped: 'not-linked' };
+  const app = appState({ ctx, probeProcesses: true });
+  const remoteList = readJson(accPath(ctx, 'remote-list.json'), null);
+  const res = app.fullAllowed
+    ? await fullPass(ctx, { app, remoteList, reasons: [reason] })
+    : await livePass(ctx, { app, remoteList });
+  if (res.armWaiter || res.aborted || loadState(ctx).fullPassOwed) armWaiter(ctx, 'deferred');
+  return res;
+}
+
+async function accountsSync(reason) {
+  try {
+    const ctx = makeCtx();
+    if (!ctx.store) return;
+    if (!loadState(ctx).linked) return;
+    const res = await accountsPass(ctx, reason);
+    const s = summarizePass(res);
+    log(`accounts ${reason}: ${s.ok ? 'ok' : (s.skipped ?? s.reason ?? 'not run')} (linked ${s.linked}, re-linked ${s.relinked}, deleted ${s.deleted}, owed ${s.owed})`);
+  } catch (e) { log(`accounts ${reason} failed: ${e?.message || e}`); }
+}
+
+/** After a push: the remote duplicate check, at most daily. */
+async function accountsDailyRemoteCheck() {
+  try {
+    const ctx = makeCtx();
+    if (!ctx.store) return;
+    const state = loadState(ctx);
+    if (!state.linked) return;
+    if (state.lastRemoteCheck && Date.now() - Date.parse(state.lastRemoteCheck) < 24 * 3600 * 1000) return;
+    const r = await accountsRemoteCheck(ctx);
+    log(`accounts remote check: ${r.checked ? `${r.ids} record(s), ${r.duplicates} duplicate(s)` : r.reason}`);
+  } catch (e) { log(`accounts remote check failed: ${e?.message || e}`); }
+}
+
+const askText = (n, ids) => `session-sync: the Claude desktop app on this machine has been signed into ${n} claude.ai accounts (${ids.join(', ')}). `
+  + 'session-sync can show every Code-tab conversation, local scheduled task and app setting in all of them. '
+  + 'If you are talking with the user, ask them once whether to share these across the accounts, and point them to /session-sync:accounts for details. '
+  + `Record the answer with: node "${resolve(process.argv[1])}" accounts answer yes   (or: no). `
+  + 'If this session runs unattended (no user to ask), do nothing.';
+
+/** `ask-claim-<pairhash>-<YYYYMMDD>`: created with `wx`, so two sessions starting together ask once. */
+function claimAsk(ctx, pend) {
+  const hash = createHash('sha1').update(pend.join(',')).digest('hex').slice(0, 10);
+  const day = new Date(ctx.now()).toISOString().slice(0, 10).replace(/-/g, '');
+  const file = accPath(ctx, `ask-claim-${hash}-${day}`);
+  try { mkdirSync(dirname(file), { recursive: true }); closeSync(openSync(file, 'wx')); return true; } catch { return false; }
+}
+
+/**
+ * The SessionStart step (plan 6). Runs first on `auto-pull --from-hook`, before the
+ * `enabled` and rclone checks, and must stay fast: no PowerShell, no store walk
+ * beyond one directory listing. It writes at most ONE JSON object to stdout.
+ */
+async function accountsHookStep() {
+  if (CFG.accountLink === 'off') return;
+  const ctx = makeCtx();
+  if (!ctx.store) return;
+  const folders = listFolders(ctx.store);
+  const accts = accountsOf(folders);
+  if (accts.length < 2) return;
+  const state = loadState(ctx);
+  const pend = pendingPairs(state, accts);
+  if (pend.length) {
+    if (CFG.accountLink === 'auto') {
+      answerPairs(state, pend, 'yes', 'auto', ctx.now());
+      saveState(ctx, state);
+      log(`accounts: accountLink=auto, ${pend.length} pair(s) answered yes`);
+    } else {
+      const now = ctx.now();
+      const due = pend.some((k) => {
+        const p = state.pairs?.[k];
+        return (p?.askCount ?? 0) < 3 && (!p?.askedAt || now - Date.parse(p.askedAt) > 7 * 24 * 3600 * 1000);
+      });
+      if (due && claimAsk(ctx, pend)) {
+        state.pairs ||= {};
+        for (const k of pend) { const p = (state.pairs[k] ||= {}); p.askedAt = new Date(now).toISOString(); p.askCount = (p.askCount ?? 0) + 1; }
+        saveState(ctx, state);
+        writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: askText(accts.length, accts.map((a) => a.slice(0, 8))) } })}\n`);
+        log(`accounts: asked about ${pend.length} pending pair(s)`);
+        return;
+      }
+    }
+  }
+  const group = groupOf(state, folders);
+  if (group.length < 2) return;
+  const stamp = accPath(ctx, state.linked ? 'hook-rectify.stamp' : 'hook-link.stamp');
+  if (!state.linked) {
+    if (lockfilePresent(ctx)) { armWaiter(ctx, 'link'); log('accounts: app running, waiter armed for the link'); }
+    else if (!stampRecent(stamp, HOOK_DEBOUNCE_MS)) { writeStamp(stamp); spawnDetachedSelf(['accounts', 'link', '--from-hook']); log('accounts: link started in the background'); }
+    return;
+  }
+  if (!stampRecent(stamp, HOOK_DEBOUNCE_MS)) { writeStamp(stamp); spawnDetachedSelf(['accounts', 'rectify', '--from-hook']); }
+  if (state.fullPassOwed) armWaiter(ctx, 'owed');
+}
+
+/** `accounts <sub> ...` (plan 6). Returns the exit code. */
+async function accountsCommand(sub, args) {
+  const ctx = makeCtx();
+  const hook = args.includes('--from-hook');
+  const has = (f) => args.includes(f);
+  if (!ctx.store && sub !== 'wait') {
+    emit({ ok: false, reason: 'no-store' }, ['The Claude desktop session store was not found on this machine.']);
+    return 3;
+  }
+  const printPass = (res, kind) => {
+    const sum = summarizePass(res, kind);
+    if (!hook) emit({ command: sub, ...sum }, formatPass(sum));
+    return sum;
+  };
+  const refused = (code, text, facts = {}) => { if (!hook) emit({ ok: false, command: sub, reason: code, ...facts }, [text]); return 3; };
+
+  if (sub === 'status') {
+    let remote = null;
+    if (has('--remote')) remote = await accountsRemoteCheck(ctx);
+    const st = collectStatus(ctx, { probe: true });
+    const lines = formatStatus(st, { all: has('--all') });
+    if (remote) lines.push(remote.checked ? `Remote check: ${remote.ids} record(s), ${remote.duplicates} duplicate(s).` : `Remote check not run: ${remote.reason}.`);
+    emit({ command: 'status', ...st, ...(remote ? { remoteCheck: remote } : {}) }, lines);
+    return 0;
+  }
+
+  if (sub === 'answer') {
+    const answer = args.find((a) => a === 'yes' || a === 'no');
+    if (!answer) { console.error('Usage: accounts answer yes|no'); return 2; }
+    const state = loadState(ctx);
+    const pend = pendingPairs(state, accountsOf(listFolders(ctx.store)));
+    if (!pend.length) { emit({ ok: true, command: 'answer', answered: 0 }, ['No pending account pairs.']); return 0; }
+    answerPairs(state, pend, answer, 'cli', ctx.now());
+    saveState(ctx, state);
+    if (answer === 'no') { emit({ ok: true, command: 'answer', answered: pend.length, answer }, [`Recorded: not sharing (${pend.length} pair(s)). Change your mind with: accounts answer yes after clearing the pair, or config accountLink.`]); return 0; }
+    const app = appState({ ctx, probeProcesses: true });
+    if (app.fullAllowed) {
+      const res = await link(ctx, {});
+      const sum = summarizePass(res, 'link');
+      emit({ command: 'answer', answered: pend.length, answer, ...sum }, formatPass(sum));
+      return res.ok ? 0 : 3;
+    }
+    const w = armWaiter(ctx, 'link');
+    emit({ ok: true, command: 'answer', answered: pend.length, answer, waiter: w.action },
+      [`Recorded: sharing (${pend.length} pair(s)).`, 'Claude is running. Quit it from the tray icon: the first link takes a backup, then links, and a notice says when it is done.']);
+    return 0;
+  }
+
+  if (sub === 'link') {
+    const state = loadState(ctx);
+    if (groupOf(state, listFolders(ctx.store)).length < 2) return refused('no-group', REASON('no-group'));
+    const app = appState({ ctx, probeProcesses: true });
+    if (!app.fullAllowed) {
+      if (has('--now')) return refused('app-running', 'Quit Claude from the tray icon first (closing the window only hides it).');
+      const w = armWaiter(ctx, 'link');
+      if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, ['Claude is running. The link runs when you quit it from the tray icon.']);
+      return 0;
+    }
+    const res = await link(ctx, { app });
+    printPass(res, 'link');
+    return res.ok ? 0 : 3;
+  }
+
+  if (sub === 'rectify') {
+    if (hook) {
+      // a stamp written by the SessionStart step already debounces; a second guard for direct runs
+      if (stampRecent(accPath(ctx, 'hook-rectify-run.stamp'), HOOK_DEBOUNCE_MS)) return 0;
+      writeStamp(accPath(ctx, 'hook-rectify-run.stamp'));
+    }
+    const res = await accountsPass(ctx, 'rectify');
+    if (res.skipped === 'not-linked') return refused('not-linked', REASON('not-linked'));
+    const sum = summarizePass(res, res.kind === 'live' ? 'live' : 'full');
+    if (hook) return 0;
+    // a manual run includes the remote check
+    const remote = await accountsRemoteCheck(ctx);
+    emit({ command: 'rectify', ...sum, remoteCheck: remote },
+      [...formatPass(sum), remote.checked ? `Remote: ${remote.ids} record(s), ${remote.duplicates} duplicate(s).` : `Remote check not run: ${remote.reason}.`]);
+    return sum.ok || sum.skipped ? 0 : 3;
+  }
+
+  if (sub === 'unlink') {
+    const state = loadState(ctx);
+    if (!state.linked) return refused('not-linked', REASON('not-linked'));
+    const app = appState({ ctx, probeProcesses: true });
+    if (!app.fullAllowed) {
+      if (!has('--when-app-exits')) return refused('app-running', 'Quit Claude from the tray icon first, or run: accounts unlink --when-app-exits');
+      const w = armWaiter(ctx, 'unlink');
+      emit({ ok: true, command: 'unlink', waiter: w.action }, ['Claude is running. The unlink runs when you quit it from the tray icon.']);
+      return 0;
+    }
+    const res = await unlink(ctx, { app });
+    printPass(res, 'unlink');
+    return res.ok ? 0 : 3;
+  }
+
+  if (sub === 'rollback') {
+    const state = loadState(ctx);
+    const script = state.backupId ? accPath(ctx, 'backup', state.backupId, 'rollback.mjs') : null;
+    if (!script || !existsSync(script)) return refused('no-backup', 'There is no backup to roll back to (none was taken, or it was already rolled back).');
+    const pass = args.filter((a) => a === '--exact' || a === '--dry-run' || a === '--json');
+    const r = spawnSync(process.execPath, [script, ...pass], { windowsHide: true, stdio: 'inherit' });
+    return r.status ?? 1;
+  }
+
+  if (sub === 'wait') {
+    const i = args.indexOf('--reason');
+    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', notify: accountsToast });
+    log(`accounts waiter: ${out.exit}${out.report ? ` (${out.report.op} ${out.report.ok ? 'ok' : out.report.error ?? out.report.reason ?? 'not ok'})` : ''}`);
+    return 0;
+  }
+
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run]');
+  return 2;
+}
+
+function REASON(code) {
+  return { 'no-group': 'No account pair has been answered yes. Run: accounts answer yes', 'not-linked': 'The accounts are not linked.' }[code] ?? code;
+}
+
 // ---- config: read, or set a key ------------------------------------------
 // `config`                      -> print current settings as JSON
 // `config remote gdrive:X/Y`    -> set where backups go
@@ -343,8 +625,38 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, debounceMinutes: n, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications, notifyMode, debounceMinutes`);
+  if (key === 'accountLink') {
+    if (!ACCOUNT_LINK_MODES.includes(value)) {
+      console.error(`"${value}" is not a valid accountLink. Use: ${ACCOUNT_LINK_MODES.join(', ')}.`);
+      process.exit(2);
+    }
+    saveConfig({ accountLink: value });
+    log(`config: accountLink -> ${value}`);
+    console.log(JSON.stringify({ ok: true, accountLink: value, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink`);
   process.exit(2);
+}
+
+// `accounts ...` never needs rclone or `enabled`, so it is dispatched before those checks.
+if (cmd === 'accounts') {
+  const sub = process.argv[3] || 'status';
+  let code = 0;
+  try {
+    code = await accountsCommand(sub, process.argv.slice(4));
+  } catch (e) {
+    log(`accounts ${sub} failed: ${e?.stack || e}`);
+    if (!fromHook) console.error(`accounts ${sub} failed: ${e?.message || e}`);
+    code = fromHook ? 0 : 1;
+  }
+  process.exit(fromHook ? 0 : code);
+}
+
+// The SessionStart hook runs the account step first, before the `enabled` and rclone
+// checks below (a machine can link accounts with no remote). It never throws.
+if (cmd === 'auto-pull' && fromHook) {
+  try { await accountsHookStep(); } catch (e) { log(`accounts hook step failed: ${e?.message || e}`); }
 }
 
 // Paused on this machine? Do nothing, quietly — this is a deliberate choice,
@@ -409,8 +721,9 @@ try {
     // the lock file on every run. 'exit' fires on explicit exit too.
     process.on('exit', () => lock.release());
     log(`push -> ${REMOTE}`);
+    await accountsSync('push');
     const r = await push(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
-    if (r.ok) { ensureState(); writeFileSync(LAST_PUSH, new Date().toISOString()); }
+    if (r.ok) { ensureState(); writeFileSync(LAST_PUSH, new Date().toISOString()); await accountsDailyRemoteCheck(); }
     log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
     process.exit(r.ok || !strict ? 0 : 1);
   }
@@ -421,7 +734,7 @@ try {
     process.on('exit', () => lock.release());
     log(`pull <- ${REMOTE}`);
     const r = await pull(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
-    if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); }
+    if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); await accountsSync('pull'); }
     log(`pull ${r.ok ? 'ok' : 'FAILED'} (${r.secs}s)`);
     process.exit(r.ok || !strict ? 0 : 1);
   }
@@ -454,7 +767,7 @@ try {
     if (!hit) { log('auto-pull: nothing newer'); process.exit(0); }
     log(`auto-pull: ${hit.machine} pushed at ${hit.ts} — pulling`);
     const r = await pull(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
-    if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); }
+    if (r.ok) { ensureState(); writeFileSync(LAST_PULL, new Date().toISOString()); await accountsSync('pull'); }
     process.exit(0);
   }
 
