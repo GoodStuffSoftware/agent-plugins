@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+Written by hand; the version bump and release commit follow the merge (see "Releases" in the repo README).
+
+### Features
+
+* **session-sync:** link conversations across claude.ai accounts. Every Code-tab conversation appears in each linked account's folder as a hard link to one file; a rectify pass repairs what the app's atomic save breaks (newest copy wins, the older one is backed up first) and propagates new conversations and deletes.
+* **session-sync:** scheduled tasks, the backlog, per-account settings and Cowork memory are kept in step across the linked accounts by three-way merges against the last full pass. Task run times merge by newest, so a switch never double-fires a catch-up.
+* **session-sync:** `/session-sync:accounts`, a guided setup: what is shared, link, unlink, rollback, and the claude.ai-only checklist.
+* **session-sync:** `accounts` commands (`status`, `answer`, `link`, `rectify`, `unlink`, `rollback`) and the `accountLink` setting (`ask`, `auto`, `off`; env `CLAUDE_PLUGIN_OPTION_ACCOUNTLINK`).
+* **session-sync:** `accounts status` lists connectors, published artifacts and plugins the signed-in account lacks, and the local tasks that will catch up once on the next load.
+
+### Changed
+
+* Push uploads each conversation once, from its home folder; mirrored names never upload. Push and pull run a rectify pass first and after.
+* The SessionStart hook asks once per account pair before anything is linked. Nothing runs until the user answers yes or sets `accountLink` to `auto`.
+
+### Safety
+
+* A verified backup and a standalone `rollback.mjs` (Node only) come before the first link. Displaced and deleted files are copied to a backup folder, never erased.
+* The full pass needs the desktop app stopped; while it runs only a live pass adds new names. A hidden waiter finishes the work after the app exits.
+* Do not downgrade to 0.3.0 while linked: it has no push filter. Run `accounts unlink` or `accounts rollback` first.
+
 ## [0.3.0](https://github.com/GoodStuffSoftware/agent-plugins/compare/session-sync@v0.2.1...session-sync@v0.3.0) (2026-09-24)
 
 
