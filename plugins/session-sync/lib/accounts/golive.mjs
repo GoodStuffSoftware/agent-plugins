@@ -31,6 +31,7 @@ import { appState, lockfilePresent } from './appstate.mjs';
 import { link } from './pass.mjs';
 import { groupHealth } from './report.mjs';
 import { desktopCopies, relaunchApp } from './desktop.mjs';
+import { requestAppQuit } from './appquit.mjs';
 
 export const PHASES = ['wait-stop', 'relist', 'link', 'verify', 'relaunch', 'wait-start', 'wait-capability', 'rectify', 'remote', 'finish'];
 export const FINAL_STATUSES = ['ok', 'rolled_back', 'attention', 'failed'];
@@ -126,7 +127,7 @@ function writeResult(ctx, gl, status, extra = {}) {
     rollbackScript: backupId ? accPath(ctx, 'backup', backupId, 'rollback.mjs') : null,
     push: { pausedByGoLive: !!gl.pausedPush, reEnabled: !!gl.pushReEnabled, enabledBefore: gl.before?.pushEnabled ?? null },
     relaunch: gl.relaunch ?? null,
-    messages: gl.messages ?? [], log: goLiveLogFile(ctx),
+    messages: gl.messages ?? [], attention: gl.attention ?? [], log: goLiveLogFile(ctx),
     ...extra,
   });
 }
@@ -231,6 +232,56 @@ export function resumeIfDead(ctx, launch) {
   return { resumed: !!r?.ok, launch: r };
 }
 
+/* ------------------------------------------------------------------ the SessionStart report */
+
+const MID_RUN_PHASES = ['relaunch', 'wait-start', 'wait-capability', 'rectify', 'remote', 'finish'];
+
+/** Claim "tell a session about <key>" once across sessions that start together (`wx`). */
+function claimReport(ctx, key) {
+  const file = accPath(ctx, `go-live-reported-${key}`);
+  try { mkdirSync(dirname(file), { recursive: true }); closeSync(openSync(file, 'wx')); return true; } catch { return false; }
+}
+
+/** One or two plain lines for a go-live result. Pure. */
+export function goLiveReportText(res) {
+  const c = res.counts ?? {};
+  const facts = [
+    Number.isFinite(c.expected) ? `${c.expected} conversation(s) in ${c.folders ?? '?'} folder(s)` : null,
+    Number.isFinite(c.remoteDuplicates) ? `${c.remoteDuplicates} remote duplicate(s)` : null,
+  ].filter(Boolean).join(', ');
+  const log = `Log: ${res.log}`;
+  const first = (list, n) => list.slice(0, n).join(' ');
+  if (res.status === 'failed' && res.resumable) {
+    return `session-sync: the account go-live stopped at phase "${res.phase}". ${first((res.messages ?? []).slice(-1), 1)} Run: accounts go-live (it resumes). ${log}`.replace(/\s+/g, ' ');
+  }
+  if (!FINAL_STATUSES.includes(res.status)) {
+    return `session-sync: the account go-live is still running (phase "${res.phase}", after the restart). Its result is shown at the next session start. Follow it with: accounts status. ${log}`;
+  }
+  if (res.status === 'ok') return `session-sync: the account go-live finished. The accounts are linked${facts ? ` (${facts})` : ''}. No action needed here; the after-go-live checklist in /session-sync:accounts lists what is left to do by hand. ${log}`;
+  if (res.status === 'attention') return `session-sync: the account go-live finished but needs you${facts ? ` (${facts})` : ''}. ${first(res.attention?.length ? res.attention : (res.messages ?? []).slice(-1), 2)} ${log}`.replace(/\s+/g, ' ');
+  if (res.status === 'rolled_back') return `session-sync: the account go-live was rolled back; nothing is linked. ${first((res.messages ?? []).slice(-2), 2)} ${log}`.replace(/\s+/g, ' ');
+  return `session-sync: the account go-live failed. ${first((res.messages ?? []).slice(-1), 1)} ${log}`.replace(/\s+/g, ' ');
+}
+
+/**
+ * For the SessionStart step: text for a go-live result no session has been told about yet (a final
+ * result once; a mid-run notice once per phase after the app restarts), else null. Cheap: one JSON read
+ * and at most one `wx` file create. It never throws.
+ */
+export function takeGoLiveReport(ctx) {
+  try {
+    const res = readGoLiveResult(ctx);
+    if (!res?.id) return null;
+    if (FINAL_STATUSES.includes(res.status)) {
+      return claimReport(ctx, `${res.id}-${res.status}`) ? goLiveReportText(res) : null;
+    }
+    if (res.status === 'waiting' && MID_RUN_PHASES.includes(res.phase) && runnerAlive(ctx)) {
+      return claimReport(ctx, `${res.id}-mid-${res.phase}`) ? goLiveReportText(res) : null;
+    }
+    return null;
+  } catch { return null; }
+}
+
 /* ------------------------------------------------------------------ the runner */
 
 const END = Symbol('end');
@@ -284,7 +335,7 @@ export async function runGoLive(ctx, deps = {}) {
     log(`result: ${status}`);
     return END;
   };
-  const attention = (msg) => { gl.flags.attention = true; note(msg); };
+  const attention = (msg) => { gl.flags.attention = true; (gl.attention ||= []).push(msg); note(msg); };
 
   /** Wait until the app is stopped on two readings a gap apart. 'ok' | 'timeout'. */
   async function waitStopped(name, ms) {
@@ -326,7 +377,15 @@ export async function runGoLive(ctx, deps = {}) {
 
   const steps = {
     async 'wait-stop'() {
-      note('Waiting for the Claude app to stop. Quit it from the tray icon or the app menu.');
+      if (gl.opts.quitApp && !gl.quitRequested && running()) {
+        // the runner asks, a few seconds in, so the go-live command has already returned to the agent that ran it
+        await sleep(deps.quitDelayMs ?? (testPoll || 5000));
+        let q;
+        try { q = await (deps.requestQuit ?? requestAppQuit)(); } catch (e) { q = { supported: true, requested: false, reason: String(e?.message ?? e) }; }
+        gl.quitRequested = true; save();
+        if (q?.requested) note('Asked Claude to quit.');
+        else note(`Claude could not be asked to quit (${q?.reason ?? 'unknown'}). Quit it from the tray icon or the app menu. Closing the window only hides it.`);
+      } else note('Waiting for the Claude app to stop. Quit it from the tray icon or the app menu.');
       const r = await waitStopped('wait-stop', T.stopMs);
       if (r === 'timeout') {
         return finalize('failed', 'Timed out waiting for the app to stop. Your answer is still recorded. Quit Claude, then run: accounts go-live (it resumes).');
@@ -445,7 +504,7 @@ export async function runGoLive(ctx, deps = {}) {
       if (Number(r.duplicates) !== 0) {
         try { setPush(false); } catch { /* reported below */ }
         attention(`The remote holds ${r.duplicates} conversation(s) under more than one folder (expected 0). Push is PAUSED. Nothing was deleted. Look at it before running: config enabled true`);
-      } else note(`Remote: ${r.ids} record(s), 0 duplicates.`);
+      } else note(r.neverPushed ? 'Remote: nothing has been pushed yet, so 0 records and 0 duplicates.' : `Remote: ${r.ids} record(s), 0 duplicates.`);
       return 'finish';
     },
 

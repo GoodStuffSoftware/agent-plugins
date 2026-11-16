@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
-  planGoLive, beginGoLive, runGoLive, resumeIfDead, goLiveInProgress, runnerAlive, readGoLive, readGoLiveResult,
+  planGoLive, beginGoLive, runGoLive, resumeIfDead, takeGoLiveReport, goLiveInProgress, runnerAlive, readGoLive, readGoLiveResult,
   goLiveFile, goLiveResultFile, goLiveLogFile, verifyLinked, expectedSet, readListing,
 } from '../lib/accounts/golive.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations, accPath, rollbackMarkerFile } from '../lib/accounts/state.mjs';
@@ -20,7 +20,9 @@ import { answerPairs, pairKey, listFolders } from '../lib/accounts/folders.mjs';
 import { copyCapability, desktopCopies, relaunchApp, resolveAumid } from '../lib/accounts/desktop.mjs';
 import { launchDetached, forwardedEnv, CLI_PATH } from '../lib/accounts/launcher.mjs';
 import { collectStatus, formatStatus, formatGoLive } from '../lib/accounts/report.mjs';
-import { requestAppQuit } from '../lib/accounts/appquit.mjs';
+import { requestAppQuit, quitSupport } from '../lib/accounts/appquit.mjs';
+import { remoteRecordList } from '../lib/sync.mjs';
+import { findRclone } from '../lib/rclone.mjs';
 import { makeRoot, makeClock, addFolder, putRecord, putTombstone, uuid, treeHashes, recordName } from './fixtures/store.mjs';
 
 afterEach(() => {
@@ -584,8 +586,174 @@ test('desktop: macOS relaunch is `open -a Claude`; other platforms are reported 
   assert.equal(relaunchApp(w.ctx, { platform: 'linux', env: {}, spawnFn }).ok, false);
 });
 
-test('appquit: the leg B seam says it is not supported yet', async () => {
-  const q = await requestAppQuit();
-  assert.equal(q.supported, false);
-  assert.ok(q.reason);
+/* ------------------------------------------------------------------ leg B: app quit */
+
+test('appquit: macOS asks through osascript (hidden, bounded); a failure is reported, never forced', async () => {
+  const calls = [];
+  const ok = await requestAppQuit({ platform: 'darwin', env: {}, spawnSyncFn: (cmd, argv, o) => { calls.push({ cmd, argv, o }); return { status: 0 }; } });
+  assert.deepEqual(ok, { supported: true, requested: true });
+  assert.equal(calls[0].cmd, 'osascript');
+  assert.deepEqual(calls[0].argv, ['-e', 'quit app "Claude"']);
+  assert.equal(calls[0].o.windowsHide, true);
+  assert.ok(calls[0].o.timeout > 0);
+  const bad = await requestAppQuit({ platform: 'darwin', env: {}, spawnSyncFn: () => ({ status: 1, stderr: 'not allowed\n' }) });
+  assert.deepEqual(bad, { supported: true, requested: false, reason: 'not allowed' });
+  const err = await requestAppQuit({ platform: 'darwin', env: {}, spawnSyncFn: () => ({ error: new Error('ENOENT') }) });
+  assert.equal(err.requested, false);
+  assert.match(err.reason, /ENOENT/);
+  const thrown = await requestAppQuit({ platform: 'darwin', env: {}, spawnSyncFn: () => { throw new Error('boom'); } });
+  assert.equal(thrown.requested, false);
+});
+
+test('appquit: Windows and Linux are unsupported with a reason, and nothing is spawned', async () => {
+  const spawnSyncFn = () => { throw new Error('must not spawn'); };
+  for (const platform of ['win32', 'linux']) {
+    const q = await requestAppQuit({ platform, env: {}, spawnSyncFn });
+    assert.equal(q.supported, false);
+    assert.ok(q.reason.length > 10);
+    assert.equal(q.requested, undefined);
+    assert.equal(quitSupport(platform).supported, false);
+  }
+  assert.equal(quitSupport('darwin').supported, true);
+});
+
+test('appquit: with the app-state test seam set, no real app is ever asked to quit', async () => {
+  const q = await requestAppQuit({ platform: 'darwin', env: { SESSION_SYNC_TEST_APP_STATE: 'x' }, spawnSyncFn: () => { throw new Error('must not spawn'); } });
+  assert.equal(q.requested, false);
+});
+
+test('runner --quit-app: asks once after a delay while the app runs, then waits for the stop', async () => {
+  const w = world();
+  w.setApp(true);
+  let asked = 0; const order = [];
+  const { d } = deps(w, {
+    quitDelayMs: 1,
+    requestQuit: async () => { asked++; order.push('ask'); w.setApp(false); return { supported: true, requested: true }; },
+    onPhase: (p) => order.push(p),
+  });
+  start(w, d, { quitApp: true });
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'ok');
+  assert.equal(asked, 1);
+  assert.ok(order.indexOf('ask') > order.indexOf('wait-stop') && order.indexOf('ask') < order.indexOf('relist'));
+  assert.equal(readGoLive(w.ctx).quitRequested, true);
+  assert.match(res(w).messages.join('\n'), /Asked Claude to quit/);
+});
+
+test('runner --quit-app: an unsupported quit says to use the tray icon, still waits, and is not asked again on resume', async () => {
+  const w = world();
+  w.setApp(true);
+  let asked = 0;
+  const { d } = deps(w, {
+    quitDelayMs: 1, timeouts: { stopMs: 2000 },
+    requestQuit: async () => { asked++; return { supported: false, reason: 'not here' }; },
+  });
+  start(w, d, { quitApp: true });
+  const first = await runGoLive(w.ctx, d);
+  assert.equal(first.status, 'failed', 'timed out waiting; nothing was forced');
+  assert.equal(asked, 1);
+  assert.match(res(w).messages.join('\n'), /could not be asked to quit \(not here\)[\s\S]*tray icon/);
+  const d2 = { ...d, onSleep: undefined, sleep: async () => { w.setApp(false); } };
+  const second = await runGoLive(w.ctx, d2);
+  assert.equal(second.status, 'ok');
+  assert.equal(asked, 1, 'asked only once');
+});
+
+test('runner --quit-app: nothing is asked when the app is not running, or without the flag', async () => {
+  for (const quitApp of [true, false]) {
+    const w = world();
+    w.setApp(!quitApp);
+    let asked = 0;
+    const { d } = deps(w, { quitDelayMs: 1, requestQuit: async () => { asked++; return { supported: true, requested: true }; }, onSleep: (n) => { if (n === 2) w.setApp(false); } });
+    start(w, d, { quitApp });
+    await runGoLive(w.ctx, d);
+    assert.equal(asked, 0);
+  }
+});
+
+/* ------------------------------------------------------------------ leg B: remote check on a never-pushed remote */
+
+test('runner: a remote that was never pushed is 0 duplicates with a note, not attention', async () => {
+  const w = world();
+  const { d } = deps(w, { remoteCheck: async () => ({ checked: true, ids: 0, duplicates: 0, neverPushed: true }) });
+  start(w, d);
+  assert.equal((await runGoLive(w.ctx, d)).status, 'ok');
+  assert.equal(res(w).counts.remoteDuplicates, 0);
+  assert.match(res(w).messages.join('\n'), /nothing has been pushed yet, so 0 records and 0 duplicates/);
+});
+
+test('runner: a remote check that really fails stays attention', async () => {
+  const w = world();
+  const { d } = deps(w, { remoteCheck: async () => ({ checked: false, reason: 'the remote could not be listed' }) });
+  start(w, d);
+  assert.equal((await runGoLive(w.ctx, d)).status, 'attention');
+});
+
+const rcloneSkip = findRclone() ? false : 'rclone is not installed on this machine';
+test('remoteRecordList: a missing claude-code-sessions folder is ok and neverPushed; a real rclone error is not ok', { skip: rcloneSkip }, async () => {
+  const remote = makeRoot('rem').root;
+  const never = await remoteRecordList(remote);
+  assert.equal(never.ok, true);
+  assert.equal(never.neverPushed, true);
+  assert.equal(never.count, 0);
+  const real = join(remote, 'claude-code-sessions', A, OA);
+  mkdirSync(real, { recursive: true });
+  writeFileSync(join(real, recordName(1)), '{}');
+  const pushed = await remoteRecordList(remote);
+  assert.equal(pushed.ok, true);
+  assert.equal(pushed.neverPushed, undefined);
+  assert.equal(pushed.count, 1);
+  const broken = await remoteRecordList('session-sync-no-such-remote:x');
+  assert.equal(broken.ok, false, 'an rclone error other than "not found" is not a never-pushed remote');
+});
+
+/* ------------------------------------------------------------------ leg B: the SessionStart report */
+
+const claimFileOf = (w) => join(w.acc, 'go-live.claim');
+const putResult = (w, over) => writeFileSync(goLiveResultFile(w.ctx), JSON.stringify({
+  v: 1, id: 'gl-1', status: 'ok', phase: 'done', resumable: false, counts: { expected: 562, folders: 3, remoteDuplicates: 0 },
+  messages: ['m1', 'm2'], attention: [], log: '/x/go-live.log', ...over,
+}));
+
+test('report: a final result is told once, in plain lines with counts and the log path', () => {
+  const w = world();
+  putResult(w, {});
+  const t = takeGoLiveReport(w.ctx);
+  assert.match(t, /go-live finished/);
+  assert.match(t, /562 conversation\(s\) in 3 folder\(s\), 0 remote duplicate\(s\)/);
+  assert.match(t, /Log: \/x\/go-live\.log/);
+  assert.doesNotMatch(t, /2014/);
+  assert.equal(takeGoLiveReport(w.ctx), null, 'once only');
+  assert.equal(takeGoLiveReport(w.ctx), null);
+  putResult(w, { id: 'gl-2' });
+  assert.ok(takeGoLiveReport(w.ctx), 'a new go-live is reported again');
+});
+
+test('report: attention names what to do; rolled back and failed say so', () => {
+  const w = world();
+  putResult(w, { status: 'attention', attention: ['Push stays PAUSED: 1 copy lacks the feature.', 'Second.', 'Third.'] });
+  const a = takeGoLiveReport(w.ctx);
+  assert.match(a, /needs you/);
+  assert.match(a, /Push stays PAUSED/);
+  assert.match(a, /Second\./);
+  assert.doesNotMatch(a, /Third\./, 'at most two');
+  putResult(w, { id: 'gl-2', status: 'rolled_back', messages: ['PROBLEM: x. Rolling back.', 'Rollback finished.'] });
+  assert.match(takeGoLiveReport(w.ctx), /rolled back; nothing is linked[\s\S]*Rollback finished/);
+  putResult(w, { id: 'gl-3', status: 'failed', phase: 'wait-stop', resumable: true, messages: ['Timed out.'] });
+  assert.match(takeGoLiveReport(w.ctx), /stopped at phase "wait-stop"[\s\S]*Run: accounts go-live/);
+});
+
+test('report: mid-run (after the restart, runner alive) says so once per phase; before that it is silent', () => {
+  const w = world();
+  putResult(w, { status: 'waiting', phase: 'rectify', resumable: true });
+  assert.equal(takeGoLiveReport(w.ctx), null, 'no live runner: nothing to say');
+  writeFileSync(claimFileOf(w), JSON.stringify({ pid: process.pid, at: w.ctx.now(), beatAt: w.ctx.now() }));
+  const t = takeGoLiveReport(w.ctx);
+  assert.match(t, /still running \(phase "rectify"/);
+  assert.equal(takeGoLiveReport(w.ctx), null, 'once per phase');
+  putResult(w, { status: 'waiting', phase: 'remote', resumable: true });
+  assert.match(takeGoLiveReport(w.ctx), /phase "remote"/);
+  putResult(w, { status: 'waiting', phase: 'wait-stop', resumable: true, id: 'gl-2' });
+  assert.equal(takeGoLiveReport(w.ctx), null, 'while still waiting for the quit, the agent that started it knows');
+  assert.equal(takeGoLiveReport(makeRoot('nores').ctx), null, 'no result file: nothing');
 });

@@ -38,8 +38,8 @@ import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
 import { launchDetached } from './accounts/launcher.mjs';
-import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
-import { requestAppQuit } from './accounts/appquit.mjs';
+import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
+import { quitSupport } from './accounts/appquit.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus } from './accounts/report.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, writeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -364,7 +364,7 @@ async function accountsRemoteCheck(ctx) {
   const state = loadState(ctx);
   state.lastRemoteCheck = at;
   saveState(ctx, state);
-  return { checked: true, at, ids: r.count, duplicates: Object.keys(r.duplicates).length };
+  return { checked: true, at, ids: r.count, duplicates: Object.keys(r.duplicates).length, ...(r.neverPushed ? { neverPushed: true } : {}) };
 }
 
 /**
@@ -428,6 +428,17 @@ function claimAsk(ctx, pend) {
  * beyond one directory listing. It writes at most ONE JSON object to stdout.
  */
 async function accountsHookStep() {
+  const parts = [];
+  try {
+    // a go-live result no session has been told about yet (once), or a mid-run notice
+    try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
+    await accountsHookStepInner(parts);
+  } finally {
+    if (parts.length) writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: parts.join('\n\n') } })}\n`);
+  }
+}
+
+async function accountsHookStepInner(parts) {
   if (CFG.accountLink === 'off') return;
   const ctx = makeCtx();
   if (!ctx.store) return;
@@ -453,7 +464,7 @@ async function accountsHookStep() {
         state.pairs ||= {};
         for (const k of pend) { const p = (state.pairs[k] ||= {}); p.askedAt = new Date(now).toISOString(); p.askCount = (p.askCount ?? 0) + 1; }
         saveState(ctx, state);
-        writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: askText(accts.length, accts.map((a) => a.slice(0, 8))) } })}\n`);
+        parts.push(askText(accts.length, accts.map((a) => a.slice(0, 8))));
         log(`accounts: asked about ${pend.length} pending pair(s)`);
         return;
       }
@@ -535,8 +546,10 @@ async function goLiveCommand(ctx, args) {
   if (!r.ok) return refuse('launch-failed', `Your answer is recorded, but the background runner could not start: ${r.error}. Run: accounts go-live again.`, 1);
   let quitNote = app.fullAllowed ? null : 'Quit Claude from the tray icon or the app menu. Closing the window only hides it.';
   if (opts.quitApp && !app.fullAllowed) {
-    const q = await requestAppQuit();
-    quitNote = q.supported ? 'Asked Claude to quit.' : `Claude cannot be quit from here yet (${q.reason}). Quit it from the tray icon or the app menu.`;
+    const q = quitSupport();
+    quitNote = q.supported
+      ? 'The background runner asks Claude to quit in a few seconds. This session ends when it does. If Claude asks about running sessions, answer it in the app.'
+      : `Claude cannot be quit from here (${q.reason}). Quit it from the tray icon or the app menu. Closing the window only hides it.`;
   }
   emit({ ok: true, command: 'go-live', started: true, expected: plan.expected, runner: { pid: r.pid, method: r.method }, paused: plan.stale.length > 0, quit: quitNote },
     [...(jsonOut ? [] : ['Recorded: sharing. The background runner is started and survives the app quit.']), ...(quitNote ? [quitNote] : []), ...tail]);
@@ -564,7 +577,7 @@ async function accountsCommand(sub, args) {
     if (has('--remote')) remote = await accountsRemoteCheck(ctx);
     const st = collectStatus(ctx, { probe: true });
     const lines = formatStatus(st, { all: has('--all') });
-    if (remote) lines.push(remote.checked ? `Remote check: ${remote.ids} record(s), ${remote.duplicates} duplicate(s).` : `Remote check not run: ${remote.reason}.`);
+    if (remote) lines.push(remote.checked ? `Remote check: ${remote.ids} record(s), ${remote.duplicates} duplicate(s)${remote.neverPushed ? ' (nothing has been pushed yet)' : ''}.` : `Remote check not run: ${remote.reason}.`);
     emit({ command: 'status', ...st, ...(remote ? { remoteCheck: remote } : {}) }, lines);
     return 0;
   }
@@ -621,7 +634,7 @@ async function accountsCommand(sub, args) {
     // a manual run includes the remote check
     const remote = await accountsRemoteCheck(ctx);
     emit({ command: 'rectify', ...sum, remoteCheck: remote },
-      [...formatPass(sum), remote.checked ? `Remote: ${remote.ids} record(s), ${remote.duplicates} duplicate(s).` : `Remote check not run: ${remote.reason}.`]);
+      [...formatPass(sum), remote.checked ? `Remote: ${remote.ids} record(s), ${remote.duplicates} duplicate(s)${remote.neverPushed ? ' (nothing has been pushed yet)' : ''}.` : `Remote check not run: ${remote.reason}.`]);
     return sum.ok || sum.skipped ? 0 : 3;
   }
 

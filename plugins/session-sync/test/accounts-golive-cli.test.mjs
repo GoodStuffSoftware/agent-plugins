@@ -6,7 +6,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { readJson } from '../lib/accounts/state.mjs';
 import { pairKey } from '../lib/accounts/folders.mjs';
@@ -58,8 +58,8 @@ test('go-live while the app runs: tells the user to quit from the tray icon; --q
   q.setApp({ running: true, signedIn: A, startedAtMs: 1 });
   const rq = run(q, ['accounts', 'go-live', '--yes', '--quit-app']);
   assert.equal(rq.status, 0, rq.stderr);
-  assert.match(rq.stdout, /cannot be quit from here yet/);
-  assert.match(rq.stdout, /tray icon/);
+  // Windows and Linux: cannot quit from here, use the tray icon. macOS: the runner asks in a few seconds.
+  assert.match(rq.stdout, process.platform === 'darwin' ? /asks Claude to quit in a few seconds/ : /cannot be quit from here[\s\S]*tray icon/);
 });
 
 test('go-live refuses an already linked store and a single account', () => {
@@ -104,4 +104,23 @@ test('end to end: the hidden runner links, verifies, relaunches through the seam
   assert.equal(run(w, ['accounts', 'golive-run']).status, 0);
   // the status line
   assert.match(run(w, ['accounts', 'status']).stdout, /Go-live: (ok|attention)/);
+});
+
+test('SessionStart hook: a final go-live result is added to the context once, in the same single JSON object as an ask', () => {
+  const w = cworld();
+  mkdirSync(w.acc, { recursive: true });
+  writeFileSync(join(w.acc, 'go-live-result.json'), JSON.stringify({
+    v: 1, id: 'gl-9', status: 'ok', phase: 'done', resumable: false, counts: { expected: 4, folders: 2, remoteDuplicates: 0 },
+    messages: [], attention: [], log: join(w.acc, 'go-live.log'),
+  }));
+  const a = w.run(['auto-pull', '--from-hook']);
+  assert.equal(a.status, 0, a.stderr);
+  const obj = JSON.parse(a.stdout.trim());                 // one JSON value only
+  assert.equal(obj.hookSpecificOutput.hookEventName, 'SessionStart');
+  const text = obj.hookSpecificOutput.additionalContext;
+  assert.match(text, /go-live finished/);
+  assert.match(text, /4 conversation\(s\) in 2 folder\(s\)/);
+  assert.match(text, /accounts answer yes/, 'the pending-pair ask rides along in the same object');
+  const b = w.run(['auto-pull', '--from-hook']);
+  assert.equal(b.stdout, '', 'reported once; the ask is also once a day');
 });
