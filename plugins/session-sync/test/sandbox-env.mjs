@@ -58,6 +58,9 @@ process.env.HOME = home;
 process.env.APPDATA = join(home, 'AppData', 'Roaming');
 process.env.XDG_CONFIG_HOME = join(home, '.config');
 
+// Tests that start a background process use a plain detached spawn, never a CIM launch (launcher.mjs).
+process.env.SESSION_SYNC_TEST_LAUNCH = 'spawn';
+
 // A stray CLAUDE_SESSION_SYNC_REMOTE in the developer's own shell would point
 // real pushes at a real remote. Tests set their own per-case.
 delete process.env.CLAUDE_SESSION_SYNC_REMOTE;

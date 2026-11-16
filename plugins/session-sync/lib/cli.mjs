@@ -37,6 +37,9 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
+import { launchDetached } from './accounts/launcher.mjs';
+import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
+import { requestAppQuit } from './accounts/appquit.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus } from './accounts/report.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, writeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -320,7 +323,12 @@ function writeStdout(text) {
   try { writeSync(1, text); } catch { try { process.stdout.write(text); } catch { /* no stdout */ } }
 }
 
-const spawnWaiter = (reason) => spawnDetachedSelf(['accounts', 'wait', '--reason', reason]);
+// The waiter must outlive the app quit AND an archive or account switch of the launching session: the one launcher (accounts/launcher.mjs).
+const spawnWaiter = (reason) => {
+  const r = launchDetached(['accounts', 'wait', '--reason', reason], { ctx: makeCtx() });
+  if (!r.ok) throw new Error(r.error ?? 'could not start the waiter');
+  return r.pid;
+};
 const armWaiter = (ctx, reason) => ensureWaiter(ctx, reason, spawnWaiter);
 
 /** A "done" toast, honouring `notifications` and `notifyMode: failures`. */
@@ -348,7 +356,7 @@ function emit(facts, lines) {
  */
 async function accountsRemoteCheck(ctx) {
   const p = preflight(REMOTE);
-  if (!p.rclone || !p.remoteConfigured) return { checked: false, reason: 'rclone or the remote is not configured' };
+  if (!p.rclone || !p.remoteConfigured) return { checked: false, notConfigured: true, reason: 'rclone or the remote is not configured' };
   const r = await remoteRecordList(REMOTE);
   if (!r.ok) return { checked: false, reason: 'the remote could not be listed' };
   const at = new Date().toISOString();
@@ -427,6 +435,8 @@ async function accountsHookStep() {
   const accts = accountsOf(folders);
   if (accts.length < 2) return;
   const state = loadState(ctx);
+  // an unfinished go-live whose runner died (reboot, kill) is picked up again here
+  try { resumeIfDead(ctx, (a) => launchDetached(a, { ctx })); } catch { /* never block a session */ }
   const pend = pendingPairs(state, accts);
   if (pend.length) {
     if (CFG.accountLink === 'auto') {
@@ -459,6 +469,78 @@ async function accountsHookStep() {
   }
   if (!stampRecent(stamp, HOOK_DEBOUNCE_MS)) { writeStamp(stamp); spawnDetachedSelf(['accounts', 'rectify', '--from-hook']); }
   if (state.fullPassOwed) armWaiter(ctx, 'owed');
+}
+
+/** The go-live runner's side effects that live in this file (config, passes, the remote check). */
+const goLiveDeps = () => ({
+  getPush: () => loadConfig().enabled !== false,
+  setPush: (on) => { saveConfig({ enabled: !!on }); log(`config: enabled -> ${!!on} (go-live)`); },
+  rectify: async (ctx) => summarizePass(await accountsPass(ctx, 'go-live')),
+  remoteCheck: accountsRemoteCheck,
+});
+
+/** y/n on a terminal; null when there is no terminal to ask on. */
+async function confirmYes(question) {
+  if (!process.stdin.isTTY) return null;
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try { return /^(y|yes)$/i.test((await rl.question(`${question} [y/N] `)).trim()); } finally { rl.close(); }
+}
+
+/** `accounts go-live [--yes] [--no-relaunch] [--quit-app] [--json]`: confirm, record consent, start the detached runner. */
+async function goLiveCommand(ctx, args) {
+  const has = (f) => args.includes(f);
+  const yes = has('--yes');
+  const opts = { noRelaunch: has('--no-relaunch'), quitApp: has('--quit-app') };
+  const deps = goLiveDeps();
+  const refuse = (reason, text, code = 3) => { emit({ ok: false, command: 'go-live', reason }, [text]); return code; };
+  const launchRunner = () => launchDetached(['accounts', 'golive-run'], { ctx });
+  const tail = ['The rest runs by itself, with no window. Follow it with: accounts status', `Log: ${goLiveLogFile(ctx)}`, `Result: ${goLiveResultFile(ctx)}`];
+
+  const prog = goLiveInProgress(ctx);
+  if (prog) {
+    const where = `phase ${prog.result.phase}, ${prog.result.status}`;
+    if (runnerAlive(ctx)) { emit({ ok: true, command: 'go-live', alreadyRunning: true, phase: prog.result.phase }, [`A go-live is already running (${where}).`, ...tail]); return 0; }
+    if (!yes) {
+      const a = await confirmYes(`A go-live is in progress (${where}). Resume it?`);
+      if (a === null) return refuse('needs-yes', 'Run again with --yes to resume.', 2);
+      if (!a) return refuse('declined', 'Nothing was changed.', 0);
+    }
+    const r = launchRunner();
+    if (!r.ok) return refuse('launch-failed', `Could not start the background runner: ${r.error}. Run: accounts go-live again.`, 1);
+    emit({ ok: true, command: 'go-live', resumed: true, runner: { pid: r.pid, method: r.method } }, ['Resumed the go-live.', ...tail]);
+    return 0;
+  }
+
+  const plan = planGoLive(ctx, deps);
+  if (!plan.ok) return refuse(plan.reason, plan.text);
+  const app = appState({ ctx, probeProcesses: true });
+  const lines = [
+    `Accounts: ${plan.accounts}; folders: ${plan.folders}; conversations: ${plan.conversations}.`,
+    `After the link every folder holds all ${plan.expected} conversations (plus any that arrive before you quit Claude).`,
+    plan.copies.length
+      ? (plan.stale.length ? `${plan.stale.length} of ${plan.copies.length} desktop copy(ies) of session-sync cannot filter mirrored records. Push will be paused until every copy can.` : `All ${plan.copies.length} desktop copy(ies) of session-sync can link.`)
+      : 'No desktop copy of session-sync was found.',
+    `What happens: a backup is taken and checked, the accounts are linked and every folder is verified, Claude starts again${opts.noRelaunch ? ' (not with --no-relaunch: you start it)' : ''}, then a pass and the remote duplicate check run. A failed check rolls back by itself.`,
+    app.fullAllowed ? 'Claude does not look like it is running, so the link starts at once.' : 'Claude is running: finish or stop running sessions first. The link starts when it is fully stopped.',
+  ];
+  if (!jsonOut) console.log(lines.join('\n'));
+  if (!yes) {
+    const a = await confirmYes('Link the accounts now?');
+    if (a === null) return refuse('needs-yes', 'Run again with --yes to confirm.', 2);
+    if (!a) return refuse('declined', 'Nothing was changed.', 0);
+  }
+  beginGoLive(ctx, plan, opts, deps);
+  const r = launchRunner();
+  if (!r.ok) return refuse('launch-failed', `Your answer is recorded, but the background runner could not start: ${r.error}. Run: accounts go-live again.`, 1);
+  let quitNote = app.fullAllowed ? null : 'Quit Claude from the tray icon or the app menu. Closing the window only hides it.';
+  if (opts.quitApp && !app.fullAllowed) {
+    const q = await requestAppQuit();
+    quitNote = q.supported ? 'Asked Claude to quit.' : `Claude cannot be quit from here yet (${q.reason}). Quit it from the tray icon or the app menu.`;
+  }
+  emit({ ok: true, command: 'go-live', started: true, expected: plan.expected, runner: { pid: r.pid, method: r.method }, paused: plan.stale.length > 0, quit: quitNote },
+    [...(jsonOut ? [] : ['Recorded: sharing. The background runner is started and survives the app quit.']), ...(quitNote ? [quitNote] : []), ...tail]);
+  return 0;
 }
 
 /** `accounts <sub> ...` (plan 6). Returns the exit code. */
@@ -572,6 +654,14 @@ async function accountsCommand(sub, args) {
     return r.status ?? 1;
   }
 
+  if (sub === 'go-live') return goLiveCommand(ctx, args);
+
+  if (sub === 'golive-run') {
+    const out = await runGoLive(ctx, goLiveDeps());
+    log(`accounts go-live runner: ${out.exit}${out.status ? ` (${out.status})` : ''}`);
+    return 0;
+  }
+
   if (sub === 'wait') {
     const i = args.indexOf('--reason');
     const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', notify: accountsToast });
@@ -579,7 +669,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run]');
   return 2;
 }
 
