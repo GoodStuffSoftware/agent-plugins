@@ -13,8 +13,10 @@
  * Steps: (1) refuse while the app runs; (2) snapshot the current state to
  * pre-rollback-<stamp>/; (3) find records created after the backup;
  * (4) restore the store from the backup; (5) put post-backup records back into
- * their home folder as single files; (6) task run-times (stage 2, see below);
- * (7) whole-file areas; (8) verify; (9) reset the account pairs to "no".
+ * their home folder as single files; (6) task run-times (max-merge; --exact skips it);
+ * (7) whole-file areas and path-level areas (only the saved allow-listed paths of
+ * claude_desktop_config.json and remote-control-state.json); (8) verify;
+ * (9) reset the account pairs to "no".
  *
  * Never restored or removed, left exactly as they are now: waiting-input/**,
  * owed-bridge-delete_*, archived-sessions.idx (the app's live queues and hints:
@@ -175,6 +177,189 @@ function writeJsonAtomic(file, obj) {
   renameRetry(tmp, file);
 }
 
+/* ------------------------------------------------------------ JSON text helpers (formatting kept) */
+
+const isPlain = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function detectFormat(text) {
+  const bom = text.charCodeAt(0) === 0xFEFF;
+  const t = bom ? text.slice(1) : text;
+  const eol = t.includes('\r\n') ? '\r\n' : '\n';
+  const trailingNewline = /\r?\n$/.test(t);
+  let indent = 0;
+  for (const line of t.split(/\r?\n/)) {
+    const m = /^(\t+| +)\S/.exec(line);
+    if (m) { indent = m[1][0] === '\t' ? '\t' : m[1].length; break; }
+  }
+  return { bom, eol, trailingNewline, indent };
+}
+
+function serializeJson(obj, fmt = {}) {
+  const { indent = 2, eol = '\n', trailingNewline = false, bom = false } = fmt;
+  let text = JSON.stringify(obj, null, indent);
+  if (eol !== '\n') text = text.replace(/\n/g, eol);
+  if (trailingNewline) text += eol;
+  return bom ? '﻿' + text : text;
+}
+
+const getAt = (obj, path) => {
+  let cur = obj;
+  for (const k of path) { if (!isPlain(cur) || !(k in cur)) return undefined; cur = cur[k]; }
+  return cur;
+};
+const setAt = (obj, path, value) => {
+  let cur = obj;
+  for (let i = 0; i < path.length - 1; i++) {
+    if (cur[path[i]] === undefined) cur[path[i]] = {};
+    if (!isPlain(cur[path[i]])) throw new Error('a container on the path is not an object');
+    cur = cur[path[i]];
+  }
+  cur[path[path.length - 1]] = value;
+};
+const delAt = (obj, path) => { const p = getAt(obj, path.slice(0, -1)); if (isPlain(p)) delete p[path[path.length - 1]]; };
+
+/** Write text through a temp name and a rename (no .bak: path-level files may hold secrets). */
+function writeTextAtomic(file, text, tmpName) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = join(dirname(file), tmpName());
+  const fd = openSync(tmp, 'w');
+  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  try { renameRetry(tmp, file); } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
+}
+
+/**
+ * Path-level restore (D5): put back the saved value of every recorded path of a
+ * file that also holds secrets, leaving every other key untouched. A file that
+ * does not round-trip, or a change that would reach outside the recorded paths,
+ * is refused and left alone. Only counts are ever printed, never values.
+ */
+function restorePathArea(file, area, tmpName, dry) {
+  let text;
+  try { text = readFileSync(file, 'utf8'); } catch { return { status: 'absent', n: 0 }; }
+  let obj;
+  try { obj = JSON.parse(text); } catch { return { status: 'refused', reason: 'unparseable', n: 0 }; }
+  if (!isPlain(obj)) return { status: 'refused', reason: 'not an object', n: 0 };
+  const fmt = detectFormat(text);
+  if (serializeJson(obj, fmt) !== text) return { status: 'refused', reason: 'not round-trippable', n: 0 };
+  const entries = Object.entries(area.paths ?? {}).map(([k, want]) => ({ p: JSON.parse(k), want }));
+  const before = structuredClone(obj);
+  let n = 0;
+  for (const { p, want } of entries) {
+    const cur = getAt(obj, p);
+    if (want.absent) { if (cur !== undefined) { delAt(obj, p); n++; } }
+    else if (JSON.stringify(cur) !== JSON.stringify(want.value)) { setAt(obj, p, structuredClone(want.value)); n++; }
+  }
+  for (const k of area.absentContainers ?? []) {
+    const c = getAt(obj, JSON.parse(k));
+    if (isPlain(c) && !Object.keys(c).length) delAt(obj, JSON.parse(k));
+  }
+  if (!n) return { status: 'unchanged', n: 0 };
+  const strip = (o) => {
+    const c = structuredClone(o);
+    for (const { p } of entries) delAt(c, p);
+    for (const k of area.absentContainers ?? []) { const x = getAt(c, JSON.parse(k)); if (isPlain(x) && !Object.keys(x).length) delAt(c, JSON.parse(k)); }
+    return JSON.stringify(c);
+  };
+  if (strip(before) !== strip(obj)) return { status: 'refused', reason: 'would change a path outside the backup', n: 0 };
+  if (dry) return { status: 'would-restore', n };
+  writeTextAtomic(file, serializeJson(obj, fmt), tmpName);
+  let again;
+  try { again = JSON.parse(readFileSync(file, 'utf8')); } catch { again = undefined; }
+  if (JSON.stringify(again) !== JSON.stringify(obj)) return { status: 'failed', reason: 'read back differently', n };
+  return { status: 'restored', n };
+}
+
+/** The current value (or absence) of each recorded path, for the pre-rollback snapshot. */
+function currentPathValues(file, area) {
+  let obj;
+  try { obj = JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+  const out = {};
+  for (const k of Object.keys(area.paths ?? {})) { const v = getAt(obj, JSON.parse(k)); out[k] = v === undefined ? { absent: true } : { value: v }; }
+  return out;
+}
+
+/* ------------------------------------------------------------ tasks (step 6) */
+
+const TASK_FILE = /^([^/]+\/[^/]+)\/scheduled-tasks\.json$/;
+const RUNTIME = ['lastRunAt', 'lastScheduledFor', 'missedRunScanFloor'];
+const toMs = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? Date.parse(v) : -Infinity);
+
+/** The task files of the state before the rollback: folder key -> {list, mtimeMs}. */
+function readTaskFiles(files) {
+  const out = new Map();
+  for (const f of files) {
+    const m = TASK_FILE.exec(f.rel);
+    if (!m) continue;
+    try {
+      const doc = JSON.parse(readFileSync(f.abs, 'utf8'));
+      if (Array.isArray(doc?.scheduledTasks)) out.set(m[1], { list: doc.scheduledTasks, mtimeMs: statSync(f.abs).mtimeMs });
+    } catch { /* unreadable: ignored */ }
+  }
+  return out;
+}
+
+/**
+ * Step 6. `pre` is readTaskFiles() of the state before the rollback. For every
+ * task file the backup lists (read from the backup copy, i.e. what step 4
+ * restored): each run-time field becomes the max of the restored value and the
+ * value in any file of the state before. A task that exists only in the state
+ * before is appended to its origin file (tasks-base.json) or, without a recorded
+ * origin, to the folder it was found in. A task file the backup does not list
+ * (created by the link) is removed unless a post-backup task is appended to it.
+ */
+function planTasks({ pre, taskEntries, srcOf, destOf, origin, store }) {
+  const maxes = new Map();       // id -> field -> {ms, raw}
+  const newest = new Map();      // id -> {task, mtimeMs, folder}
+  for (const [folder, side] of [...pre].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    for (const t of side.list) {
+      if (!t || typeof t.id !== 'string') continue;
+      if (!maxes.has(t.id)) maxes.set(t.id, {});
+      for (const f of RUNTIME) {
+        const ms = toMs(t[f]);
+        const cur = maxes.get(t.id)[f];
+        if (ms > -Infinity && (!cur || ms > cur.ms)) maxes.get(t.id)[f] = { ms, raw: t[f] };
+      }
+      const n = newest.get(t.id);
+      if (!n || side.mtimeMs > n.mtimeMs) newest.set(t.id, { task: t, mtimeMs: side.mtimeMs, folder });
+    }
+  }
+  const files = new Map();       // folder -> {path, doc, list, fmt, changed, isNew}
+  const restoredIds = new Set();
+  let updated = 0;
+  for (const e of taskEntries) {
+    const folder = TASK_FILE.exec(e.rel)[1];
+    let text; let doc;
+    try { text = readFileSync(srcOf(e), 'utf8'); doc = JSON.parse(text); } catch { continue; }
+    if (!Array.isArray(doc?.scheduledTasks)) continue;
+    const entry = { path: destOf(e), doc, list: doc.scheduledTasks, fmt: detectFormat(text), changed: false, isNew: false };
+    for (const t of doc.scheduledTasks) {
+      if (!t || typeof t.id !== 'string') continue;
+      restoredIds.add(t.id);
+      const mx = maxes.get(t.id);
+      if (!mx) continue;
+      for (const f of RUNTIME) if (mx[f] && mx[f].ms > toMs(t[f])) { t[f] = mx[f].raw; entry.changed = true; updated++; }
+    }
+    files.set(folder, entry);
+  }
+  let appended = 0;
+  for (const [id, n] of newest) {
+    if (restoredIds.has(id)) continue;
+    const target = origin[id] ?? n.folder;
+    let entry = files.get(target);
+    if (!entry) {
+      entry = { path: join(store, ...target.split('/'), 'scheduled-tasks.json'), doc: { scheduledTasks: [] }, list: [], fmt: { indent: 2 }, changed: true, isNew: true };
+      entry.list = entry.doc.scheduledTasks;
+      files.set(target, entry);
+    }
+    const task = structuredClone(n.task);
+    for (const f of RUNTIME) { const mx = maxes.get(id)?.[f]; if (mx) task[f] = mx.raw; }
+    entry.list.push(task);
+    entry.changed = true;
+    appended++;
+  }
+  return { files, updated, appended };
+}
+
 /* ------------------------------------------------------------ main */
 
 function main() {
@@ -210,6 +395,7 @@ function main() {
   const storeEntries = manifest.entries.filter((e) => e.area === 'store');
   const manifestRels = new Set(storeEntries.map((e) => e.rel));
   const nowFiles = walk(store);
+  const preTasks = readTaskFiles(nowFiles);
 
   // (2) snapshot of the current state
   const snapDir = join(acc, `pre-rollback-${stampNow()}`);
@@ -225,6 +411,14 @@ function main() {
     }
     for (const b of ['tasks-base.json', 'backlog-base.json', 'settings-base.json', 'memory-base.json']) {
       if (existsSync(join(acc, b))) copyFileSync(join(acc, b), join(snapDir, b));
+    }
+    // path-level areas: only the recorded (allow-listed) paths of the current files, never the whole file
+    for (const [name, area] of Object.entries(manifest.pathAreas ?? {})) {
+      const vals = currentPathValues(join(userData, name), area);
+      if (!vals) continue;
+      mkdirSync(join(snapDir, 'paths'), { recursive: true });
+      writeFileSync(join(snapDir, 'paths', name), JSON.stringify(vals, null, 2));
+      snapEntries.push({ area: 'paths', rel: name });
     }
     writeFileSync(join(snapDir, 'snapshot.json'), JSON.stringify({ createdAt: new Date().toISOString(), store, entries: snapEntries }, null, 2));
   }
@@ -307,9 +501,26 @@ function main() {
       restoreFile(pb.src, dst, pb.mtimeMs, tmpName);
     }
 
-    // (6) tasks: run-time max-merge is part of stage 2 of the account link build. Stubbed here:
-    // the task files were restored byte for byte, which is what --exact asks for.
-    if (!EXACT) say('tasks: run-time max-merge is not in this build yet; task files were restored exactly.');
+    // (6) tasks: the files were restored byte for byte (what --exact asks for). By default the run-time
+    // fields then move to the max of the restored and the pre-rollback values, and tasks created after
+    // the backup are appended to their origin file, so a rollback never makes a task run twice or vanish.
+    if (!EXACT) {
+      const origin = (() => { try { return JSON.parse(readFileSync(join(acc, 'tasks-base.json'), 'utf8')).origin ?? {}; } catch { return {}; } })();
+      const taskEntries = storeEntries.filter((e) => TASK_FILE.test(e.rel));
+      const plan = planTasks({ pre: preTasks, taskEntries, srcOf, destOf, origin, store });
+      out.tasks = { runtimeUpdated: plan.updated, appended: plan.appended, removedFiles: 0 };
+      for (const entry of plan.files.values()) {
+        if (!entry.changed) continue;
+        if (!DRY) writeTextAtomic(entry.path, serializeJson(entry.doc, entry.fmt), tmpName);
+      }
+      const listed = new Set(taskEntries.map((e) => e.rel));
+      for (const f of nowFiles) {
+        const m = TASK_FILE.exec(f.rel);
+        if (!m || listed.has(f.rel) || plan.files.has(m[1])) continue;
+        out.tasks.removedFiles++;                      // created by the link; its tasks are in the snapshot
+        if (!DRY) unlinkSync(f.abs);
+      }
+    }
 
     // (7) whole-file areas (and cowork memory): byte restore
     for (const e of manifest.entries.filter((x) => x.area !== 'store')) {
@@ -319,14 +530,19 @@ function main() {
       out.global++;
       if (!DRY) restoreFile(srcOf(e), destOf(e), e.mtimeMs, () => `${randomBytes(4).toString('hex')}.rollback.tmp`);
     }
-    const pa = Object.keys(manifest.pathAreas ?? {});
-    if (pa.length) say(`path-level areas (${pa.join(', ')}) are not restored by this build; they were not changed.`);
+    out.paths = {};
+    for (const [name, area] of Object.entries(manifest.pathAreas ?? {})) {
+      const r = restorePathArea(join(userData, name), area, () => `.session-sync-link-${randomBytes(6).toString('hex')}`, DRY);
+      out.paths[name] = r.status === 'refused' || r.status === 'failed' ? { status: r.status, reason: r.reason } : { status: r.status, paths: r.n };
+      if (r.status === 'refused' || r.status === 'failed') say(`path-level area ${name} was NOT restored (${r.reason}); the file is unchanged.`);
+    }
 
     // (8) verify
     if (!DRY) {
       const bad = [];
       for (const e of manifest.entries) {
         if (e.area === 'store' && isExcluded(e.rel)) continue;
+        if (e.area === 'store' && !EXACT && TASK_FILE.test(e.rel)) continue;   // step 6 may have merged run-times
         try { if (shaFile(destOf(e)) !== e.sha256) bad.push(`${e.area}:${e.rel}`); } catch { bad.push(`${e.area}:${e.rel}`); }
       }
       if (bad.length) { out.errors = bad; console.error(`rollback: ${bad.length} file(s) do not match the backup after restore: ${bad.slice(0, 5).join(', ')}`); }
@@ -357,7 +573,9 @@ function main() {
 
   if (JSON_OUT) console.log(JSON.stringify(out));
   else say(`${DRY ? 'dry run: would restore' : 'restored'} ${out.restored} file(s); kept ${out.kept}; excluded ${out.excluded} (left as they are); `
-    + `removed ${out.removed}; post-backup records put back ${out.postBackup}; whole-file areas restored ${out.global}.${out.snapshot ? `\nSnapshot of the state before: ${out.snapshot}` : ''}`);
+    + `removed ${out.removed}; post-backup records put back ${out.postBackup}; whole-file areas restored ${out.global}.`
+    + `${out.tasks ? ` Tasks: ${out.tasks.runtimeUpdated} run-time field(s) kept at their max, ${out.tasks.appended} added back, ${out.tasks.removedFiles} link-created file(s) removed.` : ''}`
+    + `${Object.keys(out.paths ?? {}).length ? ` Path-level areas: ${Object.entries(out.paths).map(([n, r]) => `${n} ${r.status}${r.paths ? ` (${r.paths} paths)` : ''}`).join(', ')}.` : ''}${out.snapshot ? `\nSnapshot of the state before: ${out.snapshot}` : ''}`);
   return out.errors.length ? 1 : 0;
 }
 

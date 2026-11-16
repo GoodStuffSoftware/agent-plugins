@@ -16,6 +16,8 @@ import { rectify } from '../lib/accounts/rectify.mjs';
 import { takeBackup, verifyBackup } from '../lib/accounts/backup.mjs';
 import { emptyState, saveState, resetMutations, loadState, readJson } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey } from '../lib/accounts/folders.mjs';
+import { link, fullPass } from '../lib/accounts/pass.mjs';
+import { putTasks, makeTask, readJsonFile } from './fixtures/store.mjs';
 import {
   makeRoot, makeClock, addFolder, putRecord, putTombstone, putSidecars, treeHashes, setMtime, inoOf, nlinkOf,
   recordId, recordName, uuid, tasksJson,
@@ -293,4 +295,164 @@ test('T17 rollback.mjs is standalone: node builtins only, run from the backup wi
   });
   assert.equal(res.status, 1, 'with the file copies missing it refuses, proving it reads only next to itself');
   rmSync(join(w.r.root, 'elsewhere'), { recursive: true, force: true });
+});
+
+/* ------------------------------------------------------------------ T17 (stage 2): tasks step 6, path-level areas */
+
+const P_SECRET = 'FAKE-SECRET-IN-MCP-ENV-NEVER-COPIED';
+
+function pworld() {
+  const r = makeRoot('rbp');
+  const clock = makeClock();
+  const sim = createSim({ clock, appFile: join(r.root, 'app.json') });
+  const a = uuid('a', 1); const b = uuid('b', 1);
+  const oa = uuid('1', 1); const ob = uuid('2', 2);
+  const fA = addFolder(r.store, a, oa);
+  const fB = addFolder(r.store, b, ob);
+  const group = [fA, fB];
+  for (let i = 1; i <= 3; i++) putRecord(fA.path, i, {}, clock.tick());
+  putRecord(fB.path, 4, {}, clock.tick());
+  putTasks(fA.path, [makeTask('tA', { cronExpression: '20 5 * * *' })], {}, clock.tick());
+  putTasks(fB.path, [makeTask('tB', { cronExpression: '40 6 * * *' })], {}, clock.tick());
+  const cfg = {
+    preferences: {
+      sidebarMode: 'code',
+      bypassPermissionsOptInByAccount: { [a]: true },
+      epitaxyPrefs: { [`epitaxy-auto-mode-denial-count.${a}`]: 4 },
+    },
+    mcpServers: { s: { command: 'node', env: { TOKEN: P_SECRET } } },
+    'oauth:tokenCache': `enc-${P_SECRET}`,
+  };
+  const rc = { version: 1, telemetrySalt: `salt-${P_SECRET}`, identities: { [`${oa}:${a}`]: { serve: 'on', folders: { 'C:\\x': { mode: 'a' } }, pendingDelete: ['q'] } } };
+  writeFileSync(join(r.userData, 'claude_desktop_config.json'), JSON.stringify(cfg, null, 2));
+  writeFileSync(join(r.userData, 'remote-control-state.json'), `${JSON.stringify(rc, null, 2)}\n`);
+  writeFileSync(join(r.userData, 'ccd-session-presets.json'), JSON.stringify({ byAccount: { [a]: { presets: [{ id: 'p1', name: 'P', createdAt: 1 }] } } }, null, '\t'));
+  writeFileSync(join(r.userData, 'mcp-user-tool-toggles.json'), JSON.stringify({ v: 3, owners: { [a]: ['x:y'] } }, null, 2));
+  writeFileSync(join(r.userData, 'config.json'), JSON.stringify({ lastKnownAccountUuid: a, 'oauth:tokenCache': P_SECRET }));
+  sim.setApp({ running: false });
+  const state = emptyState(r.store);
+  answerPairs(state, [pairKey(a, b)], 'yes', 'cli', clock.t);
+  saveState(r.ctx, state);
+  const file = (n) => join(r.userData, n);
+  return { r, ctx: r.ctx, clock, sim, fA, fB, group, a, b, file };
+}
+
+const rbRun = (w, id, args = []) => spawnSync(process.execPath, [join(w.ctx.acc, 'backup', id, 'rollback.mjs'), ...args], {
+  cwd: tmpdir(), windowsHide: true, encoding: 'utf8', env: { ...process.env },
+});
+
+test('T17 path-level areas and task run-times: rollback after a complete link', async () => {
+  const w = pworld();
+  const before = {
+    cfg: readFileSync(w.file('claude_desktop_config.json'), 'utf8'),
+    rc: readFileSync(w.file('remote-control-state.json'), 'utf8'),
+    presets: readFileSync(w.file('ccd-session-presets.json'), 'utf8'),
+    toggles: readFileSync(w.file('mcp-user-tool-toggles.json'), 'utf8'),
+    store: treeHashes(w.r.store, (rel) => !/scheduled-tasks\.json$|backlog/.test(rel)),
+  };
+  const rep = await link(w.ctx, {});
+  assert.equal(rep.ok, true, JSON.stringify(rep));
+  const linkedCfg = readFileSync(w.file('claude_desktop_config.json'), 'utf8');
+  assert.notEqual(linkedCfg, before.cfg, 'the link changed the settings');
+
+  // life after the link: B runs task tA, a task is created in B, the app changes an unrelated preference
+  w.sim.setApp({ running: true, signedIn: w.b, startedAtMs: w.clock.t });
+  w.sim.runTask(w.fB, 'tA', w.clock.tick());
+  const bf = join(w.fB.path, 'scheduled-tasks.json');
+  const bdoc = readJsonFile(bf);
+  bdoc.scheduledTasks.push(makeTask('tNew', { cronExpression: '5 7 * * *' }));
+  writeFileSync(bf, JSON.stringify(bdoc, null, 2));
+  w.sim.stopApp();
+  const cfgObj = readJsonFile(w.file('claude_desktop_config.json'));
+  cfgObj.preferences.sidebarMode = 'chat';
+  cfgObj.preferences.brandNew = 1;
+  writeFileSync(w.file('claude_desktop_config.json'), JSON.stringify(cfgObj, null, 2));
+  assert.equal((await fullPass(w.ctx, {})).ok, true);
+  assert.ok(readJsonFile(join(w.fA.path, 'scheduled-tasks.json')).scheduledTasks.some((t) => t.id === 'tNew'), 'the new task spread');
+  const ranAt = readJsonFile(join(w.fA.path, 'scheduled-tasks.json')).scheduledTasks.find((t) => t.id === 'tA').lastRunAt;
+  assert.ok(ranAt);
+
+  const res = rbRun(w, rep.backupId, ['--json']);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const out = JSON.parse(res.stdout.trim().split('\n').pop());
+  assert.equal(out.paths['claude_desktop_config.json'].status, 'restored');
+  assert.equal(out.paths['remote-control-state.json'].status === 'restored' || out.paths['remote-control-state.json'].status === 'unchanged', true);
+
+  // path-level: allow-listed values are back; every other key (including the app's own later change) stays
+  const cfg = readJsonFile(w.file('claude_desktop_config.json'));
+  assert.deepEqual(cfg.preferences.bypassPermissionsOptInByAccount, { [w.a]: true });
+  assert.equal(cfg.preferences.epitaxyPrefs[`epitaxy-auto-mode-denial-count.${w.b}`], undefined);
+  assert.equal(cfg.preferences.sidebarMode, 'chat');
+  assert.equal(cfg.preferences.brandNew, 1);
+  assert.equal(cfg.mcpServers.s.env.TOKEN, P_SECRET);
+  assert.equal(cfg['oauth:tokenCache'], `enc-${P_SECRET}`);
+  assert.equal(readFileSync(w.file('remote-control-state.json'), 'utf8'), before.rc);
+  // whole-file areas: byte for byte; the store (without tasks and backlog): byte for byte
+  assert.equal(readFileSync(w.file('ccd-session-presets.json'), 'utf8'), before.presets);
+  assert.equal(readFileSync(w.file('mcp-user-tool-toggles.json'), 'utf8'), before.toggles);
+  assert.deepEqual(treeHashes(w.r.store, (rel) => !/scheduled-tasks\.json$|backlog/.test(rel)), before.store);
+  // tasks: each file as at the backup, plus the run-time max and the task created after the backup in its origin
+  const ta = readJsonFile(join(w.fA.path, 'scheduled-tasks.json')).scheduledTasks;
+  assert.deepEqual(ta.map((t) => t.id), ['tA']);
+  assert.equal(ta[0].lastRunAt, ranAt, 'the run in B is not forgotten: tA does not fire twice');
+  const tb = readJsonFile(join(w.fB.path, 'scheduled-tasks.json')).scheduledTasks;
+  assert.deepEqual(tb.map((t) => t.id).sort(), ['tB', 'tNew']);
+  assert.equal(out.tasks.appended, 1);
+  assert.ok(out.tasks.runtimeUpdated >= 1);
+  // the state is unlinked; no secret in the snapshot or anywhere under the accounts folder
+  const st = loadState(w.ctx);
+  assert.equal(st.linked, false);
+  for (const f of walkFiles(w.ctx.acc)) assert.ok(!readFileSync(f, 'latin1').includes(P_SECRET), `no secret in ${f}`);
+  const snap = readdirSync(w.ctx.acc).find((d) => d.startsWith('pre-rollback-'));
+  assert.ok(existsSync(join(w.ctx.acc, snap, 'paths', 'claude_desktop_config.json')));
+});
+
+test('T17 --exact restores the task files byte for byte', async () => {
+  const w = pworld();
+  const t0 = ['A', 'B'].map((x) => readFileSync(join((x === 'A' ? w.fA : w.fB).path, 'scheduled-tasks.json'), 'utf8'));
+  const rep = await link(w.ctx, {});
+  assert.equal(rep.ok, true);
+  w.sim.setApp({ running: true, signedIn: w.b, startedAtMs: w.clock.t });
+  w.sim.runTask(w.fB, 'tA', w.clock.tick());
+  w.sim.stopApp();
+  assert.equal((await fullPass(w.ctx, {})).ok, true);
+  const res = rbRun(w, rep.backupId, ['--exact']);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  const t1 = ['A', 'B'].map((x) => readFileSync(join((x === 'A' ? w.fA : w.fB).path, 'scheduled-tasks.json'), 'utf8'));
+  assert.deepEqual(t1, t0);
+});
+
+test('T17 a path-level file that no longer round-trips is refused and left alone', async () => {
+  const w = pworld();
+  const rep = await link(w.ctx, {});
+  assert.equal(rep.ok, true);
+  const odd = `{"preferences":{"bypassPermissionsOptInByAccount":{"${w.a}":false,"${w.b}":true}},"mcpServers":{"s":{"env":{"TOKEN":"${P_SECRET}"}}}}`;
+  writeFileSync(w.file('claude_desktop_config.json'), odd);
+  const res = rbRun(w, rep.backupId, ['--json']);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(readFileSync(w.file('claude_desktop_config.json'), 'utf8'), odd);
+  const out = JSON.parse(res.stdout.trim().split('\n').pop());
+  assert.equal(out.paths['claude_desktop_config.json'].status, 'refused');
+  assert.ok(!res.stdout.includes(P_SECRET) && !res.stderr.includes(P_SECRET));
+});
+
+test('T17 an injected failure mid-link, at several points: rollback restores the store and settings exactly', async () => {
+  for (const n of [0, 1, 4, 8]) {
+    const w = pworld();
+    const before = {
+      store: treeHashes(w.r.store),
+      files: Object.fromEntries(['claude_desktop_config.json', 'remote-control-state.json', 'ccd-session-presets.json', 'mcp-user-tool-toggles.json'].map((f) => [f, readFileSync(w.file(f), 'utf8')])),
+    };
+    process.env.SESSION_SYNC_TEST_FAIL_AFTER = String(n);
+    resetMutations();
+    await assert.rejects(() => link(w.ctx, {}), /FAIL_AFTER/, `n=${n}`);
+    delete process.env.SESSION_SYNC_TEST_FAIL_AFTER; resetMutations();
+    const id = loadState(w.ctx).backupId;
+    if (!id) { assert.deepEqual(treeHashes(w.r.store), before.store, `n=${n}: failed before the backup: nothing changed`); rmSync(w.r.root, { recursive: true, force: true }); continue; }
+    const res = rbRun(w, id);
+    assert.equal(res.status, 0, `n=${n}: ${res.stdout}${res.stderr}`);
+    assert.deepEqual(treeHashes(w.r.store), before.store, `n=${n}: store restored byte for byte`);
+    for (const [f, text] of Object.entries(before.files)) assert.equal(readFileSync(w.file(f), 'utf8'), text, `n=${n}: ${f}`);
+    rmSync(w.r.root, { recursive: true, force: true });
+  }
 });
