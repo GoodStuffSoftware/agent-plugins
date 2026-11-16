@@ -124,3 +124,17 @@ test('SessionStart hook: a final go-live result is added to the context once, in
   const b = w.run(['auto-pull', '--from-hook']);
   assert.equal(b.stdout, '', 'reported once; the ask is also once a day');
 });
+
+test('hidden launch-detached (the helper the SessionStart hook starts) launches only the waiter or the go-live runner', () => {
+  const w = cworld();
+  const ok = run(w, ['accounts', 'launch-detached', 'accounts', 'wait', '--reason', 'link']);
+  assert.equal(ok.status, 0, ok.stderr);
+  const rn = run(w, ['accounts', 'launch-detached', 'accounts', 'golive-run']);
+  assert.equal(rn.status, 0, rn.stderr);
+  assert.deepEqual(launched(w), [['accounts', 'wait', '--reason', 'link'], ['accounts', 'golive-run']]);
+  const bad = run(w, ['accounts', 'launch-detached', 'push']);
+  assert.equal(bad.status, 1);
+  const bad2 = run(w, ['accounts', 'launch-detached', 'accounts', 'rollback']);
+  assert.equal(bad2.status, 1);
+  assert.equal(launched(w).length, 2, 'nothing else was launched');
+});

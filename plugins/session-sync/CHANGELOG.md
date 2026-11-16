@@ -4,13 +4,17 @@
 
 ### Features
 
-* **session-sync:** `accounts go-live` does the whole link in one command. It records your yes and starts one hidden background runner that survives quitting Claude. The runner waits for the app to stop, takes the backup, links, verifies that every folder holds every conversation, starts Claude again, waits for every desktop copy of session-sync to be able to link, runs a rectify pass and checks the remote for duplicates. A failed link or check rolls back by itself. Running the command again resumes an unfinished go-live.
+* **session-sync:** `accounts go-live` does the whole link in one command. It records your yes and starts one hidden background runner that survives quitting Claude. The runner waits for the app to stop, takes the backup, links, verifies that every folder holds every conversation, starts Claude again, waits for every copy of session-sync (the app's and the terminal install) to be able to link, runs a rectify pass and checks the remote for duplicates. A failed link or check rolls back by itself. Running the command again resumes an unfinished go-live.
 * **session-sync:** `--quit-app` has the runner ask Claude to quit a few seconds after it starts (macOS). On Windows and Linux the command says to quit from the tray icon or the app menu, and the runner waits. A synthetic Windows session-end message was tested on a throwaway Electron app: it ends the process about 100 ms after the event, before the app's own asynchronous shutdown can finish, so it is not used.
 * **session-sync:** the next SessionStart reports a finished go-live once (status, counts, anything that needs you, the log path), and says so while the runner is still working after the restart.
 * **session-sync:** `/session-sync:accounts` has the go-live steps for an agent and an after-go-live checklist (connectors, custom connector URLs, artifact shares, what to copy by hand, reading the other account from the terminal).
 
 ### Fixed
 
+* go-live checks the link only with the app stopped and after one full pass, so a good link is never rolled back because the app was reopened. The automatic rollback is exact when the app has not run since the link, is not retried once a finished rollback reports files that do not match, and then names those files and the snapshot.
+* go-live also judges the copy of session-sync that terminal sessions run (the install in ~/.claude/plugins). A stale one pauses push, and the report says how to update it.
+* The runner keeps its claim fresh with a timer, so a long step no longer lets a second runner start. A go-live that failed with push paused says so in the session report and in accounts status.
+* The SessionStart hook starts the waiter and a resumed runner through a small detached helper, so the hook itself never runs PowerShell.
 * The remote duplicate check treats a remote that was never pushed as 0 records and 0 duplicates, with a note. Only a real rclone error is reported as needing attention.
 
 ## 0.4.0 (2026-11-16)

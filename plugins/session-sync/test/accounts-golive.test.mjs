@@ -7,18 +7,20 @@
 
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, rmSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, rmSync, renameSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import {
   planGoLive, beginGoLive, runGoLive, resumeIfDead, takeGoLiveReport, goLiveInProgress, runnerAlive, readGoLive, readGoLiveResult,
-  goLiveFile, goLiveResultFile, goLiveLogFile, verifyLinked, expectedSet, readListing,
+  goLiveFile, goLiveResultFile, goLiveLogFile, verifyLinked, expectedSet, readListing, defaultRollback, copyWords,
 } from '../lib/accounts/golive.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations, accPath, rollbackMarkerFile } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey, listFolders } from '../lib/accounts/folders.mjs';
-import { copyCapability, desktopCopies, relaunchApp, resolveAumid } from '../lib/accounts/desktop.mjs';
-import { launchDetached, forwardedEnv, CLI_PATH } from '../lib/accounts/launcher.mjs';
+import { link, fullPass } from '../lib/accounts/pass.mjs';
+import { cliCopies, sessionSyncCopies, copyCapability, desktopCopies, relaunchApp, resolveAumid } from '../lib/accounts/desktop.mjs';
+import { launchDetached, launchViaHelper, forwardedEnv, CLI_PATH } from '../lib/accounts/launcher.mjs';
 import { collectStatus, formatStatus, formatGoLive } from '../lib/accounts/report.mjs';
 import { requestAppQuit, quitSupport } from '../lib/accounts/appquit.mjs';
 import { remoteRecordList } from '../lib/sync.mjs';
@@ -756,4 +758,305 @@ test('report: mid-run (after the restart, runner alive) says so once per phase; 
   putResult(w, { status: 'waiting', phase: 'wait-stop', resumable: true, id: 'gl-2' });
   assert.equal(takeGoLiveReport(w.ctx), null, 'while still waiting for the quit, the agent that started it knows');
   assert.equal(takeGoLiveReport(makeRoot('nores').ctx), null, 'no result file: nothing');
+});
+
+/* ------------------------------------------------------------------ go-live review fixes (B1, B2, S1 to S5) */
+
+/** The app saving a record (tmp + rename) breaks the hard link: that folder's copy gets a new inode. */
+function appSaves(folderPath, n) {
+  const p = join(folderPath, recordName(n));
+  const tmp = `${p}.app-tmp`;
+  writeFileSync(tmp, readFileSync(p));
+  renameSync(tmp, p);
+}
+
+test('B1 verify: a link made by another pass is NOT rolled back when the app ran since; the check waits for the stop and runs one pass first', async () => {
+  const w = world();
+  const { d: d0 } = deps(w);
+  start(w, d0);
+  const lk = await link(w.ctx, { reasons: ['waiter'] });         // the waiter links with the app stopped
+  assert.equal(lk.ok, true);
+  let flipped = false;
+  let rollbacks = 0;
+  let passes = 0;
+  let splitSeen = false;
+  const { d } = deps(w, {
+    onPhase: (p) => { if (p === 'verify' && !flipped) { flipped = true; w.setApp(true); appSaves(w.fB.path, 1); splitSeen = verifyLinked(w.ctx, readGoLive(w.ctx).expected, 2).problems.some((x) => /split/.test(x)); } },   // the user reopens the app and it saves
+    onSleep: () => { if (flipped) w.setApp(false); },
+    rollback: async () => { rollbacks++; return { ok: true }; },
+    fullPass: async (ctx, o) => { passes++; return fullPass(ctx, o); },
+  });
+  const out = await runGoLive(w.ctx, d);
+  assert.deepEqual(out, { exit: 'done', status: 'ok' });
+  assert.equal(splitSeen, true, 'the app save really split the record before the pass');
+  assert.equal(rollbacks, 0, 'a good link is never rolled back because the app was reopened');
+  assert.equal(passes >= 1, true, 'one full pass ran before the check');
+  assert.equal(loadState(w.ctx).linked, true);
+  assert.equal(readGoLive(w.ctx).appSeenSinceLink, true);
+  assert.match(res(w).messages.join('\n'), /the check waits until it has stopped/);
+  assert.deepEqual(verifyLinked(w.ctx, readGoLive(w.ctx).expected, 2).problems, []);
+});
+
+test('B1 verify: a resume at verify with the app running waits instead of rolling back; a timeout leaves the link and a resumable failure', async () => {
+  const w = world();
+  const { d: d0 } = deps(w, { haltAfter: 'link' });
+  start(w, d0);
+  await runGoLive(w.ctx, d0);                                    // linked by this runner, halted before verify
+  w.setApp(true);
+  appSaves(w.fA.path, 2);
+  let rollbacks = 0;
+  const { d } = deps(w, { timeouts: { stopMs: 2000 }, rollback: async () => { rollbacks++; return { ok: true }; } });
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'failed');
+  assert.equal(rollbacks, 0);
+  assert.equal(res(w).resumable, true);
+  assert.equal(loadState(w.ctx).linked, true, 'the link stays');
+  assert.match(res(w).messages.join('\n'), /was not rolled back/);
+  // the user quits; the resume heals the split with one pass and finishes
+  w.setApp(false);
+  const { d: d2 } = deps(w, { rollback: async () => { rollbacks++; return { ok: true }; } });
+  assert.deepEqual(await runGoLive(w.ctx, d2), { exit: 'done', status: 'ok' });
+  assert.equal(rollbacks, 0);
+});
+
+test('B2 copies: the terminal install is judged too (installed_plugins.json), a stale one pauses push, a capable one does not', () => {
+  const w = world({ copies: [{ capable: true }] });
+  const home = join(w.r.root, 'home');
+  const cacheRoot = (v) => join(home, '.claude', 'plugins', 'cache', 'goodstuff', 'session-sync', v);
+  const writeCopy = (v, capable) => {
+    const root = cacheRoot(v);
+    mkdirSync(join(root, '.claude-plugin'), { recursive: true });
+    mkdirSync(join(root, 'lib', 'accounts'), { recursive: true });
+    writeFileSync(join(root, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'session-sync', version: v }));
+    if (capable) {
+      for (const f of ['pass', 'waiter', 'folders']) writeFileSync(join(root, 'lib', 'accounts', `${f}.mjs`), '// x');
+      writeFileSync(join(root, 'lib', 'sync.mjs'), 'export function accountsPushFilter() {}');
+    } else writeFileSync(join(root, 'lib', 'sync.mjs'), 'export function push() {}');
+    return root;
+  };
+  const oldRoot = writeCopy('0.3.0', false);
+  const newRoot = writeCopy('0.5.0', true);
+  const installed = (p) => writeFileSync(join(home, '.claude', 'plugins', 'installed_plugins.json'), JSON.stringify({ version: 2, plugins: { 'session-sync@goodstuff': [{ scope: 'user', installPath: p, version: '0.3.0' }], 'other@goodstuff': [{ installPath: '/nope' }] } }));
+  // the installed copy is the old one: stale, even though a newer one sits in the cache
+  installed(oldRoot);
+  let cli = cliCopies(w.ctx, { home });
+  assert.equal(cli.length, 1);
+  assert.equal(cli[0].kind, 'cli');
+  assert.equal(cli[0].marketplace, 'goodstuff');
+  assert.equal(cli[0].capable, false);
+  const all = sessionSyncCopies(w.ctx, { home });
+  assert.deepEqual(all.map((c) => c.kind).sort(), ['cli', 'desktop']);
+  const plan = planGoLive(w.ctx, { copies: (c) => sessionSyncCopies(c, { home }) });
+  assert.equal(plan.stale.length, 1);
+  assert.equal(plan.stale[0].kind, 'cli');
+  assert.match(copyWords(plan.stale), /1 installed terminal copy/);
+  const gl = beginGoLive(w.ctx, plan, {}, { getPush: () => true, setPush: () => {} });
+  assert.equal(gl.pausedPush, true, 'push is paused for a stale terminal copy');
+  // the installed copy is the new one: capable
+  installed(newRoot);
+  assert.equal(cliCopies(w.ctx, { home })[0].capable, true);
+  // no install list: the newest cached version is the one judged
+  rmSync(join(home, '.claude', 'plugins', 'installed_plugins.json'));
+  cli = cliCopies(w.ctx, { home });
+  assert.equal(cli.length, 1);
+  assert.equal(cli[0].version, '0.5.0');
+  // nothing installed from the terminal: nothing to judge
+  assert.deepEqual(cliCopies(w.ctx, { home: join(w.r.root, 'empty') }), []);
+});
+
+test('B2 runner: a stale terminal copy keeps push paused (not waited for) and says how to update it; once updated push comes back', async () => {
+  const w = world();
+  const stale = { path: '/cli', version: '0.3.0', kind: 'cli', marketplace: 'goodstuff', capable: false };
+  let copies = [stale];
+  const { d, calls } = deps(w, { copies: () => copies, timeouts: { capabilityMs: 1000000 } });
+  start(w, d);
+  assert.deepEqual(calls.push, [false], 'paused at the start');
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'attention');
+  assert.deepEqual(calls.push, [false]);
+  assert.match(res(w).messages.join('\n'), /Push stays PAUSED: 1 installed terminal copy\(ies\)/);
+  assert.match(res(w).messages.join('\n'), /claude plugin update session-sync@goodstuff --scope user/);
+  assert.equal(calls.phases.filter((p) => p === 'wait-capability').length, 1);
+  // a second world: the copy is updated before the capability check
+  const w2 = world();
+  copies = [{ ...stale }];
+  const { d: d2, calls: c2 } = deps(w2, { copies: () => copies, onPhase: (p) => { if (p === 'wait-capability') copies = [{ ...stale, version: '0.5.0', capable: true }]; } });
+  start(w2, d2);
+  assert.equal((await runGoLive(w2.ctx, d2)).status, 'ok');
+  assert.deepEqual(c2.push, [false, true]);
+});
+
+test('S1 heartbeat: a timer keeps the claim fresh while a step awaits, and a runner never writes over another holder\'s claim', async () => {
+  const w = world();
+  const claim = join(w.acc, 'go-live.claim');
+  let seen = null;
+  const { d } = deps(w, {
+    heartbeatMs: 10,
+    onPhase: async (p) => {
+      if (p !== 'relaunch') return;
+      const t0 = w.ctx.now();
+      w.ctx.setNow(t0 + 600000);
+      await new Promise((r) => setTimeout(r, 80));                // an awaiting step: only the timer can beat
+      seen = readJson(claim).beatAt;
+      assert.equal(seen, t0 + 600000, 'the timer beat during the await');
+      // another process took the claim over: the old runner must leave it alone
+      writeFileSync(claim, JSON.stringify({ pid: process.ppid, at: 1, beatAt: 5 }));
+      await new Promise((r) => setTimeout(r, 80));
+      assert.deepEqual(readJson(claim), { pid: process.ppid, at: 1, beatAt: 5 });
+    },
+  });
+  start(w, d);
+  assert.equal((await runGoLive(w.ctx, d)).status, 'ok');
+  assert.equal(readJson(claim).pid, process.ppid, 'releaseClaim does not delete a claim that is not ours either');
+  assert.ok(seen);
+});
+
+test('S1 rollback: the real rollback is an async child (the heartbeat keeps beating), parses --json, and passes --exact', async () => {
+  const w = world();
+  const st = loadState(w.ctx); st.backupId = 'bk1'; saveState(w.ctx, st);
+  const seen = [];
+  const fake = (stdout, code) => (cmd, argv, o) => {
+    seen.push({ argv, o });
+    const c = new EventEmitter(); c.stdout = new EventEmitter(); c.stderr = new EventEmitter(); c.kill = () => {};
+    setTimeout(() => { c.stdout.emit('data', stdout); c.emit('close', code); }, 5);
+    return c;
+  };
+  const p = defaultRollback(w.ctx, { exact: true, spawnFn: fake('', 0) });
+  assert.equal(typeof p.then, 'function', 'async: nothing blocks the event loop');
+  assert.deepEqual(await p, { ok: true, code: 0, errors: undefined, snapshot: undefined });
+  assert.ok(seen[0].argv.includes('--exact') && seen[0].argv.includes('--json'));
+  assert.equal(seen[0].o.windowsHide, true);
+  const bad = await defaultRollback(w.ctx, { spawnFn: fake(`${JSON.stringify({ errors: ['store:a.json'], snapshot: '/snap' })}\n`, 1) });
+  assert.deepEqual(bad, { ok: false, code: 1, errors: ['store:a.json'], snapshot: '/snap' });
+  assert.equal(seen[1].argv.includes('--exact'), false);
+  const none = await defaultRollback(makeRoot('nobk').ctx);
+  assert.deepEqual(none, { ok: false, error: 'no backup' });
+});
+
+test('S2 rollback is --exact when the app has not run since the link, and not exact once it has been seen', async () => {
+  // damage right after our own link, app never seen: exact
+  const a = world();
+  let optsA = null;
+  const { d: da } = deps(a, {
+    afterLink: async () => { unlinkSync(join(a.fB.path, recordName(1))); },
+    rollback: async (ctx, o) => { optsA = o; return defaultRollback(ctx, o); },
+  });
+  start(a, da);
+  assert.equal((await runGoLive(a.ctx, da)).status, 'rolled_back');
+  assert.deepEqual(optsA, { exact: true });
+  // linked by another pass (the app may have run): not exact
+  const b = world();
+  let optsB = null;
+  const { d: db0 } = deps(b);
+  start(b, db0);
+  assert.equal((await link(b.ctx, { reasons: ['waiter'] })).ok, true);
+  unlinkSync(join(b.fB.path, recordName(1)));
+  const { d: db } = deps(b, {
+    fullPass: async () => ({ ok: true }),                         // a pass that cannot heal it
+    rollback: async (ctx, o) => { optsB = o; return defaultRollback(ctx, o); },
+  });
+  assert.equal((await runGoLive(b.ctx, db)).status, 'rolled_back');
+  assert.deepEqual(optsB, { exact: false });
+});
+
+test('S3 rollback: a finished rollback that does not match the backup is not retried and names the files and the snapshot', async () => {
+  const w = world();
+  let tries = 0;
+  const { d } = deps(w, {
+    afterLink: async () => { unlinkSync(join(w.fB.path, recordName(1))); },
+    rollback: async () => {
+      tries++;
+      const st = loadState(w.ctx); st.backupId = null; saveState(w.ctx, st);   // what the script does at its end
+      return { ok: false, code: 1, errors: ['store:a/b/local_x.json', 'store:c.json'], snapshot: '/snap/pre-rollback-1' };
+    },
+  });
+  start(w, d);
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'failed');
+  assert.equal(tries, 1, 'no pointless retries');
+  const m = res(w).messages.join('\n');
+  assert.match(m, /2 file\(s\) do not match the backup/);
+  assert.match(m, /store:a\/b\/local_x\.json/);
+  assert.match(m, /\/snap\/pre-rollback-1/);
+  assert.doesNotMatch(m, /run: accounts rollback/);
+});
+
+test('S3 rollback: a refused or part-way run keeps its state and is retried', async () => {
+  const w = world();
+  let tries = 0;
+  const { d } = deps(w, {
+    afterLink: async () => { unlinkSync(join(w.fB.path, recordName(1))); },
+    rollback: async (ctx, o) => { tries++; if (tries < 3) return { ok: false, code: tries === 1 ? 3 : 1 }; return defaultRollback(ctx, o); },
+  });
+  start(w, d);
+  assert.equal((await runGoLive(w.ctx, d)).status, 'rolled_back');
+  assert.equal(tries, 3);
+});
+
+test('S4 push paused: a failed or waiting go-live says push is paused by go-live, in the report and in status', async () => {
+  const w = world({ copies: [{ capable: false }] });
+  w.setApp(true);
+  const { d } = deps(w, { timeouts: { stopMs: 2000 } });
+  start(w, d);
+  assert.match(formatGoLive(res(w)), /Push is paused by go-live/, 'already while it waits');
+  assert.equal((await runGoLive(w.ctx, d)).status, 'failed');
+  const r = res(w);
+  assert.equal(r.push.pausedByGoLive, true);
+  assert.equal(r.push.reEnabled, false);
+  assert.match(formatGoLive(r), /Push is paused by go-live and stays off/);
+  assert.match(takeGoLiveReport(w.ctx), /Push is paused by go-live[\s\S]*Log:/);
+  // a finished go-live that switched push back on does not say it
+  const ok = world();
+  const { d: dok } = deps(ok);
+  start(ok, dok);
+  await runGoLive(ok.ctx, dok);
+  assert.doesNotMatch(formatGoLive(res(ok)), /paused/);
+});
+
+test('nit: remote duplicates leave the result saying push is paused, not re-enabled', async () => {
+  const w = world({ copies: [{ capable: false }] });
+  const { d } = deps(w, { remoteCheck: async () => ({ checked: true, ids: 3, duplicates: 1 }), onSleep: () => { w.made[0].makeCapable(); } });
+  start(w, d);
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'attention');
+  assert.equal(res(w).push.reEnabled, false);
+  assert.equal(res(w).push.pausedByGoLive, true);
+});
+
+test('nit: beginning a go-live sweeps the report markers of earlier go-lives', () => {
+  const w = world();
+  writeFileSync(join(w.acc, 'go-live-reported-gl-1-ok'), '');
+  writeFileSync(join(w.acc, 'go-live-reported-gl-1-mid-rectify'), '');
+  const { d } = deps(w);
+  const gl = start(w, d);
+  assert.deepEqual(readdirSyncSafe(w.acc).filter((n) => n.startsWith('go-live-reported-')), []);
+  assert.ok(gl.id);
+});
+
+test('nit: a quit request that times out means the quit is under way, not that it failed', async () => {
+  const q = await requestAppQuit({ platform: 'darwin', env: {}, spawnSyncFn: () => ({ error: Object.assign(new Error('spawnSync osascript ETIMEDOUT'), { code: 'ETIMEDOUT' }) }) });
+  assert.deepEqual(q, { supported: true, requested: true, slow: true });
+});
+
+test('S5 hook launch: the helper is a tiny detached hidden node, never PowerShell; the log seam records the request directly', () => {
+  const calls = [];
+  const spawnFn = (cmd, argv, o) => { calls.push({ cmd, argv, o }); return { pid: 31, on() {}, unref() {} }; };
+  const spawnSyncFn = () => assert.fail('the hook must not run a synchronous child (no PowerShell)');
+  const r = launchViaHelper(['accounts', 'wait', '--reason', 'link'], { platform: 'win32', env: {}, spawnFn, spawnSyncFn, execPath: '/node', cli: '/x/cli.mjs' });
+  assert.equal(r.ok, true);
+  assert.equal(r.method, 'helper');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, '/node');
+  assert.deepEqual(calls[0].argv, ['/x/cli.mjs', 'accounts', 'launch-detached', 'accounts', 'wait', '--reason', 'link']);
+  assert.equal(calls[0].o.detached, true);
+  assert.equal(calls[0].o.windowsHide, true);
+  assert.equal(calls[0].o.stdio, 'ignore');
+  const bad = launchViaHelper(['accounts', 'wait'], { env: {}, spawnFn: () => { throw new Error('boom'); } });
+  assert.equal(bad.ok, false);
+  const log = join(tmpdir(), `ss-helper-${process.pid}-${Date.now()}.log`);
+  try {
+    const seam = launchViaHelper(['accounts', 'golive-run'], { env: { SESSION_SYNC_TEST_LAUNCH_LOG: log }, spawnFn: () => assert.fail('no') });
+    assert.equal(seam.method, 'test-log');
+    assert.deepEqual(JSON.parse(readFileSync(log, 'utf8').trim()), { args: ['accounts', 'golive-run'] });
+  } finally { rmSync(log, { force: true }); }
 });
