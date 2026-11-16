@@ -79,6 +79,14 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config accountLink off    # ask (defaul
 
 `ask` asks once per account pair, `auto` links without asking, `off` never asks and never touches the per-account folders. The environment variable `CLAUDE_PLUGIN_OPTION_ACCOUNTLINK` overrides the file.
 
+### The whole go-live in one command
+
+```bash
+node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts go-live [--yes] [--no-relaunch] [--json]
+```
+
+It asks once (`--yes` skips the question), records the answer, then starts ONE hidden background runner that survives quitting Claude and archiving or switching the session. The runner waits for Claude to be fully stopped (up to 30 minutes; quit it from the tray icon or the app menu), takes the backup, links, verifies that every folder holds every conversation (0 split, 0 missing), starts Claude again (`--no-relaunch` leaves that to the user), waits for every desktop copy of session-sync to be able to link, runs a rectify pass and checks the remote for duplicates. A link or verify failure rolls back by itself. If a desktop copy cannot filter mirrored records yet, push is paused and switched back on once every copy can. Follow it with `accounts status` (the `Go-live:` line) or read `go-live-result.json` and `go-live.log` in the accounts folder; running the command again resumes an unfinished go-live.
+
 ## 4. Undo: unlink
 
 ```bash
