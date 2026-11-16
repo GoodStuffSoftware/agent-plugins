@@ -13,6 +13,7 @@ import {
   renameSync, copyFileSync, unlinkSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { STATE_DIR } from '../config.mjs';
 import { sessionStores } from '../paths.mjs';
 import { acquireLock } from '../lock.mjs';
@@ -77,6 +78,43 @@ export function writeJsonAtomic(file, obj, fmt = {}) {
   try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
   if (existsSync(file)) { try { copyFileSync(file, `${file}.bak`); } catch { /* a missing .bak is not fatal */ } }
   try { renameRetry(tmp, file); } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
+}
+
+/* ---- formatted JSON text (guarded edits keep the file's own style) ---- */
+
+/** Detect BOM, EOL, indent (tab, N spaces, or 0 = compact) and trailing newline of a JSON text. */
+export function detectFormat(text) {
+  const bom = text.charCodeAt(0) === 0xFEFF;
+  const t = bom ? text.slice(1) : text;
+  const eol = t.includes('\r\n') ? '\r\n' : '\n';
+  const trailingNewline = /\r?\n$/.test(t);
+  let indent = 0;
+  for (const line of t.split(/\r?\n/)) {
+    const m = /^(\t+| +)\S/.exec(line);
+    if (m) { indent = m[1][0] === '\t' ? '\t' : m[1].length; break; }
+  }
+  return { bom, eol, trailingNewline, indent };
+}
+
+export function serializeJson(obj, fmt = {}) {
+  const { indent = 2, eol = '\n', trailingNewline = false, bom = false } = fmt;
+  let text = JSON.stringify(obj, null, indent);
+  if (eol !== '\n') text = text.replace(/\n/g, eol);
+  if (trailingNewline) text += eol;
+  return bom ? '﻿' + text : text;
+}
+
+/**
+ * Atomic text write with NO .bak (global files may hold secrets; a copy next to
+ * them would be one more place for them to sit). The temp name matches OURTMP:
+ * not a record name, not *.json.tmp, excluded from push, cleaned up after 1 h.
+ */
+export function writeTextAtomic(file, text, { guard } = {}) {
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = join(dirname(file), `.session-sync-link-${randomBytes(6).toString('hex')}`);
+  const fd = openSync(tmp, 'wx');
+  try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+  try { guard?.(); renameRetry(tmp, file); } catch (e) { try { unlinkSync(tmp); } catch { /* ignore */ } throw e; }
 }
 
 export function loadState(ctx) {
