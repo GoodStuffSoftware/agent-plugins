@@ -8,11 +8,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { accountLists } from '../lib/accounts/lists.mjs';
+import { accountLists, taskIsDue } from '../lib/accounts/lists.mjs';
 import { collectStatus, formatStatus } from '../lib/accounts/report.mjs';
 import { listFolders, answerPairs, pairKey } from '../lib/accounts/folders.mjs';
 import { emptyState, saveState } from '../lib/accounts/state.mjs';
-import { makeRoot, makeClock, addFolder, putRecord, uuid } from './fixtures/store.mjs';
+import { makeRoot, makeClock, addFolder, putRecord, putTasks, makeTask, uuid } from './fixtures/store.mjs';
 
 const A = uuid('a', 1); const B = uuid('b', 1);
 const OA = uuid('1', 1); const OB = uuid('2', 2);
@@ -120,4 +120,34 @@ test('T23 status text: counts and a short list, the secrets stay out, --all lift
   assert.match(capped, /newest 20/);
   assert.doesNotMatch(capped, /artifacts\/n25/);
   assert.match(formatStatus({ ...st, lists: many }, { all: true }).join('\n'), /artifacts\/n25/);
+});
+
+test('T23 tasks due: the missed-run rule (cron slot after the last run, floor, 7 days; one-shot) and the status line', () => {
+  const now = 1_800_000_500_000;
+  const hourAgo = new Date(now - 3600_000);
+  const dailyAtHourAgo = `${hourAgo.getMinutes()} ${hourAgo.getHours()} * * *`;   // fires in local time, like the app
+  const iso = (ms) => new Date(ms).toISOString();
+  assert.equal(taskIsDue(makeTask('a', { cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 2 * 86400000) }), now), true, 'slot an hour ago, last run two days ago');
+  assert.equal(taskIsDue(makeTask('b', { cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 1800_000) }), now), false, 'ran after the slot');
+  assert.equal(taskIsDue(makeTask('c', { cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 2 * 86400000), missedRunScanFloor: iso(now - 600_000) }), now), false, 'the floor is after the slot');
+  assert.equal(taskIsDue(makeTask('d', { cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 30 * 86400000) }), now), true, 'older than 7 days still catches up the latest slot once');
+  assert.equal(taskIsDue(makeTask('e', { cronExpression: dailyAtHourAgo, enabled: false }), now), false, 'disabled');
+  assert.equal(taskIsDue(makeTask('f', { cronExpression: 'not a cron' }), now), false, 'unparseable');
+  assert.equal(taskIsDue(makeTask('g', { cronExpression: '*/5 * * * *', createdAt: now - 3600_000 }), now), true, 'step field');
+  const once = { cronExpression: undefined, fireAt: iso(now - 1000) };
+  assert.equal(taskIsDue(makeTask('h', once), now), true, 'one-shot never run');
+  assert.equal(taskIsDue(makeTask('i', { ...once, lastRunAt: iso(now - 500) }), now), false, 'one-shot already ran');
+  assert.equal(taskIsDue(makeTask('j', { cronExpression: undefined, fireAt: iso(now + 100_000) }), now), false, 'one-shot in the future');
+
+  const w = world();
+  const [fA, fB] = w.folders;
+  // A holds a daily task that B's older copy lacks the run-time of: the max run-time applies, so it is not due.
+  putTasks(fA.path, [makeTask('daily', { displayName: 'Morning report', cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 600_000) }), makeTask('shot', { displayName: 'Reminder\u0007', cronExpression: undefined, fireAt: iso(now - 1000) })]);
+  putTasks(fB.path, [makeTask('daily', { displayName: 'Morning report', cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 3 * 86400000) }), makeTask('late', { displayName: 'Late job', cronExpression: dailyAtHourAgo, lastRunAt: iso(now - 2 * 86400000) })]);
+  w.ctx.setNow(now);
+  const st = collectStatus(w.ctx, { probe: false });
+  assert.deepEqual(st.tasksDue, { count: 2, names: ['Late job', 'Reminder'] });
+  const text = formatStatus(st).join('\n');
+  assert.match(text, /Tasks due a catch-up run when the app next loads: 2 - Late job; Reminder\./);
+  assert.doesNotMatch(text, /\u0007/);
 });

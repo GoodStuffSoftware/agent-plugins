@@ -16,7 +16,7 @@ import { listFolders, groupOf, accountsOf, pendingPairs, RECORD } from './folder
 import { appState } from './appstate.mjs';
 import { owedWork } from './pass.mjs';
 import { waiterStatus } from './waiter.mjs';
-import { accountLists } from './lists.mjs';
+import { accountLists, tasksDueCatchUp } from './lists.mjs';
 import { unknownAccountKeys, CFG as DESKTOP_CONFIG } from './settings.mjs';
 
 const id8 = (s) => (s ? String(s).slice(0, 8) : null);
@@ -140,6 +140,9 @@ export function collectStatus(ctx, o = {}) {
     const cfg = readJson(join(ctx.userData, DESKTOP_CONFIG), null);
     if (cfg) { try { unknown = unknownAccountKeys(cfg, group); } catch { /* unreadable settings: none */ } }
   }
+  // tasks due a catch-up: the linked group's files, or (before an answer) what a yes would combine
+  const dueScope = group.length >= 2 ? group : pendingPairs(state, accts).length ? folders : [];
+  const tasksDue = dueScope.length ? tasksDueCatchUp(dueScope, ctx.now()) : null;
   const dups = remoteList?.ids ? Object.entries(remoteList.ids).filter(([, k]) => k.length > 1).length : null;
   return {
     accounts: accts.map((a) => ({ id: id8(a), signedIn: a === app.signedIn, folders: folders.filter((f) => f.acct === a).length })),
@@ -157,6 +160,7 @@ export function collectStatus(ctx, o = {}) {
     backupId: state.backupId ?? null,
     remote: remoteList ? { checkedAt: remoteList.at ?? null, ids: Object.keys(remoteList.ids ?? {}).length, duplicates: dups } : null,
     lists,
+    tasksDue,
     unknownKeys: unknown,
   };
 }
@@ -175,6 +179,10 @@ export function formatStatus(st, { all = false } = {}) {
   if (st.lastPass) out.push(`Last pass: ${st.lastPass.op} ${st.lastPass.ok ? 'ok' : `failed (${st.lastPass.reason ?? st.lastPass.error ?? 'unknown'})`} at ${st.lastPass.at}.`);
   out.push(`Remote duplicates: ${st.remote ? `${st.remote.duplicates} (checked ${st.remote.checkedAt})` : 'not checked (run: accounts status --remote)'}.`);
   if (st.unknownKeys.length) out.push(`Unknown per-account settings keys (not synced): ${st.unknownKeys.length}.`);
+  if (st.tasksDue) {
+    const t = st.tasksDue;
+    out.push(`Tasks due a catch-up run when the app next loads: ${t.count}${t.names.length ? ` - ${t.names.join('; ')}${t.count > t.names.length ? `; and ${t.count - t.names.length} more` : ''}` : ''}.`);
+  }
   for (const v of st.lists.views) {
     const tag = st.lists.views.length > 1 ? ` for ${v.account}` : '';
     const cl = all ? v.connectorsMissing : v.connectorsMissing.slice(0, 10);

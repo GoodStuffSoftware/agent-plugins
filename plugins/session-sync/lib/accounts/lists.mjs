@@ -12,6 +12,8 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { RECORD, homeOf } from './folders.mjs';
+import { toMs } from './merge3.mjs';
+import { RUNTIME } from './tasks.mjs';
 
 const CTRL = /[\u0000-\u001f\u007f-\u009f]/g;
 const clean = (s, max) => String(s ?? '').replace(CTRL, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
@@ -157,3 +159,73 @@ export function accountLists(ctx, folders, state, { signedIn = null, remoteList 
 export const connectorsMissing = (ctx, folders, state, o) => accountLists(ctx, folders, state, o).views.map((v) => ({ account: v.account, items: v.connectorsMissing }));
 export const artifactsFromOthers = (ctx, folders, state, o) => accountLists(ctx, folders, state, o).views.map((v) => ({ account: v.account, items: v.artifactsFromOthers }));
 export const pluginsMissing = (ctx, folders, state, o) => accountLists(ctx, folders, state, o).views.map((v) => ({ account: v.account, items: v.pluginsMissing }));
+
+/* ------------------------------------------------------------------ tasks due a catch-up */
+
+/** One cron field ("*", "n", "a-b", step forms, comma lists) as a predicate, or null when unparseable. */
+function cronField(text, lo, hi) {
+  const tests = [];
+  for (const part of String(text).split(',')) {
+    const m = /^(?:\*|(\d+)(?:-(\d+))?)(?:\/(\d+))?$/.exec(part);
+    if (!m) return null;
+    const step = m[3] ? Number(m[3]) : 1;
+    if (!step) return null;
+    const from = m[1] === undefined ? lo : Number(m[1]);
+    const to = m[1] === undefined ? hi : m[2] !== undefined ? Number(m[2]) : m[3] ? hi : from;
+    tests.push((v) => v >= from && v <= to && (v - from) % step === 0);
+  }
+  return (v) => tests.some((t) => t(v));
+}
+
+/** A matcher for a 5-field cron expression in LOCAL time (the app fires in local time), or null. */
+function cronMatcher(expr) {
+  const f = String(expr ?? '').trim().split(/\s+/);
+  if (f.length !== 5) return null;
+  const [mi, h, dom, mo, dow] = [cronField(f[0], 0, 59), cronField(f[1], 0, 23), cronField(f[2], 1, 31), cronField(f[3], 1, 12), cronField(f[4], 0, 7)];
+  if (![mi, h, dom, mo, dow].every(Boolean)) return null;
+  const anyStar = f[2] === '*' || f[4] === '*';
+  return (d) => {
+    if (!mi(d.getMinutes()) || !h(d.getHours()) || !mo(d.getMonth() + 1)) return false;
+    const dm = dom(d.getDate());
+    const dw = dow(d.getDay()) || (d.getDay() === 0 && dow(7));
+    return anyStar ? dm && dw : dm || dw;
+  };
+}
+
+/**
+ * The app's missed-run rule: a cron task fires once for the latest slot after
+ * max(lastScheduledFor ?? lastRunAt ?? createdAt, missedRunScanFloor, now - 7 days); a one-shot
+ * fires when `enabled && !lastRunAt && fireAt <= now`.
+ */
+export function taskIsDue(t, now) {
+  if (!t || t.enabled !== true) return false;
+  if (t.fireAt !== undefined && t.fireAt !== null) return !t.lastRunAt && toMs(t.fireAt) <= now;
+  const match = cronMatcher(t.cronExpression);
+  if (!match) return false;
+  const after = Math.max(toMs(t.lastScheduledFor ?? t.lastRunAt ?? t.createdAt), toMs(t.missedRunScanFloor), now - 7 * 86400000);
+  const floor = Number.isFinite(after) ? after : now - 7 * 86400000;
+  for (let at = Math.floor(now / 60000) * 60000; at > floor; at -= 60000) if (match(new Date(at))) return true;
+  return false;
+}
+
+/**
+ * Tasks that will catch up once when the signed-in account next loads its task file. The files
+ * of `folders` are combined by id with each run-time at its newest (what a full pass writes), so
+ * this also answers "what would the first link make the app run". Names only, control characters
+ * stripped. Unreadable files are skipped.
+ */
+export function tasksDueCatchUp(folders, now) {
+  const merged = new Map();
+  for (const f of folders) {
+    let doc = null;
+    try { doc = JSON.parse(readFileSync(join(f.path, 'scheduled-tasks.json'), 'utf8')); } catch { continue; }
+    for (const t of Array.isArray(doc?.scheduledTasks) ? doc.scheduledTasks : []) {
+      if (!t || typeof t !== 'object' || typeof t.id !== 'string') continue;
+      const prev = merged.get(t.id);
+      if (!prev) { merged.set(t.id, { ...t }); continue; }
+      for (const k of RUNTIME) if (toMs(t[k]) > toMs(prev[k])) prev[k] = t[k];
+    }
+  }
+  const due = [...merged.values()].filter((t) => taskIsDue(t, now)).map((t) => clean(t.displayName ?? t.id, 60)).sort();
+  return { count: due.length, names: due.slice(0, 10) };
+}
