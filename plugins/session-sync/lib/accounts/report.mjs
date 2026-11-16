@@ -11,7 +11,7 @@
 
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadState, accPath, readJson } from './state.mjs';
+import { loadState, accPath, readJson, rollbackActive } from './state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, RECORD } from './folders.mjs';
 import { appState } from './appstate.mjs';
 import { owedWork } from './pass.mjs';
@@ -28,6 +28,7 @@ export const REASON_TEXT = {
   'not-linked': 'the accounts are not linked',
   locked: 'another account pass is running',
   'pull-active': 'a pull is running',
+  'rollback-active': 'a rollback is running or was interrupted (run: accounts rollback again to finish it)',
 };
 
 /* ------------------------------------------------------------------ pass reports */
@@ -158,6 +159,7 @@ export function collectStatus(ctx, o = {}) {
     lastFullPass: state.lastFullPass ?? null, lastRectify: state.lastRectify ?? null,
     lastPass: readJson(accPath(ctx, 'last-pass.json'), null),
     backupId: state.backupId ?? null,
+    rollbackActive: rollbackActive(ctx),
     remote: remoteList ? { checkedAt: remoteList.at ?? null, ids: Object.keys(remoteList.ids ?? {}).length, duplicates: dups } : null,
     lists,
     tasksDue,
@@ -176,6 +178,7 @@ export function formatStatus(st, { all = false } = {}) {
   if (st.health) out.push(`Conversations: ${st.health.ids}; ${st.health.split} split; ${st.health.missing} missing a name.`);
   out.push(`App: ${st.app.running ? 'running' : st.app.stopped ? 'stopped' : 'unknown'}${st.app.signedIn ? `, signed in ${st.app.signedIn}` : ''}. Owed: ${st.owed ? 'yes' : 'no'}.`);
   out.push(`Waiter: ${st.waiter.alive ? `armed (pid ${st.waiter.pid}; ${st.waiter.reasons.join(', ') || 'no reason'})` : 'none'}.`);
+  if (st.rollbackActive) out.push('A rollback is running or was interrupted: no pass runs until it finishes (run: accounts rollback again).');
   if (st.lastPass) out.push(`Last pass: ${st.lastPass.op} ${st.lastPass.ok ? 'ok' : `failed (${st.lastPass.reason ?? st.lastPass.error ?? 'unknown'})`} at ${st.lastPass.at}.`);
   out.push(`Remote duplicates: ${st.remote ? `${st.remote.duplicates} (checked ${st.remote.checkedAt})` : 'not checked (run: accounts status --remote)'}.`);
   if (st.unknownKeys.length) out.push(`Unknown per-account settings keys (not synced): ${st.unknownKeys.length}.`);

@@ -32,7 +32,7 @@ import { notify, registerWindowsSender } from './notify.mjs';
 import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES } from './config.mjs';
 import { acquireLock } from './lock.mjs';
 import { requestDeferred, refreshDeferred, settleDeferred, readDeferred } from './defer.mjs';
-import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic } from './accounts/state.mjs';
+import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic, rollbackActive, rollbackMarkerFile } from './accounts/state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './accounts/folders.mjs';
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
@@ -491,11 +491,13 @@ async function accountsCommand(sub, args) {
     const answer = args.find((a) => a === 'yes' || a === 'no');
     if (!answer) { console.error('Usage: accounts answer yes|no'); return 2; }
     const state = loadState(ctx);
-    const pend = pendingPairs(state, accountsOf(listFolders(ctx.store)));
+    // An explicit `yes` also re-answers pairs set to "no" (after an unlink or a rollback). The SessionStart step
+    // keeps asking only about undecided pairs, so a "no" is never re-asked automatically.
+    const pend = pendingPairs(state, accountsOf(listFolders(ctx.store)), { includeNo: answer === 'yes' });
     if (!pend.length) { emit({ ok: true, command: 'answer', answered: 0 }, ['No pending account pairs.']); return 0; }
     answerPairs(state, pend, answer, 'cli', ctx.now());
     saveState(ctx, state);
-    if (answer === 'no') { emit({ ok: true, command: 'answer', answered: pend.length, answer }, [`Recorded: not sharing (${pend.length} pair(s)). Change your mind with: accounts answer yes after clearing the pair, or config accountLink.`]); return 0; }
+    if (answer === 'no') { emit({ ok: true, command: 'answer', answered: pend.length, answer }, [`Recorded: not sharing (${pend.length} pair(s)). Change your mind with: accounts answer yes, or config accountLink.`]); return 0; }
     const app = appState({ ctx, probeProcesses: true });
     if (app.fullAllowed) {
       const res = await link(ctx, {});
@@ -558,7 +560,12 @@ async function accountsCommand(sub, args) {
 
   if (sub === 'rollback') {
     const state = loadState(ctx);
+    // state.backupId is always the pre-link backup (a 'gained' safety copy never replaces it, see pass.mjs)
     const script = state.backupId ? accPath(ctx, 'backup', state.backupId, 'rollback.mjs') : null;
+    if (!script || !existsSync(script)) {
+      // a marker with no backup: the rollback had already written its state and only the marker was left behind
+      if (rollbackActive(ctx)) { try { unlinkSync(rollbackMarkerFile(ctx)); } catch { /* none */ } }
+    }
     if (!script || !existsSync(script)) return refused('no-backup', 'There is no backup to roll back to (none was taken, or it was already rolled back).');
     const pass = args.filter((a) => a === '--exact' || a === '--dry-run' || a === '--json');
     const r = spawnSync(process.execPath, [script, ...pass], { windowsHide: true, stdio: 'inherit' });

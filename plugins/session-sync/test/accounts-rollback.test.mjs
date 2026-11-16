@@ -16,7 +16,8 @@ import { rectify } from '../lib/accounts/rectify.mjs';
 import { takeBackup, verifyBackup } from '../lib/accounts/backup.mjs';
 import { emptyState, saveState, resetMutations, loadState, readJson } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey } from '../lib/accounts/folders.mjs';
-import { link, fullPass } from '../lib/accounts/pass.mjs';
+import { link, fullPass, livePass, unlink } from '../lib/accounts/pass.mjs';
+import { accountsPushFilter } from '../lib/sync.mjs';
 import { putTasks, makeTask, readJsonFile } from './fixtures/store.mjs';
 import {
   makeRoot, makeClock, addFolder, putRecord, putTombstone, putSidecars, treeHashes, setMtime, inoOf, nlinkOf,
@@ -454,5 +455,250 @@ test('T17 an injected failure mid-link, at several points: rollback restores the
     assert.deepEqual(treeHashes(w.r.store), before.store, `n=${n}: store restored byte for byte`);
     for (const [f, text] of Object.entries(before.files)) assert.equal(readFileSync(w.file(f), 'utf8'), text, `n=${n}: ${f}`);
     rmSync(w.r.root, { recursive: true, force: true });
+  }
+});
+
+/* ------------------------------------------------------------------ review fix round A: rollback target, lock, resume, interrupted link */
+
+function fixWorld(names = ['a', 'b']) {
+  const r = makeRoot('rbfix');
+  const clock = makeClock();
+  const sim = createSim({ clock, appFile: join(r.root, 'app.json') });
+  const org = uuid('1', 1);
+  const accts = names.map((n) => uuid(n, 1));
+  const folders = accts.map((a) => addFolder(r.store, a, org));
+  sim.setApp({ running: false });
+  const answer = (...pairs) => {
+    const st = loadState(r.ctx);
+    answerPairs(st, pairs.map(([x, y]) => pairKey(x, y)), 'yes', 'cli', clock.t);
+    saveState(r.ctx, st);
+  };
+  const script = (id) => join(r.acc, 'backup', id, 'rollback.mjs');
+  const rb = (id, args = []) => spawnSync(process.execPath, [script(id), ...args], { cwd: tmpdir(), windowsHide: true, encoding: 'utf8', env: { ...process.env } });
+  const names_ = (f) => readdirSync(f.path).filter((n) => n.startsWith('local_'));
+  return { r, ctx: r.ctx, clock, sim, accts, folders, answer, rb, names: names_ };
+}
+
+test('B1 a folder joining the link keeps the pre-link backup as the rollback target; rollback leaves no cross-account links', async () => {
+  const w = fixWorld(['a', 'b', 'c']);
+  const [fA, fB, fC] = w.folders;
+  const [a, b, c] = w.accts;
+  putRecord(fA.path, 1, {}, w.clock.tick()); putRecord(fA.path, 2, {}, w.clock.tick()); putRecord(fB.path, 3, {}, w.clock.tick());
+  w.answer([a, b]);
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const id1 = loadState(w.ctx).backupId;
+  // a third account joins the group
+  putRecord(fC.path, 4, {}, w.clock.tick());
+  w.answer([a, c], [b, c]);
+  const f2 = await fullPass(w.ctx, {});
+  assert.equal(f2.ok, true);
+  const st = loadState(w.ctx);
+  assert.equal(st.backupId, id1, 'the rollback target is still the pre-link backup');
+  assert.notEqual(f2.backupId, id1, 'the gained folder took its own safety backup');
+  assert.deepEqual(st.backups.map((x) => x.kind), ['pre-link', 'gained']);
+  assert.equal(st.backups[1].id, f2.backupId);
+  assert.ok(existsSync(join(w.r.acc, 'backup', f2.backupId, 'manifest.json')));
+  assert.equal(nlinkOf(join(fB.path, recordName(1))), 3, 'all three accounts share the inode while linked');
+
+  const res = w.rb(st.backupId);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.equal(loadState(w.ctx).linked, false);
+  for (const f of w.folders) for (const n of w.names(f)) assert.equal(nlinkOf(join(f.path, n)), 1, `${n} is a single name`);
+  assert.deepEqual(w.names(fA).sort(), [recordName(1), recordName(2)]);
+  assert.deepEqual(w.names(fB), [recordName(3)]);
+  assert.deepEqual(w.names(fC), [recordName(4)], 'the record created in the third account stays in it');
+});
+
+test('B1 an interrupted gained-folder pass reuses its own safety backup and still never becomes the target', async () => {
+  const w = fixWorld(['a', 'b', 'c']);
+  const [fA, , fC] = w.folders;
+  const [a, b, c] = w.accts;
+  putRecord(fA.path, 1, {}, w.clock.tick()); putRecord(fC.path, 4, {}, w.clock.tick());
+  w.answer([a, b]);
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const id1 = loadState(w.ctx).backupId;
+  w.answer([a, c], [b, c]);
+  process.env.SESSION_SYNC_TEST_FAIL_AFTER = '2'; resetMutations();
+  await assert.rejects(() => fullPass(w.ctx, {}), /FAIL_AFTER/);
+  delete process.env.SESSION_SYNC_TEST_FAIL_AFTER; resetMutations();
+  const gainedId = loadState(w.ctx).backups.find((x) => x.kind === 'gained').id;
+  const again = await fullPass(w.ctx, {});
+  assert.equal(again.ok, true);
+  assert.equal(again.backupReused, true);
+  assert.equal(again.backupId, gainedId);
+  const st = loadState(w.ctx);
+  assert.equal(st.backupId, id1);
+  assert.equal(st.backups.length, 2);
+});
+
+test('B2 a rollback started while a pass holds accounts.lock is refused and changes nothing', async () => {
+  const w = fixWorld();
+  const [fA, fB] = w.folders;
+  for (let i = 1; i <= 3; i++) putRecord(fA.path, i, {}, w.clock.tick());
+  putRecord(fB.path, 4, {}, w.clock.tick());
+  w.answer([w.accts[0], w.accts[1]]);
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const backupId = loadState(w.ctx).backupId;
+  putRecord(fA.path, 5, {}, w.clock.tick());          // the next pass has work to do
+  let rb = null;
+  const guard = () => {
+    if (rb) return;
+    rb = w.rb(backupId);                                // the user runs `accounts rollback` while the pass is between steps
+  };
+  const pass = await fullPass(w.ctx, { guard });
+  assert.equal(rb.status, 3, rb.stdout + rb.stderr);
+  assert.match(rb.stderr, /accounts\.lock/);
+  assert.ok(!existsSync(join(w.r.acc, 'rollback-active')), 'a refused rollback leaves no marker');
+  assert.equal(pass.ok, true);
+  const s = loadState(w.ctx);
+  assert.equal(s.linked, true);
+  assert.equal(Object.values(s.pairs)[0].answer, 'yes', 'the pass state is intact and consistent with the store');
+  assert.equal(nlinkOf(join(fB.path, recordName(5))), 2);
+  // run again with nothing holding the lock: the rollback goes through
+  const ok = w.rb(backupId);
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.equal(loadState(w.ctx).linked, false);
+  assert.ok(!existsSync(join(w.r.acc, 'accounts.lock')), 'the lock is released');
+  assert.ok(!existsSync(join(w.r.acc, 'rollback-active')), 'and the marker is gone after a finished rollback');
+});
+
+test('B2 a live lock refuses the rollback; a lock of a dead pid is taken over; a dry run takes no lock', async () => {
+  const w = fixWorld();
+  const [fA, fB] = w.folders;
+  putRecord(fA.path, 1, {}, w.clock.tick()); putRecord(fB.path, 2, {}, w.clock.tick());
+  w.answer([w.accts[0], w.accts[1]]);
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const id = loadState(w.ctx).backupId;
+  const lockFile = join(w.r.acc, 'accounts.lock');
+  writeFileSync(lockFile, JSON.stringify({ pid: process.pid, at: Date.now() }));     // this test process: alive
+  const before = treeHashes(w.r.store);
+  const refused = w.rb(id);
+  assert.equal(refused.status, 3, refused.stdout + refused.stderr);
+  assert.deepEqual(treeHashes(w.r.store), before);
+  assert.ok(!readdirSync(w.r.acc).some((d) => d.startsWith('pre-rollback-')), 'no snapshot');
+  assert.equal(JSON.parse(readFileSync(lockFile, 'utf8')).pid, process.pid, 'the live holder keeps its lock');
+  const dry = w.rb(id, ['--dry-run']);
+  assert.equal(dry.status, 0, dry.stdout + dry.stderr);
+  assert.ok(!existsSync(join(w.r.acc, 'rollback-active')));
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8', windowsHide: true });
+  writeFileSync(lockFile, JSON.stringify({ pid: Number(dead.stdout), at: Date.now() }));
+  const ok = w.rb(id);
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.ok(!existsSync(lockFile));
+});
+
+test('B2 no pass or unlink runs while a rollback is active; an interrupted rollback blocks them until it is finished', async () => {
+  const w = fixWorld();
+  const [fA, fB] = w.folders;
+  putRecord(fA.path, 1, {}, w.clock.tick()); putRecord(fB.path, 2, {}, w.clock.tick());
+  w.answer([w.accts[0], w.accts[1]]);
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const id = loadState(w.ctx).backupId;
+  putRecord(fA.path, 10, {}, w.clock.tick());
+  assert.equal((await fullPass(w.ctx, {})).ok, true);
+  // an injected failure in step 5 (record 10's home cannot be created): the rollback stops half way
+  const s = loadState(w.ctx); s.records[recordId(10)].home = 'blocker/sub'; saveState(w.ctx, s);
+  writeFileSync(join(w.r.store, 'blocker'), 'x');
+  const run1 = w.rb(id);
+  assert.equal(run1.status, 1, run1.stdout + run1.stderr);
+  assert.match(run1.stderr, /run this rollback again/);
+  assert.ok(existsSync(join(w.r.acc, 'rollback-active')), 'the marker stays');
+  assert.ok(!existsSync(join(w.r.acc, 'accounts.lock')), 'the lock is released at exit');
+  const hashes = treeHashes(w.r.store);
+  const full = await fullPass(w.ctx, {});
+  assert.deepEqual([full.ok, full.reason], [false, 'rollback-active']);
+  w.sim.setApp({ running: true, signedIn: w.accts[0], startedAtMs: w.clock.t });
+  assert.equal((await livePass(w.ctx, {})).skipped, 'rollback-active');
+  w.sim.setApp({ running: false });
+  assert.equal((await unlink(w.ctx, {})).reason, 'rollback-active');
+  assert.deepEqual(treeHashes(w.r.store), hashes, 'the blocked passes changed nothing');
+  // the cause goes away; running the rollback again finishes it and lifts the block
+  rmSync(join(w.r.store, 'blocker'));
+  const fixed = loadState(w.ctx); fixed.records[recordId(10)].home = fA.key; saveState(w.ctx, fixed);
+  const run2 = w.rb(id);
+  assert.equal(run2.status, 0, run2.stdout + run2.stderr);
+  assert.ok(!existsSync(join(w.r.acc, 'rollback-active')));
+  assert.equal(loadState(w.ctx).linked, false);
+  assert.equal((await fullPass(w.ctx, {})).reason, 'no-group', 'passes may run again (and there is nothing to link)');
+});
+
+test('S3 a rollback that failed part way and is run again puts every post-backup conversation back', async () => {
+  const w = fixWorld();
+  const [fA, fB] = w.folders;
+  putRecord(fA.path, 1, {}, w.clock.tick()); putRecord(fB.path, 2, {}, w.clock.tick());
+  w.answer([w.accts[0], w.accts[1]]);
+  assert.equal((await link(w.ctx, {})).ok, true);
+  const id = loadState(w.ctx).backupId;
+  putRecord(fA.path, 10, { title: 'post-link 10' }, w.clock.tick()); putRecord(fA.path, 11, { title: 'post-link 11' }, w.clock.tick());
+  assert.equal((await fullPass(w.ctx, {})).ok, true);
+  const s = loadState(w.ctx); s.records[recordId(10)].home = 'blocker/sub'; saveState(w.ctx, s);
+  writeFileSync(join(w.r.store, 'blocker'), 'x');
+  const run1 = w.rb(id);
+  assert.equal(run1.status, 1);
+  for (const n of [10, 11]) assert.ok([fA, fB].some((F) => existsSync(join(F.path, recordName(n)))), `record ${n} still has a name after the failed run`);
+  rmSync(join(w.r.store, 'blocker'));
+  const fixed = loadState(w.ctx); fixed.records[recordId(10)].home = fA.key; saveState(w.ctx, fixed);
+  const run2 = w.rb(id);
+  assert.equal(run2.status, 0, run2.stdout + run2.stderr);
+  assert.match(run2.stdout, /post-backup records put back 2/);
+  for (const n of [10, 11]) {
+    assert.equal(JSON.parse(readFileSync(join(fA.path, recordName(n)), 'utf8')).title, `post-link ${n}`);
+    assert.equal(nlinkOf(join(fA.path, recordName(n))), 1);
+    assert.ok(!existsSync(join(fB.path, recordName(n))));
+  }
+  assert.equal(readdirSync(w.r.acc).filter((d) => d.startsWith('pre-rollback-')).length, 2, 'two runs, two snapshots (none overwritten)');
+});
+
+test('S1 a first link that stops part way already filters mirrors out of the push', async () => {
+  const w = fixWorld();
+  const [fA, fB] = w.folders;
+  for (let i = 1; i <= 6; i++) putRecord(fA.path, i, {}, w.clock.tick());
+  w.answer([w.accts[0], w.accts[1]]);
+  process.env.SESSION_SYNC_TEST_FAIL_AFTER = '4'; resetMutations();
+  await assert.rejects(() => link(w.ctx, {}), /FAIL_AFTER/);
+  delete process.env.SESSION_SYNC_TEST_FAIL_AFTER; resetMutations();
+  const st = loadState(w.ctx);
+  assert.equal(st.linked, false, 'the link did not finish');
+  const mirrors = w.names(fB).filter((n) => nlinkOf(join(fB.path, n)) > 1);
+  assert.ok(mirrors.length > 0, 'mirrors were already added');
+  const filter = accountsPushFilter({ ctx: w.ctx });
+  assert.equal(typeof filter, 'function', 'the home-only filter is on');
+  for (const n of mirrors) {
+    assert.equal(filter(`${fB.key}/${n}`), false, `${n} in B is a mirror: not uploaded`);
+    assert.equal(filter(`${fA.key}/${n}`), true, `${n} in A (home) is uploaded`);
+  }
+  const done = await link(w.ctx, {});
+  assert.equal(done.ok, true);
+  assert.equal(typeof accountsPushFilter({ ctx: w.ctx }), 'function');
+});
+
+test('S1 after a rollback of a stopped first link there is no journal and no filter', async () => {
+  const w = fixWorld();
+  const [fA] = w.folders;
+  for (let i = 1; i <= 4; i++) putRecord(fA.path, i, {}, w.clock.tick());
+  w.answer([w.accts[0], w.accts[1]]);
+  process.env.SESSION_SYNC_TEST_FAIL_AFTER = '4'; resetMutations();
+  await assert.rejects(() => link(w.ctx, {}), /FAIL_AFTER/);
+  delete process.env.SESSION_SYNC_TEST_FAIL_AFTER; resetMutations();
+  const res = w.rb(loadState(w.ctx).backupId);
+  assert.equal(res.status, 0, res.stdout + res.stderr);
+  assert.ok(!existsSync(join(w.r.acc, 'journal.json')));
+  assert.equal(accountsPushFilter({ ctx: w.ctx }), null);
+});
+
+test('S6 rollback --exact removes a task file the link created, like the default mode', async () => {
+  for (const mode of [['--exact'], []]) {
+    const w = fixWorld();
+    const [fA, fB] = w.folders;
+    putRecord(fA.path, 1, {}, w.clock.tick()); putRecord(fB.path, 2, {}, w.clock.tick());
+    putTasks(fA.path, [makeTask('tA')], {}, w.clock.tick());          // B has no task file before the link
+    w.answer([w.accts[0], w.accts[1]]);
+    assert.equal((await link(w.ctx, {})).ok, true);
+    const bFile = join(fB.path, 'scheduled-tasks.json');
+    assert.ok(existsSync(bFile), 'the link created it');
+    const res = w.rb(loadState(w.ctx).backupId, mode);
+    assert.equal(res.status, 0, `${mode}: ${res.stdout}${res.stderr}`);
+    assert.ok(!existsSync(bFile), `${mode.join(' ') || 'default'}: B has no task file again`);
+    assert.deepEqual(readJsonFile(join(fA.path, 'scheduled-tasks.json')).scheduledTasks.map((t) => t.id), ['tA']);
   }
 });

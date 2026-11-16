@@ -156,6 +156,47 @@ test('accounts answer no records the answer and links nothing', () => {
   assert.equal(w.run(['accounts', 'answer', 'maybe']).status, 2);
 });
 
+test('S7 answer yes links again after an unlink or a rollback; the hook never re-asks a "no"', () => {
+  const w = cworld();
+  assert.equal(w.run(['accounts', 'answer', 'yes']).status, 0);
+  const firstBackup = w.state().backupId;
+  assert.equal(w.state().linked, true);
+
+  // unlink: the pair is "no"; the hook stays silent (no ask, no link)
+  assert.equal(w.run(['accounts', 'unlink']).status, 0);
+  assert.equal(w.state().pairs[askedPair].answer, 'no');
+  assert.equal(w.state().pairs[askedPair].via, 'unlink');
+  assert.equal(w.run(['auto-pull', '--from-hook']).stdout, '', 'a "no" is never asked again');
+  assert.equal(w.state().linked, false);
+  assert.equal(nlinkOf(join(w.fA.path, recordName(1))), 1);
+  // an explicit yes re-answers the pair and links again with a fresh backup
+  const again = w.run(['accounts', 'answer', 'yes', '--json']);
+  assert.equal(again.status, 0, again.stdout + again.stderr);
+  assert.equal(JSON.parse(again.stdout).answered, 1);
+  assert.equal(w.state().pairs[askedPair].answer, 'yes');
+  assert.equal(w.state().pairs[askedPair].via, 'cli');
+  assert.equal(w.state().linked, true);
+  assert.notEqual(w.state().backupId, firstBackup, 'the new link has its own pre-link backup');
+  assert.equal(w.state().backups.length, 2, 'the old backup is kept in the list');
+  assert.equal(nlinkOf(join(w.fA.path, recordName(1))), 2);
+  assert.equal(readdirSync(w.fB.path).filter((n) => /^local_/.test(n)).length, 4, 'every name linked again');
+
+  // rollback: the pair is "no" again, and yes links once more
+  const rb = w.run(['accounts', 'rollback']);
+  assert.equal(rb.status, 0, rb.stdout + rb.stderr);
+  assert.equal(w.state().pairs[askedPair].via, 'rollback');
+  assert.equal(w.run(['auto-pull', '--from-hook']).stdout, '');
+  assert.equal(w.state().linked, false);
+  assert.equal(w.run(['accounts', 'answer', 'yes']).status, 0);
+  assert.equal(w.state().linked, true);
+  assert.equal(nlinkOf(join(w.fA.path, recordName(1))), 2);
+  // a yes with nothing left to answer is a no-op; a no never touches a pair that is already yes
+  const noop = w.run(['accounts', 'answer', 'yes', '--json']);
+  assert.equal(JSON.parse(noop.stdout).answered, 0);
+  assert.equal(w.run(['accounts', 'answer', 'no']).status, 0);
+  assert.equal(w.state().pairs[askedPair].answer, 'yes');
+});
+
 test('accounts link --now refuses while the app runs (exit 3); without --now it arms the waiter', () => {
   const w = cworld();
   w.putState((s) => { s.pairs[askedPair] = { answer: 'yes', via: 'cli', at: daysAgo(1) }; });

@@ -10,6 +10,10 @@
  *   node rollback.mjs [--dry-run] [--exact] [--json]
  *                     [--ignore-stale-lockfile] [--acc <dir>] [--store <dir>] [--user-data <dir>]
  *
+ * It takes accounts.lock (refused with exit 3 while a pass holds it) and writes ACC/rollback-active, which
+ * stays until the rollback has finished: no pass or unlink runs while it exists, so a rollback that
+ * stopped half way is finished by running it again. A dry run takes neither.
+ *
  * Steps: (1) refuse while the app runs; (2) snapshot the current state to
  * pre-rollback-<stamp>/; (3) find records created after the backup;
  * (4) restore the store from the backup; (5) put post-backup records back into
@@ -166,8 +170,42 @@ function relinkTo(primary, dst) {
 const inoOf = (p) => { try { const s = statSync(p, { bigint: true }); return `${s.dev}:${s.ino}`; } catch { return null; } };
 const stampNow = () => {
   const d = new Date(); const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${String(d.getMilliseconds()).padStart(3, '0')}`;
 };
+
+/* ------------------------------------------------------------ accounts.lock and the rollback-active marker (B2) */
+
+const LOCK_TTL_MS = 30 * 60 * 1000;   // the same rule as the plugin's lock.mjs
+const pidAlive = (pid) => {
+  if (!pid) return false;
+  if (pid === process.pid) return true;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+};
+
+/**
+ * Take ACC/accounts.lock (`{pid, at}`, created with `wx`; the plugin's passes use the same file and rule).
+ * Returns a release function, or null when a live process holds it. A lock of a dead pid or older than the
+ * TTL is taken over; an unreadable one younger than 5 s is a writer mid-write and counts as held.
+ */
+function takeLock(acc) {
+  const file = join(acc, 'accounts.lock');
+  mkdirSync(acc, { recursive: true });
+  for (let i = 0; i < 3; i++) {
+    try {
+      const fd = openSync(file, 'wx');
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: Date.now(), by: 'rollback' })); } finally { closeSync(fd); }
+      return () => {
+        try { if (JSON.parse(readFileSync(file, 'utf8')).pid === process.pid) unlinkSync(file); } catch { /* gone */ }
+      };
+    } catch (e) { if (e.code !== 'EEXIST') throw e; }
+    let cur = null;
+    try { cur = JSON.parse(readFileSync(file, 'utf8')); } catch { /* unreadable */ }
+    if (cur) { if (pidAlive(cur.pid) && Date.now() - (cur.at || 0) < LOCK_TTL_MS) return null; }
+    else { try { if (Date.now() - statSync(file).mtimeMs < 5000) return null; } catch { /* gone: retry */ } }
+    try { unlinkSync(file); } catch { /* retry */ }
+  }
+  return null;
+}
 
 function writeJsonAtomic(file, obj) {
   mkdirSync(dirname(file), { recursive: true });
@@ -392,13 +430,27 @@ function main() {
     if (!ok) { console.error(`rollback aborted: the backup copy of ${e.area}:${e.rel} is missing or damaged. Nothing was changed.`); return 1; }
   }
 
+  // Exclusive from here on: accounts.lock (no pass can run, and none can save a stale state.json over ours) and
+  // the rollback-active marker, which stays until the rollback has finished so that a half-done rollback is
+  // finished by running it again and never undone by a re-link. A dry run changes nothing and takes neither.
+  if (!DRY) {
+    const release = takeLock(acc);
+    if (!release) {
+      console.error('rollback refused: an account pass holds accounts.lock right now. Wait a minute and run this again.');
+      return 3;
+    }
+    process.on('exit', release);
+    writeFileSync(join(acc, 'rollback-active'), JSON.stringify({ pid: process.pid, at: new Date().toISOString(), backupId: manifest.id ?? null }));
+  }
+
   const storeEntries = manifest.entries.filter((e) => e.area === 'store');
   const manifestRels = new Set(storeEntries.map((e) => e.rel));
   const nowFiles = walk(store);
   const preTasks = readTaskFiles(nowFiles);
 
   // (2) snapshot of the current state
-  const snapDir = join(acc, `pre-rollback-${stampNow()}`);
+  let snapDir = join(acc, `pre-rollback-${stampNow()}`);
+  for (let i = 1; existsSync(snapDir); i++) snapDir = join(acc, `pre-rollback-${stampNow()}-${i}`);   // never overwrite an earlier snapshot
   if (!DRY) {
     out.snapshot = snapDir;
     const snapEntries = [];
@@ -485,41 +537,49 @@ function main() {
       for (const e of rest) relinkTo(destOf(primary), destOf(e));
     }
     for (const d of manifest.dirs ?? []) if (!DRY) mkdirSync(join(store, ...d.split('/')), { recursive: true });
+    // (5) post-backup records go back into their home folder as single files. This comes BEFORE the removal
+    // below, and the removal skips these home names, so a post-backup record never has zero names: a rollback
+    // that stops half way loses nothing, and running it again finishes the job (S3).
+    for (const pb of putBack) {
+      if (DRY) continue;
+      const dst = join(store, ...pb.home.split('/'), pb.name);
+      restoreFile(pb.src, dst, pb.mtimeMs, tmpName);
+    }
+    const putBackRels = new Set(putBack.map((pb) => `${pb.home}/${pb.name}`));
+
     // names the feature created and the backup does not list
     for (const f of nowFiles) {
-      if (manifestRels.has(f.rel)) continue;
+      if (manifestRels.has(f.rel) || putBackRels.has(f.rel)) continue;
       if (isExcluded(f.rel)) { out.excluded++; continue; }
       if (!isRemovable(f.rel)) continue;
       out.removed++;
       if (!DRY) unlinkSync(f.abs);
     }
 
-    // (5) post-backup records go back into their home folder as single files
-    for (const pb of putBack) {
-      if (DRY) continue;
-      const dst = join(store, ...pb.home.split('/'), pb.name);
-      restoreFile(pb.src, dst, pb.mtimeMs, tmpName);
-    }
-
     // (6) tasks: the files were restored byte for byte (what --exact asks for). By default the run-time
     // fields then move to the max of the restored and the pre-rollback values, and tasks created after
     // the backup are appended to their origin file, so a rollback never makes a task run twice or vanish.
+    const taskEntries = storeEntries.filter((e) => TASK_FILE.test(e.rel));
+    let plan = null;
     if (!EXACT) {
       const origin = (() => { try { return JSON.parse(readFileSync(join(acc, 'tasks-base.json'), 'utf8')).origin ?? {}; } catch { return {}; } })();
-      const taskEntries = storeEntries.filter((e) => TASK_FILE.test(e.rel));
-      const plan = planTasks({ pre: preTasks, taskEntries, srcOf, destOf, origin, store });
+      plan = planTasks({ pre: preTasks, taskEntries, srcOf, destOf, origin, store });
       out.tasks = { runtimeUpdated: plan.updated, appended: plan.appended, removedFiles: 0 };
       for (const entry of plan.files.values()) {
         if (!entry.changed) continue;
         if (!DRY) writeTextAtomic(entry.path, serializeJson(entry.doc, entry.fmt), tmpName);
       }
-      const listed = new Set(taskEntries.map((e) => e.rel));
-      for (const f of nowFiles) {
-        const m = TASK_FILE.exec(f.rel);
-        if (!m || listed.has(f.rel) || plan.files.has(m[1])) continue;
-        out.tasks.removedFiles++;                      // created by the link; its tasks are in the snapshot
-        if (!DRY) unlinkSync(f.abs);
-      }
+    }
+    // A task file the backup does not list was created by the link; its tasks are in the snapshot. It goes in
+    // both modes (--exact means the backup's state, and a leftover file would run its tasks under both accounts),
+    // except where the default mode just appended a post-backup task to it.
+    out.tasks ??= { removedFiles: 0 };
+    const listedTasks = new Set(taskEntries.map((e) => e.rel));
+    for (const f of nowFiles) {
+      const m = TASK_FILE.exec(f.rel);
+      if (!m || listedTasks.has(f.rel) || plan?.files.has(m[1])) continue;
+      out.tasks.removedFiles++;
+      if (!DRY) unlinkSync(f.abs);
     }
 
     // (7) whole-file areas (and cowork memory): byte restore
@@ -548,7 +608,8 @@ function main() {
       if (bad.length) { out.errors = bad; console.error(`rollback: ${bad.length} file(s) do not match the backup after restore: ${bad.slice(0, 5).join(', ')}`); }
     }
   } catch (e) {
-    console.error(`rollback failed part way: ${e.message}${out.snapshot ? `\nThe state before this rollback is saved in ${out.snapshot}` : ''}`);
+    console.error(`rollback failed part way: ${e.message}${out.snapshot ? `\nThe state before this rollback is saved in ${out.snapshot}` : ''}`
+      + '\nNo account pass runs until a rollback has finished: fix the cause, then run this rollback again (it picks up where it stopped).');
     return 1;
   }
 
@@ -557,6 +618,7 @@ function main() {
     const s = state ?? { v: 1, records: {}, pairs: {} };
     const at = new Date().toISOString();
     s.linked = false;
+    s.group = [];
     s.fullPassOwed = false;
     s.backupId = null;
     s.lastRolledBackId = manifest.id ?? null;
@@ -569,12 +631,17 @@ function main() {
     for (const b of ['tasks-base.json', 'backlog-base.json', 'settings-base.json', 'memory-base.json']) {
       try { unlinkSync(join(acc, b)); } catch { /* none */ }
     }
+    // an interrupted link or unlink left a journal; the store is no longer in that state
+    for (const j of ['journal.json', 'journal.json.bak']) { try { unlinkSync(join(acc, j)); } catch { /* none */ } }
+    // finished: passes may run again (the lock is released at exit)
+    try { unlinkSync(join(acc, 'rollback-active')); } catch { /* none */ }
   }
 
   if (JSON_OUT) console.log(JSON.stringify(out));
   else say(`${DRY ? 'dry run: would restore' : 'restored'} ${out.restored} file(s); kept ${out.kept}; excluded ${out.excluded} (left as they are); `
     + `removed ${out.removed}; post-backup records put back ${out.postBackup}; whole-file areas restored ${out.global}.`
-    + `${out.tasks ? ` Tasks: ${out.tasks.runtimeUpdated} run-time field(s) kept at their max, ${out.tasks.appended} added back, ${out.tasks.removedFiles} link-created file(s) removed.` : ''}`
+    + `${out.tasks?.runtimeUpdated !== undefined ? ` Tasks: ${out.tasks.runtimeUpdated} run-time field(s) kept at their max, ${out.tasks.appended} added back, ${out.tasks.removedFiles} link-created file(s) removed.`
+      : out.tasks?.removedFiles ? ` Tasks: ${out.tasks.removedFiles} link-created file(s) removed.` : ''}`
     + `${Object.keys(out.paths ?? {}).length ? ` Path-level areas: ${Object.entries(out.paths).map(([n, r]) => `${n} ${r.status}${r.paths ? ` (${r.paths} paths)` : ''}`).join(', ')}.` : ''}${out.snapshot ? `\nSnapshot of the state before: ${out.snapshot}` : ''}`);
   return out.errors.length ? 1 : 0;
 }

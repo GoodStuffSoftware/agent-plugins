@@ -20,7 +20,7 @@ import { planIncremental, commitManifest } from './manifest.mjs';
 import { classifyReplacement, lostCount } from './transcript.mjs';
 import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote, isLocalRemote } from './rclone.mjs';
 import { notify } from './notify.mjs';
-import { makeCtx, loadState, accPath, readJson, ACC } from './accounts/state.mjs';
+import { makeCtx, loadState, accPath, readJson, journalRead, ACC } from './accounts/state.mjs';
 import { listFolders, groupOf, homeOf, RECORD, UUID, OURTMP } from './accounts/folders.mjs';
 
 const MARKER = '.last-push';
@@ -109,7 +109,8 @@ export function accountsPushFilter({ ctx = makeCtx(), state = null, remoteList =
   try {
     if (!ctx.store) return null;
     const st = state ?? loadState(ctx);
-    if (!st.linked) return null;
+    // A first link that stopped part way (journal op `link`) has already mirrored names: filter from then on.
+    if (!st.linked && journalRead(ctx)?.op !== 'link') return null;
     const group = groupOf(st, listFolders(ctx.store));
     if (group.length < 2) return null;
     const groupKeys = new Set(group.map((f) => f.key));

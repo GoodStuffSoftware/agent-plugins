@@ -19,7 +19,7 @@
 
 import { existsSync, unlinkSync } from 'node:fs';
 import {
-  loadState, saveState, withAccountsLock, accPath, journalStart, journalRead, journalClear, tickMutation,
+  loadState, saveState, withAccountsLock, accPath, journalStart, journalRead, journalClear, tickMutation, rollbackActive,
 } from './state.mjs';
 import { listFolders, groupOf, answerPairs, homeOf } from './folders.mjs';
 import { appState, liveFolders, makeS1Guard, noteSignedIn, AppRunningError } from './appstate.mjs';
@@ -39,6 +39,19 @@ function setup(ctx, o) {
   return { state, app, folders, group };
 }
 
+/**
+ * Inside the lock: null while a rollback is active (it must be finished, never undone by a pass), else the
+ * setup bundle re-read from disk unless the caller supplied its own state. A rollback or another pass may
+ * have saved state.json since `setup`; saving a stale copy over it would undo that work.
+ */
+function underLock(ctx, o, cur) {
+  if (rollbackActive(ctx)) return null;
+  if (o.state) return cur;
+  const state = loadState(ctx);
+  const folders = o.folders ?? listFolders(ctx.store);
+  return { ...cur, state, folders, group: groupOf(state, folders) };
+}
+
 const save = (ctx, state, o) => { if (o.save !== false) saveState(ctx, state); };
 const iso = (ctx) => new Date(ctx.now()).toISOString();
 
@@ -49,7 +62,12 @@ export async function fullPass(ctx, o = {}) {
   const rep = { kind: 'full', ok: false, reasons: o.reasons ?? [] };
   if (!app.fullAllowed) return { ...rep, reason: 'app-running' };
   if (group.length < 2) return { ...rep, reason: 'no-group' };
-  const res = await withAccountsLock(ctx, () => runFull(ctx, o, { state, app, group }, rep));
+  const res = await withAccountsLock(ctx, () => {
+    const cur = underLock(ctx, o, { state, app, group });
+    if (!cur) return { ...rep, reason: 'rollback-active' };
+    if (cur.group.length < 2) return { ...rep, reason: 'no-group' };
+    return runFull(ctx, o, cur, rep);
+  });
   return res.ok ? res.value : { ...rep, reason: 'locked' };
 }
 
@@ -60,21 +78,29 @@ function runFull(ctx, o, { state, app, group }, rep) {
   const keys = group.map((f) => f.key);
   noteSignedIn(state, app.signedIn, ctx.now());
   try {
-    // A new link, a re-link after unlink or rollback, or a group that gained a folder gets a fresh backup first.
-    // A journal left by an interrupted link keeps its (pristine) backup: a second one would capture a half-linked store.
+    // A new link or a re-link after unlink or rollback gets a fresh 'pre-link' backup first: the rollback target
+    // (state.backupId). A group that gained a folder gets a 'gained' backup: a safety copy of an already linked
+    // store, listed in state.backups and NEVER the rollback target (restoring it would re-create every mirror).
+    // A journal left by an interrupted link keeps its backup: a second one would capture a half-linked store.
+    state.backups ||= [];
     const gained = state.linked && keys.some((k) => !(state.group ?? []).includes(k));
     if (!state.linked || gained) {
+      const kind = gained ? 'gained' : 'pre-link';
       const j = journalRead(ctx);
-      const reuse = j?.op === 'link' && j.step === 'backup-done' && state.backupId
-        && existsSync(accPath(ctx, 'backup', state.backupId, 'manifest.json'));
-      if (reuse) {
-        rep.backupId = state.backupId; rep.backupReused = true;
+      const jid = j?.op === 'link' && j.step === 'backup-done' && (j.kind ?? 'pre-link') === kind
+        ? (j.backupId ?? (kind === 'pre-link' ? state.backupId : null)) : null;
+      if (jid && existsSync(accPath(ctx, 'backup', jid, 'manifest.json'))) {
+        rep.backupId = jid; rep.backupReused = true;
+        if (kind === 'pre-link') state.backupId = jid;
+        if (!state.backups.some((b) => b.id === jid)) state.backups.push({ id: jid, kind, at: iso(ctx) });
       } else {
         guard();
         tickMutation();
         const b = takeBackup(ctx, { group, pathAreas: computePathAreas(ctx, group) });
-        state.backupId = b.id; rep.backupId = b.id;
-        journalStart(ctx, 'link', 'backup-done');
+        state.backups.push({ id: b.id, kind, at: iso(ctx) });
+        if (kind === 'pre-link') state.backupId = b.id;
+        rep.backupId = b.id;
+        journalStart(ctx, 'link', 'backup-done', { kind, backupId: b.id });
         saveState(ctx, state);
       }
     }
@@ -106,12 +132,18 @@ function runFull(ctx, o, { state, app, group }, rep) {
 /* ------------------------------------------------------------------ live pass */
 
 export async function livePass(ctx, o = {}) {
-  const { state, app, folders, group } = setup(ctx, o);
+  const pre = setup(ctx, o);
+  const { app } = pre;
   const rep = { kind: 'live', ok: false };
-  if (!state.linked) return { ...rep, skipped: 'not-linked' };
+  if (!pre.state.linked) return { ...rep, skipped: 'not-linked' };
   if (!app.running) return { ...rep, skipped: 'app-not-running' };
-  if (group.length < 2) return { ...rep, skipped: 'no-group' };
+  if (pre.group.length < 2) return { ...rep, skipped: 'no-group' };
   const res = await withAccountsLock(ctx, () => {
+    const cur = underLock(ctx, o, pre);
+    if (!cur) return { ...rep, skipped: 'rollback-active' };
+    if (!cur.state.linked) return { ...rep, skipped: 'not-linked' };
+    if (cur.group.length < 2) return { ...rep, skipped: 'no-group' };
+    const { state, folders, group } = cur;
     try {
       noteSignedIn(state, app.signedIn, ctx.now());
       const live = liveFolders(app, folders, state);
@@ -157,11 +189,16 @@ export function owedWork(ctx, o = {}) {
 /* ------------------------------------------------------------------ unlink */
 
 export async function unlink(ctx, o = {}) {
-  const { state, app, group } = setup(ctx, o);
+  const pre = setup(ctx, o);
+  const { app } = pre;
   const rep = { kind: 'unlink', ok: false };
   if (!app.fullAllowed) return { ...rep, reason: 'app-running' };
-  if (!state.linked) return { ...rep, reason: 'not-linked' };
+  if (!pre.state.linked) return { ...rep, reason: 'not-linked' };
   const res = await withAccountsLock(ctx, () => {
+    const cur = underLock(ctx, o, pre);
+    if (!cur) return { ...rep, reason: 'rollback-active' };
+    if (!cur.state.linked) return { ...rep, reason: 'not-linked' };
+    const { state, group } = cur;
     const guard = o.guard ?? makeS1Guard(ctx);
     try {
       journalStart(ctx, 'unlink', 'start');

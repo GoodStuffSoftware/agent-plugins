@@ -38,7 +38,7 @@ export const accPath = (ctx, ...parts) => join(ctx.acc, ...parts);
 
 export function emptyState(store = null) {
   return {
-    v: 1, store, linked: false, group: [], pairs: {}, backupId: null, records: {},
+    v: 1, store, linked: false, group: [], pairs: {}, backupId: null, backups: [], records: {},
     live: { startedAtMs: 0, folders: [] }, tasksWritten: {}, lastSignedIn: {},
     lastRectify: null, lastFullPass: null, fullPassOwed: false, lastRemoteCheck: null,
   };
@@ -148,8 +148,8 @@ export async function withAccountsLock(ctx, fn) {
 
 export const journalFile = (ctx) => accPath(ctx, 'journal.json');
 
-export function journalStart(ctx, op, step = 'start') {
-  writeJsonAtomic(journalFile(ctx), { op, startedAt: new Date(ctx.now()).toISOString(), step, pid: process.pid });
+export function journalStart(ctx, op, step = 'start', extra = {}) {
+  writeJsonAtomic(journalFile(ctx), { op, startedAt: new Date(ctx.now()).toISOString(), step, pid: process.pid, ...extra });
 }
 
 export function journalStep(ctx, step) {
@@ -160,6 +160,14 @@ export function journalStep(ctx, step) {
 }
 
 export const journalRead = (ctx) => readJson(journalFile(ctx), null);
+
+/**
+ * `rollback-active`: written by the standalone rollback before it changes anything and removed only when
+ * it finished. While it exists no pass or unlink may run: a rollback that stopped half way must be
+ * finished (run it again), never undone by a re-link.
+ */
+export const rollbackMarkerFile = (ctx) => accPath(ctx, 'rollback-active');
+export const rollbackActive = (ctx) => existsSync(rollbackMarkerFile(ctx));
 
 export function journalClear(ctx) {
   try { unlinkSync(journalFile(ctx)); } catch { /* none */ }

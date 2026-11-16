@@ -88,7 +88,7 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts unlink --when-app-exits   # Cl
 
 Unlink keeps the newest content of every conversation, leaves each one in the account that first had it, removes the mirrored copies and splits tasks and backlog back by origin. The accounts stop being linked and the pair answers reset to "no". It is the gentle undo.
 
-Linking again later after an unlink or a rollback is **not offered by a command in 0.4.0** (`accounts answer yes` only covers pairs nobody has answered yet). Tell the user that plainly; do not edit `state.json` to work around it.
+To link again later after an unlink or a rollback, run `accounts answer yes`: an explicit yes also re-answers pairs set to "no" and links with a fresh backup. The SessionStart hook never asks about a "no" again by itself. Do not edit `state.json`.
 
 ## 5. Undo: rollback
 
@@ -99,7 +99,7 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts rollback --dry-run   # what it
 node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts rollback
 ```
 
-It restores the backup taken before the link, keeping task run times at their newest so nothing fires twice (add `--exact` to restore the task files byte for byte instead), puts any conversation created since the backup back in its home folder as a single file, and resets the pairs to "no". Exit 3 means there is no backup to roll back to.
+It restores the backup taken before the link, keeping task run times at their newest so nothing fires twice (add `--exact` to restore the task files byte for byte instead), puts any conversation created since the backup back in its home folder as a single file, and resets the pairs to "no". It always uses the backup taken before the first link (a safety copy taken when another account joins later is never the target). It holds `accounts.lock` while it runs: exit 3 can also mean a pass is running right now, so wait a minute and run it again. If it stops part way (exit 1), no pass or unlink runs until a rollback has finished: fix the cause and run it again. Exit 3 also means there is no backup to roll back to.
 
 **If the plugin itself is broken**, the backup folder carries its own copy of the rollback that needs no plugin, only Node. The folder is `~/.claude/session-sync/accounts/backup/<stamp>/` (on Windows `%USERPROFILE%\.claude\session-sync\accounts\backup\<stamp>\`); `accounts status --json` shows the stamp as `backupId`.
 
