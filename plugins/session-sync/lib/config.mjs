@@ -22,16 +22,18 @@ export const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 export const CONFIG_FILE = join(STATE_DIR, 'config.json');
 
 /** Remote Control restore (accounts/rcrestore.mjs). Defined here, with the other settings; rcrestore.mjs re-exports it. */
-export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true });
+export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4 });
 
 /** The `rcRestore` settings from a loaded config, validated: a partial block keeps the other defaults, a bad value falls back. */
 export function rcSettings(cfg = {}) {
   const raw = cfg?.rcRestore && typeof cfg.rcRestore === 'object' ? cfg.rcRestore : {};
   const days = Number(raw.days);
+  const wakeMax = Number(raw.wakeMax);
   return {
     enabled: raw.enabled === undefined ? RC_DEFAULTS.enabled : raw.enabled !== false,
     days: Number.isFinite(days) && days >= 1 && days <= 90 ? days : RC_DEFAULTS.days,
     wake: raw.wake === undefined ? RC_DEFAULTS.wake : raw.wake !== false,
+    wakeMax: Number.isInteger(wakeMax) && wakeMax >= 1 && wakeMax <= 50 ? wakeMax : RC_DEFAULTS.wakeMax,
   };
 }
 

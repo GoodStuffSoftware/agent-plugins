@@ -304,6 +304,7 @@ export async function runWaiter(ctx, o = {}) {
       if (headline && !quiet) info.headline = headline;
       writeJsonAtomic(passResultFile, { status: quiet ? 'waiting' : status, progress: info });
       await ui.end({ status, headline: info.headline, quiet });
+      w.uiEndedAt = Date.now();   // the next balloon (the Remote Control step) waits uiGapMs so this one shows first
     } catch (e) { o.log?.(`waiter: progress indicator: ${e?.message ?? e}`); }
   };
 

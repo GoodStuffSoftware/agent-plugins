@@ -137,10 +137,12 @@ test('K10 interactiveSession and recordForCliSession', () => {
 });
 
 test('K11 the instruction: both one-line messages, the exact wake message, the window, the refusal rule, no em dashes', () => {
-  const t = wakeInstruction({ days: 5 });
+  const t = wakeInstruction({ days: 5, max: 6 });
   assert.match(t, /Reconnecting Remote Control for your recent sessions/);
   assert.match(t, /Remote Control: N sessions reconnected, M still off\./);
   assert.match(t, /within the last 5 days/);
+  assert.match(t, /at most 6 sessions, the most recently active first/);
+  assert.match(wakeInstruction(), /at most 4 sessions/);
   assert.match(t, /remoteControlActive false/);
   assert.match(t, /refused/);
   assert.match(t, /not a scheduled task/);

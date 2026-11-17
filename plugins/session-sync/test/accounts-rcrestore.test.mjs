@@ -336,13 +336,87 @@ test('L1 readLaunchOutcome: the pass summary and verdict lines after the start, 
 /* ------------------------------------------------------------------ settings */
 
 test('S1 rcSettings: defaults on, 3 days, wake on; partial blocks keep the other defaults; bad values fall back', () => {
-  assert.deepEqual(rcSettings({}), { enabled: true, days: 3, wake: true });
-  assert.deepEqual(RC_DEFAULTS, { enabled: true, days: 3, wake: true });
-  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false });
-  assert.deepEqual(rcSettings({ rcRestore: { enabled: false, days: 7 } }), { enabled: false, days: 7, wake: true });
+  assert.deepEqual(rcSettings({}), { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual(RC_DEFAULTS, { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4 });
+  assert.deepEqual(rcSettings({ rcRestore: { enabled: false, days: 7 } }), { enabled: false, days: 7, wake: true, wakeMax: 4 });
   assert.equal(rcSettings({ rcRestore: { days: 0 } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 'many' } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 400 } }).days, 3);
-  assert.deepEqual(rcSettings({ rcRestore: 'yes' }), { enabled: true, days: 3, wake: true });
-  assert.deepEqual(rcSettings(undefined), { enabled: true, days: 3, wake: true });
+  assert.deepEqual(rcSettings({ rcRestore: 'yes' }), { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual(rcSettings(undefined), { enabled: true, days: 3, wake: true, wakeMax: 4 });
+});
+
+test('E12 a linked account: one conversation per org folder counts once; 4 distinct sessions get the marker, once each, hard links kept', () => {
+  const w = world();
+  const org2 = addFolder(w.store, ME, uuid('f', 2));
+  const sessions = [];
+  for (let n = 1; n <= 6; n++) {
+    const s = session(w, n, { agoMs: n * 600_000, bridge: n <= 2 ? STALE : undefined });   // 1 and 2 also need a relink
+    const twin = join(org2.path, recordName(n));
+    linkSync(s.file, twin);
+    sessions.push({ ...s, twin });
+  }
+  const plan = rcPlan(w.ctx, { projects: w.projects });
+  assert.equal(plan.recent, 6, 'twelve record files, six conversations');
+  assert.deepEqual(plan.targets.map((t) => t.id), [1, 2, 3, 4].map((n) => `local_${uuid('c', n)}`), '4 distinct sessions, not 2 sessions twice');
+  assert.equal(new Set(plan.targets.map((t) => t.id)).size, MAX_RESTORE);
+  assert.equal(plan.relink.length, 2, 'one relink per transcript');
+  const res = applyPlan(w.ctx, plan, { stopped: () => true });
+  assert.equal(res.marked, 4);
+  assert.equal(res.relinked, 2);
+  assert.equal(res.skipped, 0);
+  for (let n = 1; n <= 6; n++) {
+    const { file, twin } = sessions[n - 1];
+    assert.equal(inoOf(file), inoOf(twin), 'still one inode');
+    assert.equal(nlinkOf(file), 2);
+    const marked = n <= 4;
+    assert.equal(readRecord(file).remoteControlLiveAtUpdateQuit !== undefined, marked, `session ${n}`);
+    assert.equal(readRecord(twin).remoteControlLiveAtUpdateQuit !== undefined, marked, `twin of ${n}`);
+  }
+  const root = join(w.acc, 'rc-restore', 'backup');
+  const saved = readdirSync(join(root, readdirSync(root)[0]));
+  assert.equal(saved.filter((x) => x.endsWith('.jsonl')).length, 2, 'one transcript backup each');
+  assert.equal(saved.filter((x) => x.endsWith('.json')).length, 4, 'one record backup each');
+  assert.equal(rcDoneText(res), 'Remote Control: 2 stale links reset, 4 sessions will reconnect when Claude opens.');
+});
+
+test('E12b copies that are separate files (not hard-linked) are all marked', () => {
+  const w = world();
+  const s = session(w, 1, {});
+  const org2 = addFolder(w.store, ME, uuid('f', 2));
+  const twin = join(org2.path, recordName(1));
+  writeFileSync(twin, readFileSync(s.file));
+  const plan = rcPlan(w.ctx, { projects: w.projects });
+  assert.equal(plan.targets.length, 1);
+  assert.equal(applyPlan(w.ctx, plan, { stopped: () => true }).marked, 1);
+  assert.deepEqual(readRecord(s.file).remoteControlLiveAtUpdateQuit, { at: NOW, accountId: ME });
+  assert.deepEqual(readRecord(twin).remoteControlLiveAtUpdateQuit, { at: NOW, accountId: ME });
+});
+
+test('E13 an explicit "RC off" is never switched back on; sessions with the flag on come before link history only', () => {
+  assert.equal(eligible({ cliSessionId: uuid('d', 1), remoteControlUserEnabled: false, bridgeSessionIds: ['s'] }), false, 'off wins over old link ids');
+  const w = world();
+  session(w, 1, { agoMs: 1000, rec: { remoteControlUserEnabled: undefined } });             // history only, newest
+  session(w, 2, { agoMs: 2000, rec: { remoteControlUserEnabled: undefined } });             // history only
+  session(w, 3, { agoMs: 3000, rec: { remoteControlUserEnabled: false } });                 // turned off: vetoed
+  for (let n = 4; n <= 7; n++) session(w, n, { agoMs: n * 10_000 });                        // flag on, older
+  const ids = rcPlan(w.ctx, { projects: w.projects }).targets.map((t) => t.id);
+  assert.deepEqual(ids, [4, 5, 6, 7].map((n) => `local_${uuid('c', n)}`), 'the four flagged ones, not the newer history-only ones');
+  assert.equal(ids.includes(`local_${uuid('c', 3)}`), false);
+  // fewer flagged than slots: history-only fill the rest, newest first
+  const w2 = world();
+  session(w2, 1, { agoMs: 1000, rec: { remoteControlUserEnabled: undefined } });
+  session(w2, 2, { agoMs: 2000, rec: { remoteControlUserEnabled: undefined } });
+  session(w2, 3, { agoMs: 3000 });
+  assert.deepEqual(rcPlan(w2.ctx, { projects: w2.projects }).targets.map((t) => t.id), [3, 1, 2].map((n) => `local_${uuid('c', n)}`));
+});
+
+test('S2 rcSettings wakeMax: default 4, 1 to 50, a bad value falls back', () => {
+  assert.equal(rcSettings({}).wakeMax, 4);
+  assert.equal(rcSettings({ rcRestore: { wakeMax: 10 } }).wakeMax, 10);
+  assert.equal(rcSettings({ rcRestore: { wakeMax: 0 } }).wakeMax, 4);
+  assert.equal(rcSettings({ rcRestore: { wakeMax: 51 } }).wakeMax, 4);
+  assert.equal(rcSettings({ rcRestore: { wakeMax: 2.5 } }).wakeMax, 4);
+  assert.equal(rcSettings({ rcRestore: { wakeMax: 'many' } }).wakeMax, 4);
 });

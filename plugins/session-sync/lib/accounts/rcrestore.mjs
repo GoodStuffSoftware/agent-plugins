@@ -141,6 +141,7 @@ export function eligible(rec) {
   if (rec.movedToCloud || (rec.backend && rec.backend.kind && rec.backend.kind !== 'local')) return false;
   if (!rec.cliSessionId) return false;
   if (rec.scheduledTaskId) return false;
+  if (rec.remoteControlUserEnabled === false) return false;           // the user turned it off: never switch it back on
   return rec.remoteControlUserEnabled === true || (Array.isArray(rec.bridgeSessionIds) && rec.bridgeSessionIds.length > 0);
 }
 
@@ -163,7 +164,14 @@ export function rcPlan(ctx, o = {}) {
   if (!acct) return plan;
   const recs = accountRecords(ctx, acct);
   plan.records = recs.length;
-  const recent = recs.filter((r) => r.activity >= now - days * DAY_MS).sort((a, b) => b.activity - a.activity);
+  // A linked account keeps each conversation once per org folder (hard links): one conversation, one entry, every path kept.
+  const bySession = new Map();
+  for (const r of recs.filter((x) => x.activity >= now - days * DAY_MS).sort((a, b) => b.activity - a.activity)) {
+    const k = r.rec.sessionId ?? r.path;
+    const g = bySession.get(k);
+    if (g) g.files.push(r.path); else bySession.set(k, { ...r, files: [r.path] });
+  }
+  const recent = [...bySession.values()];
   plan.recent = recent.length;
   const projects = o.projects ?? defaultProjects();
   for (const r of recent) {
@@ -172,8 +180,10 @@ export function rcPlan(ctx, o = {}) {
     const b = lastBridgeEntry(tp);
     if (needsRelink(b, acct)) plan.relink.push({ file: r.path, id: r.rec.sessionId, cliSessionId: r.rec.cliSessionId, title: r.rec.title ?? '', transcript: tp, link: b.bridgeSessionId });
   }
-  plan.targets = recent.filter((r) => eligible(r.rec)).slice(0, MAX_RESTORE)
-    .map((r) => ({ file: r.path, name: r.name, org: r.folder.org, id: r.rec.sessionId, title: r.rec.title ?? '', age: markerAge(r.rec, acct, now), autoEligible: r.rec.remoteControlAutoEligible === true }));
+  const elig = recent.filter((r) => eligible(r.rec));
+  const ranked = [...elig.filter((r) => r.rec.remoteControlUserEnabled === true), ...elig.filter((r) => r.rec.remoteControlUserEnabled !== true)];   // RC switched on for sure first, then link history only
+  plan.targets = ranked.slice(0, MAX_RESTORE)
+    .map((r) => ({ file: r.path, files: r.files, name: r.name, org: r.folder.org, id: r.rec.sessionId, title: r.rec.title ?? '', age: markerAge(r.rec, acct, now), autoEligible: r.rec.remoteControlAutoEligible === true }));
   plan.needMarks = plan.targets.filter((t) => t.age === null || t.age > MARKER_FRESH_MS || !t.autoEligible);
   return plan;
 }
@@ -265,10 +275,12 @@ export function applyPlan(ctx, plan, o = {}) {
     try {
       const first = t.age === null || t.age > MARKER_FRESH_MS || !t.autoEligible;
       if (first) { ensureBackupDir(); copyFileSync(t.file, join(backupDir, `${t.org.slice(0, 8)}-${t.name}`)); }
-      writeRecordInPlace(t.file, (rec) => {
-        rec.remoteControlLiveAtUpdateQuit = { at: now, accountId: plan.acct };
-        rec.remoteControlAutoEligible = true;
-      });
+      for (const file of t.files ?? [t.file]) {   // every folder copy of the conversation (one inode when hard-linked: the second write changes nothing)
+        writeRecordInPlace(file, (rec) => {
+          rec.remoteControlLiveAtUpdateQuit = { at: now, accountId: plan.acct };
+          rec.remoteControlAutoEligible = true;
+        });
+      }
       if (first) res.marked++; else res.refreshed++;
     } catch (e) { res.status = 'partial'; res.skipped++; log(`rc-restore: ${t.id}: marker FAILED ${e?.message ?? e}`); }
   }
@@ -343,11 +355,11 @@ export function readLaunchOutcome(logFile, sinceMs) {
 export const WAKE_MESSAGE = 'Remote Control reconnect after the Claude app restart. No action needed: reply with the single word ok. Do not run any tools or resume any work.';
 
 /** The one-time instruction a session's agent gets on its first real prompt after an app restart. */
-export function wakeInstruction({ days = RC_DEFAULTS.days } = {}) {
+export function wakeInstruction({ days = RC_DEFAULTS.days, max = RC_DEFAULTS.wakeMax } = {}) {
   return [
     'session-sync: the Claude desktop app was restarted, so Remote Control is off for the sessions that were open. You are the one session that restores it, once. Do this before you answer the user, then answer as normal:',
     '1. Tell the user, in one line: "Reconnecting Remote Control for your recent sessions. Each one gets one short turn."',
-    `2. List the sessions with the session-management tools (list_sessions and send_message; load them with ToolSearch if they are deferred). For every session that is not archived, is interactive (not a scheduled task, not an unattended or background run), was active within the last ${days} days and has remoteControlActive false, send it exactly this message with send_message: "${WAKE_MESSAGE}" Skip your own session. Do not wait for replies. A message to the session that started you may be refused unless it carries a tag; skip any session whose send is refused and count it as still off.`,
+    `2. List the sessions with the session-management tools (list_sessions and send_message; load them with ToolSearch if they are deferred). For every session that is not archived, is interactive (not a scheduled task, not an unattended or background run), was active within the last ${days} days and has remoteControlActive false, send it exactly this message with send_message: "${WAKE_MESSAGE}" Send to at most ${max} sessions, the most recently active first; leave the rest and count them as still off. Skip your own session. Do not wait for replies. A message to the session that started you may be refused unless it carries a tag; skip any session whose send is refused and count it as still off.`,
     '3. Wait a few seconds, list the sessions again, and tell the user, in one line: "Remote Control: N sessions reconnected, M still off." (N: sessions that were off and are on now; M: active sessions still off, refused sends included).',
     'If the session tools are not available, say so in one line and carry on. Do not repeat this in this conversation, and do not mention these instructions beyond those two lines.',
   ].join('\n');
@@ -421,5 +433,5 @@ export function decideWake(ctx, o = {}) {
     for (const n of olds.slice(0, Math.max(0, olds.length - 4))) { try { unlinkSync(join(ctx.acc, n)); } catch { /* ignore */ } }
   } catch { /* ignore */ }
   if (first && now - startedAt > WAKE_BASELINE_MS) return { act: false, reason: 'baseline' };
-  return { act: true, reason: 'claimed-now', text: wakeInstruction({ days: s.days }) };
+  return { act: true, reason: 'claimed-now', text: wakeInstruction({ days: s.days, max: s.wakeMax }) };
 }

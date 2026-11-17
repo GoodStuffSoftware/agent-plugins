@@ -316,7 +316,7 @@ test('config progressIcon: on by default, saved as false and shown by `config`',
 
 test('config rcRestore.*: defaults on / 3 days / wake on, each key validated and saved without touching the others, shown by `config`', () => {
   const w = cworld();
-  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: true, days: 3, wake: true });
+  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: true, days: 3, wake: true, wakeMax: 4 });
   assert.equal(w.run(['config', 'rcRestore.days', '0']).status, 2);
   assert.equal(w.run(['config', 'rcRestore.days', '91']).status, 2);
   assert.equal(w.run(['config', 'rcRestore.days', 'soon']).status, 2);
@@ -325,10 +325,15 @@ test('config rcRestore.*: defaults on / 3 days / wake on, each key validated and
   assert.equal(days.status, 0, days.stderr);
   const wake = w.run(['config', 'rcRestore.wake', 'false']);
   assert.equal(wake.status, 0, wake.stderr);
-  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: true, days: 7, wake: false });
+  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: true, days: 7, wake: false, wakeMax: 4 });
   assert.deepEqual(JSON.parse(readFileSync(join(w.stateDir, 'config.json'), 'utf8')).rcRestore, { days: 7, wake: false }, 'only what was set is stored');
   assert.equal(w.run(['config', 'rcRestore.enabled', 'off']).status, 0);
-  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: false, days: 7, wake: false });
+  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: false, days: 7, wake: false, wakeMax: 4 });
+  assert.equal(w.run(['config', 'rcRestore.wakeMax', '0']).status, 2);
+  assert.equal(w.run(['config', 'rcRestore.wakeMax', '51']).status, 2);
+  assert.equal(w.run(['config', 'rcRestore.wakeMax', 'x']).status, 2);
+  assert.equal(w.run(['config', 'rcRestore.wakeMax', '6']).status, 0);
+  assert.equal(JSON.parse(w.run(['config']).stdout).rcRestore.wakeMax, 6);
   assert.equal(w.run(['config', 'rcRestore.enabled', 'true']).status, 0);
   assert.equal(JSON.parse(w.run(['config']).stdout).rcRestore.enabled, true);
   assert.equal(w.run(['config', 'rcRestore.bogus', 'true']).status, 2);

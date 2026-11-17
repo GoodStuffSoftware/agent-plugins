@@ -337,7 +337,7 @@ let waiterArmedHere = false;   // this process already armed (or joined) the wai
 const armWaiter = (ctx, reason) => { waiterArmedHere = true; return ensureWaiter(ctx, reason, spawnWaiter); };
 
 /** The Remote Control restore settings (config rcRestore.*), read afresh. Windows only: elsewhere the whole feature is off. */
-const rcRestoreNow = () => (platform() === 'win32' ? rcSettings(loadConfig()) : { enabled: false, days: 3, wake: false });
+const rcRestoreNow = () => (platform() === 'win32' ? rcSettings(loadConfig()) : { enabled: false, days: 3, wake: false, wakeMax: 4 });
 
 /** The watcher also prepares Remote Control at the quit, with one account or several: a session start with the app running makes sure it is there. */
 function rcHookArm() {
@@ -855,6 +855,17 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
+  if (key === 'rcRestore.wakeMax') {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 1 || n > 50) {
+      console.error(`"${value}" is not a valid rcRestore.wakeMax: use a whole number of sessions from 1 to 50.`);
+      process.exit(2);
+    }
+    saveConfig({ rcRestore: { wakeMax: n } });
+    log(`config: rcRestore.wakeMax -> ${n}`);
+    console.log(JSON.stringify({ ok: true, 'rcRestore.wakeMax': n, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
   if (key === 'rcRestore.days') {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 1 || n > 90) {
@@ -866,7 +877,7 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'rcRestore.days': n, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake');
+  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax');
   process.exit(2);
 }
 
