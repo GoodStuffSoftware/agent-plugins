@@ -397,6 +397,8 @@ async function accountsPass(ctx, reason) {
     ? await fullPass(ctx, { app, remoteList, reasons: [reason] })
     : await livePass(ctx, { app, remoteList });
   if (res.armWaiter || res.aborted || loadState(ctx).fullPassOwed) armWaiter(ctx, 'deferred');
+  // the singleton watcher follows account switches while the app runs (go-live's last pass, every push and pull)
+  else if (app.running) armWaiter(ctx, 'watch');
   return res;
 }
 
@@ -439,6 +441,21 @@ function claimAsk(ctx, pend) {
   const day = new Date(ctx.now()).toISOString().slice(0, 10).replace(/-/g, '');
   const file = accPath(ctx, `ask-claim-${hash}-${day}`);
   try { mkdirSync(dirname(file), { recursive: true }); closeSync(openSync(file, 'wx')); return true; } catch { return false; }
+}
+
+/**
+ * The one-time "Restart Claude to sync your accounts" for an account that joins a group that is already linked while the app runs
+ * (its folder is loaded, so it gets its conversations only at the next load; the full pass at the quit links it). One notice per
+ * account: the marker is created with `wx`. Returns the account ids that have not been told yet.
+ */
+function claimRestartNotice(ctx, state, group) {
+  const out = [];
+  const known = new Set((state.group ?? []).map((k) => String(k).split('/')[0]));   // a new org of an account that is already linked needs no notice
+  for (const a of new Set(group.filter((f) => !known.has(f.acct)).map((f) => f.acct))) {
+    const file = accPath(ctx, `restart-notice-${a.slice(0, 8)}`);
+    try { mkdirSync(dirname(file), { recursive: true }); closeSync(openSync(file, 'wx')); out.push(a); } catch { /* told already */ }
+  }
+  return out;
 }
 
 /**
@@ -492,6 +509,15 @@ async function accountsHookStepInner(parts) {
   const group = groupOf(state, folders);
   if (group.length < 2) return;
   const stamp = accPath(ctx, state.linked ? 'hook-rectify.stamp' : 'hook-link.stamp');
+  if (state.linked && lockfilePresent(ctx)) {
+    armWaiter(ctx, 'watch');
+    const told = claimRestartNotice(ctx, state, group);
+    if (told.length) {
+      parts.push(`session-sync: ${told.length === 1 ? 'A Claude account' : 'Some Claude accounts'} (${told.map((a) => a.slice(0, 8)).join(', ')}) joined the linked accounts. ${RESTART_LEAD_WAITER}`);
+      accountsToast('Restart Claude to sync your accounts', 'A newly signed-in account gets its conversations after one restart of Claude.');
+      log(`accounts: restart notice for ${told.length} new account(s)`);
+    }
+  }
   if (!state.linked) {
     if (lockfilePresent(ctx)) { armWaiter(ctx, 'link'); log('accounts: app running, waiter armed for the link'); }
     else if (!stampRecent(stamp, HOOK_DEBOUNCE_MS)) { writeStamp(stamp); spawnDetachedSelf(['accounts', 'link', '--from-hook']); log('accounts: link started in the background'); }
@@ -648,6 +674,7 @@ async function accountsCommand(sub, args) {
       return res.ok ? 0 : 3;
     }
     const w = armWaiter(ctx, 'link');
+    if (state.linked) claimRestartNotice(ctx, state, groupOf(state, listFolders(ctx.store)));   // told here, so the next session start does not say it again
     emit({ ok: true, command: 'answer', answered: pend.length, answer, waiter: w.action },
       [RESTART_LEAD_WAITER, `Recorded: sharing (${pend.length} pair(s)). Claude is running. The first link takes a backup, then links, and a notice says when it is done.`]);
     return 0;
@@ -733,7 +760,7 @@ async function accountsCommand(sub, args) {
 
   if (sub === 'wait') {
     const i = args.indexOf('--reason');
-    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', notify: accountsToast, log });
+    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', watch: true, notify: accountsToast, log });
     log(`accounts waiter: ${out.exit}${out.report ? ` (${out.report.op} ${out.report.ok ? 'ok' : out.report.error ?? out.report.reason ?? 'not ok'})` : ''}`);
     return 0;
   }

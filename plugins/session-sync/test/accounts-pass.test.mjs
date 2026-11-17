@@ -193,12 +193,12 @@ test('live pass with an unknown signed-in account treats every folder as live: n
   assert.equal(rep.owed, true);
 });
 
-test('S5 live pass: after an in-app switch A -> B, B\'s task run reaches A\'s file, so switching back does not re-fire the catch-up', async () => {
+test("S5 live pass: after an in-app switch A -> B, B's task run reaches A's file once A has cooled, so switching back does not re-fire the catch-up", async () => {
   const w = world();
   assert.equal((await link(w.ctx, {})).ok, true);
   const started = w.clock.tick();
   w.sim.setApp({ running: true, signedIn: A, startedAtMs: started });
-  assert.equal((await livePass(w.ctx, {})).ok, true);                         // A becomes part of the sticky live set
+  assert.equal((await livePass(w.ctx, {})).ok, true);
   w.sim.setApp({ running: true, signedIn: B, startedAtMs: started });         // in-app switch to B
   const now = w.clock.tick();
   const d = new Date(now); d.setUTCHours(5, 20, 0, 0);
@@ -206,8 +206,13 @@ test('S5 live pass: after an in-app switch A -> B, B\'s task run reaches A\'s fi
   w.sim.runTask(w.fB, 'tA', slot);                                            // the scheduler runs tA under B
   const rep = await livePass(w.ctx, {});
   assert.equal(rep.ok, true, JSON.stringify(rep));
-  assert.ok(rep.live.includes(w.fA.key), 'the sticky set still holds A for records');
-  assert.equal(rep.tasks.skipped.some((x) => x.folder === w.fA.key), false, 'A\'s task file is not live once B is signed in');
+  assert.deepEqual(rep.live, [w.fB.key], 'B is the loaded folder');
+  assert.deepEqual(rep.cooling, [w.fA.key], 'A was just switched away from');
+  assert.equal(rep.tasks.skipped.some((x) => x.folder === w.fA.key), true, 'the task file of A waits while A cools (its sessions still flush)');
+  w.ctx.setNow(w.ctx.now() + 16000);                                          // the cooling period (15 s) is over: A is free
+  const rep2 = await livePass(w.ctx, {});
+  assert.deepEqual(rep2.cooling, []);
+  assert.equal(rep2.tasks.skipped.some((x) => x.folder === w.fA.key), false, 'the task file of A is written now');
   w.sim.setApp({ running: true, signedIn: A, startedAtMs: started });         // switch back: the scheduler re-reads A's file
   const fired = w.sim.catchUp(join(w.fA.path, 'scheduled-tasks.json'), now) ?? [];
   assert.equal(fired.includes('tA'), false, 'the slot B already ran must not fire again');   // tB never ran anywhere: it may fire

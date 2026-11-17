@@ -110,8 +110,10 @@ test('T20 auto with the app running: arms the waiter, the link runs after the ap
   assert.equal(w.state()?.linked ?? false, false, 'nothing is linked while the app runs');
   w.setApp({ running: false });
   assert.equal(waitFor(() => w.state()?.linked === true), true, 'the waiter linked after the app exited');
-  assert.equal(waitFor(() => !existsSync(join(w.acc, 'waiter.claim'))), true, 'and exited');
-  assert.equal(readJson(join(w.acc, 'last-pass.json'))?.ok, true);
+  assert.equal(waitFor(() => readJson(join(w.acc, 'last-pass.json'))?.ok === true), true, 'and said so');
+  // the waiter stays on as the account-switch watcher, with no reason left but "watch"
+  assert.equal(waitFor(() => (readJson(join(w.acc, 'waiter.json'))?.reasons ?? []).join() === 'watch'), true, 'it keeps watching');
+  assert.equal(existsSync(join(w.acc, 'waiter.claim')), true);
 });
 
 /* ------------------------------------------------------------------ accounts commands */

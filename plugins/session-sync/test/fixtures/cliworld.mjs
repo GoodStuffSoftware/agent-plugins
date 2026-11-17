@@ -9,6 +9,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { emptyState, saveState, readJson } from '../../lib/accounts/state.mjs';
+import { pidAlive } from '../../lib/lock.mjs';
 import { addFolder, putRecord, uuid, makeClock } from './store.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -62,7 +63,10 @@ export function cworld({ config = {}, accounts = 2, records = 2 } = {}) {
       });
     },
     cleanup() {
-      waitFor(() => !existsSync(join(stateDir, 'accounts', 'waiter.claim')), { timeoutMs: 5000 });
+      // a waiter stays on as the account-switch watcher: end it (it would otherwise poll a removed folder until it notices)
+      const claim = readJson(join(stateDir, 'accounts', 'waiter.claim'), null);
+      if (claim?.pid && claim.pid !== process.pid) { try { process.kill(claim.pid); } catch { /* already gone */ } }
+      waitFor(() => !claim?.pid || !pidAlive(claim.pid), { timeoutMs: 5000 });
       for (const d of [home, remote]) { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ } }
     },
   };

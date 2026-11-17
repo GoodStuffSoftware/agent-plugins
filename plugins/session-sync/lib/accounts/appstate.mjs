@@ -313,6 +313,74 @@ export function liveFolders(app, folders, state) {
   return live;
 }
 
+/* ------------------------------------------------------------------ folder roles (account switches) */
+
+/**
+ * The app reads an account's folder when it LOADS it (that account signs in) and holds every record in memory from then on,
+ * so what may be written depends on what the app has loaded, not on what it ever wrote:
+ *   loaded   the signed-in account's folders (all its orgs; the current org is not visible): ADD only
+ *   cooling  the account that was signed in a moment ago: its sessions still flush and tear down into its folder for a few
+ *            seconds after the switch, so it is ADD only until `G_SWITCH_MS` has passed
+ *   free     every other folder of the group: the app does not hold it, so it can be kept fully current
+ * An unknown signed-in account makes every folder loaded (the old rule). A stopped app loads nothing.
+ */
+export const G_SWITCH_MS = 15 * 1000;
+
+/** The record names in a folder as `{id: dev:ino}`: what the app most likely loads when it opens the folder. */
+export function snapshotFolder(path) {
+  const out = {};
+  let names;
+  try { names = readdirSync(path); } catch { return out; }
+  for (const n of names) {
+    const m = /^(local_[0-9a-f-]{36})\.json$/i.exec(n);
+    if (!m) continue;
+    try { const s = statSync(join(path, n), { bigint: true }); out[m[1].toLowerCase()] = `${s.dev}:${s.ino}`; } catch { /* vanished */ }
+  }
+  return out;
+}
+
+/**
+ * Note the signed-in account in `state.signed` = {acct, at, prev, cooling: {acct: untilMs}, unloadedAt: {acct: ms}}.
+ * Returns {changed, prev}. An unknown account changes nothing; the first sight of an account is not a switch.
+ */
+export function noteSwitch(state, signedIn, now) {
+  if (!signedIn) return { changed: false, prev: null };
+  const cur = state.signed;
+  if (!cur?.acct) { state.signed = { acct: signedIn, at: now, prev: null, cooling: {}, unloadedAt: {} }; return { changed: false, prev: null }; }
+  if (cur.acct === signedIn) return { changed: false, prev: cur.prev ?? null };
+  const cooling = {};
+  for (const [a, until] of Object.entries(cur.cooling ?? {})) if (until > now && a !== signedIn) cooling[a] = until;
+  cooling[cur.acct] = now + G_SWITCH_MS;
+  const unloadedAt = { ...(cur.unloadedAt ?? {}), [cur.acct]: now };
+  delete unloadedAt[signedIn];
+  state.signed = { acct: signedIn, at: now, prev: cur.acct, cooling, unloadedAt };
+  return { changed: true, prev: cur.acct };
+}
+
+/**
+ * Roles of the group's folders for a pass (call noteSwitch first). `gainedKeys` are group folders that no full pass has
+ * covered yet (a newly linked account): they stay ADD only until the full pass has taken its safety backup.
+ * @returns {{loaded:Set<string>, cooling:Set<string>}} folder keys; a key in neither set is free
+ */
+export function folderRoles(app, folders, state, now, gainedKeys = []) {
+  const loaded = new Set(); const cooling = new Set();
+  if (!app.running) return { loaded, cooling };
+  if (!app.signedIn) { for (const f of folders) loaded.add(f.key); return { loaded, cooling }; }
+  for (const f of folders) {
+    if (f.acct === app.signedIn) loaded.add(f.key);
+    else if ((state.signed?.cooling?.[f.acct] ?? 0) > now) cooling.add(f.key);
+  }
+  for (const k of gainedKeys) if (!loaded.has(k)) cooling.add(k);
+  return { loaded, cooling };
+}
+
+/** When the next cooling period ends (ms), or 0 when none is running. */
+export function coolingEndsAt(state, now) {
+  let t = 0;
+  for (const until of Object.values(state.signed?.cooling ?? {})) if (until > now && (!t || until < t)) t = until;
+  return t;
+}
+
 function folderLooksLive(f, startedAtMs, tasksSha) {
   let names;
   try { names = readdirSync(f.path); } catch { return false; }
