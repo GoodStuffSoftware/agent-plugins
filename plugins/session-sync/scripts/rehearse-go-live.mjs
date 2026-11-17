@@ -133,7 +133,9 @@ function liveSnapshot() {
     files[n] = existsSync(p) ? sha(readFileSync(p)) : null;
   }
   const accDir = join(LIVE_STATE_DIR, 'accounts');
-  const acc = existsSync(accDir) ? new Map([...treeShape(accDir)].map(([k, v]) => [k, `${v.size}:${v.mtimeMs}`])) : new Map();
+  // a runner or waiter that is really alive on this machine beats its claim and state; those files are its own, not ours
+  const HEARTBEAT = /^(go-live\.claim|waiter\.claim|waiter\.json(\.bak)?)$/;
+  const acc = existsSync(accDir) ? new Map([...treeShape(accDir)].filter(([k]) => !HEARTBEAT.test(k)).map(([k, v]) => [k, `${v.size}:${v.mtimeMs}`])) : new Map();
   return { store: treeShape(SOURCE), files, acc };
 }
 
@@ -228,6 +230,8 @@ try {
   check('the runner is alive and waiting for the app to stop', waiting, `phase ${glState()?.phase}`);
   const claim = readJson(join(ACC, 'go-live.claim'));
   if (claim?.pid) { try { process.kill(claim.pid, 0); check('the runner pid is a live process, not a child of this script', true, `pid ${claim.pid}`); } catch { check('the runner pid is alive', false, `pid ${claim.pid}`); } }
+  const waitStatus = cli(['accounts', 'status']);
+  check('`accounts status` leads with the one restart line while waiting', /Restart Claude to sync your accounts/.test(waitStatus.out.split('\n').slice(0, 3).join('\n')), waitStatus.out.split('\n')[0].slice(0, 100));
   await sleep(2000);
   check('still waiting 2 s later (no link while the app runs)', existsSync(join(ACC, 'go-live.claim')) && !readJson(join(ACC, 'state.json'))?.linked);
 
@@ -247,6 +251,7 @@ try {
     for (const m of res.messages ?? []) info('message', m);
     if (hasRclone) check('the remote duplicate check ran and found 0', res.counts?.remoteDuplicates === 0, `ids ${res.counts?.remoteIds}, duplicates ${res.counts?.remoteDuplicates}`);
     check('result is ok (or attention only for the optional remote check)', res.status === 'ok' || (res.status === 'attention' && !(res.messages ?? []).some((m) => /PROBLEM|rolled/i.test(m))), res.status);
+    check('the finished result does not ask for a restart again', !(res.messages ?? []).some((m) => /Restart Claude to sync/.test(m)), '');
     check('result: split 0, missing 0', res.counts?.split === 0 && res.counts?.missing === 0, `split ${res.counts?.split}, missing ${res.counts?.missing}`);
     check('result names a backup and its rollback script', !!res.backupId && !!res.rollbackScript && existsSync(res.rollbackScript), res.backupId ?? '');
     check('push was switched back on once the copy could filter', res.push?.reEnabled === true && pushOn() === true, JSON.stringify(res.push));

@@ -15,6 +15,7 @@ import { spawnSync } from 'node:child_process';
 import {
   planGoLive, beginGoLive, runGoLive, resumeIfDead, takeGoLiveReport, goLiveInProgress, runnerAlive, readGoLive, readGoLiveResult,
   goLiveFile, goLiveResultFile, goLiveLogFile, verifyLinked, expectedSet, readListing, defaultRollback, copyWords,
+  DEFAULT_TIMEOUTS, STOP_POLL_MS, STOP_GAP_MS, PLUGIN_VERSION, replaceWaitingRunner,
 } from '../lib/accounts/golive.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations, accPath, rollbackMarkerFile } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey, listFolders } from '../lib/accounts/folders.mjs';
@@ -125,7 +126,7 @@ test('plan: refuses one account, an already linked store, a rollback marker, an 
 
 test('plan: summary numbers, and desktop copies judged by capability, not version', () => {
   const w = world({ copies: [{ capable: true }, { capable: false }] });
-  const plan = planGoLive(w.ctx);
+  const plan = planGoLive(w.ctx, { copies: (c) => sessionSyncCopies(c, { home: join(w.r.root, 'home') }) });   // never the real terminal install
   assert.equal(plan.ok, true);
   assert.equal(plan.accounts, 2);
   assert.equal(plan.folders, 2);
@@ -181,6 +182,7 @@ test('runner: the whole path ok - waits for stop, links, verifies, relaunches, w
   assert.ok(r.backupId);
   assert.ok(existsSync(r.rollbackScript), 'the standalone rollback script is named in the result');
   assert.equal(r.resumable, false);
+  assert.doesNotMatch(r.messages.join('\n'), /Restart Claude to sync/, 'the finished result never asks for a restart again');
   assert.deepEqual(calls.push, []);
   assert.equal(calls.relaunch, 1);
   assert.equal(calls.rectify, 1);
@@ -1059,4 +1061,253 @@ test('S5 hook launch: the helper is a tiny detached hidden node, never PowerShel
     assert.equal(seam.method, 'test-log');
     assert.deepEqual(JSON.parse(readFileSync(log, 'utf8').trim()), { args: ['accounts', 'golive-run'] });
   } finally { rmSync(log, { force: true }); }
+});
+
+/* ------------------------------------------------------------------ 0.5.1: no wait limit, fast start, relaunch in every end state, replace, restart */
+
+const claimPath = (w) => join(w.acc, 'go-live.claim');
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+/** A stand-in for a runner: a real, idle, hidden node process that only the test (and the code under test) may end.
+ *  It is NOT our child (its parent exits at once, so init reaps it like a real detached runner; a child of ours would stay
+ *  a zombie that still answers kill(pid, 0) on Linux and macOS). */
+const fakeRunner = () => {
+  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
+  const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true });
+  const pid = Number(String(r.stdout).trim());
+  return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
+};
+const writeClaim = (w, pid, extra = {}) => writeFileSync(claimPath(w), JSON.stringify({ pid, at: w.ctx.now(), beatAt: w.ctx.now(), ...extra }));
+
+test('0.5.1 wait-stop has no time limit by default: a very long wait ends when the app stops, and a stored 30 minute limit is ignored', async () => {
+  assert.equal(DEFAULT_TIMEOUTS.stopMs, Infinity);
+  const w = world();
+  w.setApp(true);
+  let t = 0;
+  const { d } = deps(w, { clock: () => (t += 3_600_000), onSleep: (n) => { if (n === 40) w.setApp(false); } });   // an hour per reading
+  start(w, d);
+  const g = readGoLive(w.ctx); g.deadlines['wait-stop'] = 1; writeFileSync(goLiveFile(w.ctx), JSON.stringify(g));   // what a 0.5.0 runner stored
+  const out = await runGoLive(w.ctx, d);
+  assert.deepEqual(out, { exit: 'done', status: 'ok' });
+  assert.equal(loadState(w.ctx).linked, true);
+  assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /Restart Claude to sync your accounts: quit Claude from the tray icon or app menu[^\n]*no time limit/);
+  assert.doesNotMatch(readGoLive(w.ctx).messages.join('\n'), /Restart Claude to sync/, 'once the app stopped, the ask is not kept in the result');
+});
+
+test('0.5.1 the verify-stop wait has no limit either: it ends only on a stopped app', async () => {
+  const w = world();
+  let t = 0; let came = false;
+  const { d } = deps(w, {
+    clock: () => (t += 3_600_000),
+    onPhase: (p) => { if (p === 'verify' && !came) { came = true; w.setApp(true); } },   // the app comes back right after the link
+    onSleep: (n) => { if (came && n % 30 === 0) w.setApp(false); },
+  });
+  start(w, d);
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'ok');
+  assert.match(readGoLive(w.ctx).messages.join('\n'), /The app is running; the check waits/);
+});
+
+test('0.5.1 intervals: the stop wait looks every half second, and the link starts within about 2 seconds of the app stopping', async () => {
+  assert.ok(STOP_POLL_MS <= 500 && STOP_GAP_MS <= 500, `poll ${STOP_POLL_MS} ms, confirm gap ${STOP_GAP_MS} ms`);
+  const w = world();
+  w.setApp(true);
+  let stoppedAt = 0; let relistAt = 0;
+  const d = {   // no pollMs, gapMs, clock or sleep: the real defaults
+    appStatus: () => { const o = readJson(w.appFile, {}); return { fullAllowed: !o.running, running: !!o.running }; },
+    onPhase: (p) => { if (p === 'relist') relistAt = Date.now(); },
+    haltAfter: 'relist',
+  };
+  start(w, d);
+  setTimeout(() => { stoppedAt = Date.now(); w.setApp(false); }, 300);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'halted' });
+  const took = relistAt - stoppedAt;
+  assert.ok(took >= STOP_GAP_MS - 50 && took < 2000, `the link phase began ${took} ms after the app stopped`);
+});
+
+/** Run a go-live to an end state; `rel` lists the phase each app start happened in. mk(w) gives the extra deps. */
+async function endState(mk, { setup, opts } = {}) {
+  const w = world();
+  setup?.(w);
+  const rel = [];
+  let phase = '';
+  const o = mk(w);
+  const relaunchResult = o.relaunchResult; delete o.relaunchResult;
+  const { d } = deps(w, {
+    ...o,
+    onPhase: (p) => { phase = p; return o.onPhase?.(p); },
+    relaunch: async () => { rel.push(phase); w.setApp(true); return relaunchResult ?? { ok: true, method: 'test' }; },
+  });
+  start(w, d, opts);
+  const out = await runGoLive(w.ctx, d);
+  return { w, rel, out };
+}
+const damage = (w) => ({ afterLink: async () => { unlinkSync(join(w.fB.path, recordName(1))); } });
+
+test('0.5.1 relaunch, ok: Claude is started in the relaunch phase, before the pass and the remote check', async () => {
+  const { rel, out } = await endState(() => ({}));
+  assert.equal(out.status, 'ok');
+  assert.deepEqual(rel, ['relaunch']);
+});
+
+test('0.5.1 relaunch, attention: Claude is started once even when the remote check then needs attention', async () => {
+  const { rel, out, w } = await endState(() => ({ remoteCheck: async () => ({ checked: true, ids: 3, duplicates: 2 }) }));
+  assert.equal(out.status, 'attention');
+  assert.deepEqual(rel, ['relaunch']);
+  assert.equal(res(w).relaunch.ok, true);
+});
+
+test('0.5.1 relaunch, attention: a start that fails is reported and not retried', async () => {
+  const { rel, out, w } = await endState(() => ({ relaunchResult: { ok: false, error: 'no app id' }, timeouts: { startMs: 1000 } }));
+  assert.equal(out.status, 'attention');
+  assert.equal(rel.length, 1);
+  assert.match(res(w).attention.join('\n'), /Could not start Claude \(no app id\)/);
+});
+
+test('0.5.1 relaunch, rolled_back: Claude is started right after the rollback, before any later phase', async () => {
+  const { rel, out, w } = await endState(damage);
+  assert.equal(out.status, 'rolled_back');
+  assert.deepEqual(rel, ['verify']);
+  assert.match(res(w).messages.join('\n'), /Claude was started again/);
+});
+
+test('0.5.1 relaunch, failed (the rollback never finishes): Claude is started, and the failure text stays the last message', async () => {
+  const { rel, out, w } = await endState((w0) => ({ ...damage(w0), rollback: async () => ({ ok: false, code: 3 }) }));
+  assert.equal(out.status, 'failed');
+  assert.equal(rel.length, 1);
+  const m = res(w).messages;
+  assert.match(m[m.length - 1], /The rollback did not finish/);
+  assert.ok(m.some((x) => /Claude was started again/.test(x)));
+});
+
+test('0.5.1 relaunch, failed (another pass holds the lock too long): Claude is started; a second failure after another quit starts it again', async () => {
+  const w = world();
+  writeFileSync(join(w.acc, 'accounts.lock'), JSON.stringify({ pid: process.ppid, at: Date.now() }));
+  const mk = () => { const rel = []; const { d } = deps(w, { timeouts: { lockMs: 2000 }, relaunch: async () => { rel.push(1); w.setApp(true); return { ok: true, method: 'test' }; } }); return { rel, d }; };
+  const a = mk();
+  start(w, a.d);
+  assert.equal((await runGoLive(w.ctx, a.d)).status, 'failed');
+  assert.equal(a.rel.length, 1);
+  w.setApp(false);                       // the user quits Claude again and re-runs go-live
+  const b = mk();
+  assert.equal((await runGoLive(w.ctx, b.d)).status, 'failed');
+  assert.equal(b.rel.length, 1, 'started again after the second stop');
+});
+
+test('0.5.1 relaunch, failed (the runner throws): Claude is started', async () => {
+  const { rel, out, w } = await endState(() => ({ onPhase: (p) => { if (p === 'link') throw new Error('boom'); } }));
+  assert.equal(out.exit, 'failed');
+  assert.equal(res(w).status, 'failed');
+  assert.equal(rel.length, 1);
+});
+
+test('0.5.1 relaunch, failed (the app never stopped): Claude was never quit, so it is not started', async () => {
+  const { rel, out } = await endState(() => ({ timeouts: { stopMs: 2000 } }), { setup: (w) => w.setApp(true) });
+  assert.equal(out.status, 'failed');
+  assert.deepEqual(rel, []);
+});
+
+test('0.5.1 relaunch: --no-relaunch opts out in the rolled_back and failed end states too', async () => {
+  const a = await endState(damage, { opts: { noRelaunch: true } });
+  assert.equal(a.out.status, 'rolled_back');
+  assert.deepEqual(a.rel, []);
+  const b = await endState((w0) => ({ ...damage(w0), rollback: async () => ({ ok: false, code: 3 }) }), { opts: { noRelaunch: true } });
+  assert.equal(b.out.status, 'failed');
+  assert.deepEqual(b.rel, []);
+});
+
+test('0.5.1 replace: a runner waiting in wait-stop is ended, its stale limit dropped, and a new runner continues the same go-live', async () => {
+  const w = world();
+  w.setApp(true);
+  const { d } = deps(w);
+  const gl = start(w, d);
+  const g = readGoLive(w.ctx); g.deadlines['wait-stop'] = 5; writeFileSync(goLiveFile(w.ctx), JSON.stringify(g));
+  const child = fakeRunner();
+  try {
+    writeClaim(w, child.pid);                                   // a 0.5.0 runner: its claim has no version
+    assert.equal(runnerAlive(w.ctx), true);
+    const r = replaceWaitingRunner(w.ctx);
+    assert.equal(r.replaced, true);
+    assert.equal(alive(child.pid), false, 'the old runner is gone');
+    assert.equal(existsSync(claimPath(w)), false);
+    const after = readGoLive(w.ctx);
+    assert.equal(after.id, gl.id);
+    assert.equal(after.phase, 'wait-stop');
+    assert.deepEqual(after.deadlines, {});
+    assert.equal(res(w).status, 'waiting');
+    assert.equal(loadState(w.ctx).linked, false, 'nothing was changed');
+    w.setApp(false);
+    const { d: d2 } = deps(w);
+    assert.deepEqual(await runGoLive(w.ctx, d2), { exit: 'done', status: 'ok' });
+    assert.equal(res(w).id, gl.id, 'the new runner finished the same go-live');
+  } finally { try { child.kill(); } catch { /* gone */ } }
+});
+
+test('0.5.1 replace: refused in any other phase, for a runner of this version, with the app stopped, or with nothing waiting; nothing is ended', async () => {
+  const kill = () => assert.fail('no process may be ended');
+  assert.equal(replaceWaitingRunner(world().ctx, { kill }).reason, 'no-waiting-runner');
+  // another phase (the link is done, verify is next)
+  const busy = world();
+  const { d } = deps(busy, { haltAfter: 'link' });
+  start(busy, d);
+  await runGoLive(busy.ctx, d);
+  writeClaim(busy, process.ppid);
+  assert.deepEqual(replaceWaitingRunner(busy.ctx, { kill, appRunning: () => true }), { replaced: false, reason: 'busy', phase: 'verify' });
+  // a runner of this very version
+  assert.ok(PLUGIN_VERSION, 'the plugin version is readable');
+  const same = world(); start(same, deps(same).d);
+  writeClaim(same, process.ppid, { version: PLUGIN_VERSION });
+  assert.equal(replaceWaitingRunner(same.ctx, { kill, appRunning: () => true }).reason, 'current');
+  // the app is stopped: the link is about to start and is not interrupted
+  const stopped = world(); start(stopped, deps(stopped).d);
+  writeClaim(stopped, process.ppid);
+  assert.equal(replaceWaitingRunner(stopped.ctx, { kill, appRunning: () => false }).reason, 'app-stopped');
+  assert.equal(readGoLive(stopped.ctx).phase, 'wait-stop');
+});
+
+test('0.5.1 hook restart: a dead runner in wait-stop is restarted once, never twice in a row, never past five, never beside a live one', async () => {
+  const w = world();
+  w.setApp(true);
+  start(w, deps(w).d);
+  const dead = spawnSync(process.execPath, ['-e', ''], { windowsHide: true }).pid;
+  writeClaim(w, dead);
+  const launched = [];
+  const launch = (a) => { launched.push(a); return { ok: true, method: 'test' }; };
+  assert.equal(resumeIfDead(w.ctx, launch).resumed, true);
+  assert.deepEqual(launched, [['accounts', 'golive-run']]);
+  assert.deepEqual(resumeIfDead(w.ctx, launch), { resumed: false, reason: 'recent' }, 'two hooks that start together launch once');
+  assert.equal(launched.length, 1);
+  const stamp = join(w.acc, 'go-live-resume.json');
+  const age = (tries) => writeFileSync(stamp, JSON.stringify({ id: readGoLive(w.ctx).id, at: w.ctx.now() - 3 * 60 * 1000, tries }));
+  for (let tries = 1; tries < 5; tries++) { age(tries); assert.equal(resumeIfDead(w.ctx, launch).resumed, true); }
+  age(5);
+  assert.deepEqual(resumeIfDead(w.ctx, launch), { resumed: false, reason: 'gave-up' }, 'no respawn loop');
+  // a live runner is left alone, and the count starts again
+  writeClaim(w, process.ppid);
+  assert.equal(resumeIfDead(w.ctx, () => assert.fail('a runner is alive')).resumed, false);
+  assert.equal(existsSync(stamp), false);
+  // a runner whose heartbeat went stale (a hung or frozen one, or a reboot that reused its pid) counts as gone
+  writeClaim(w, process.ppid, { beatAt: w.ctx.now() - 20 * 60 * 1000 });
+  assert.equal(resumeIfDead(w.ctx, launch).resumed, true);
+});
+
+test('0.5.1 hook restart: a failed go-live is not restarted by a session start (only an explicit go-live resumes it)', async () => {
+  const w = world();
+  w.setApp(true);
+  const { d } = deps(w, { timeouts: { stopMs: 2000 } });
+  start(w, d);
+  assert.equal((await runGoLive(w.ctx, d)).status, 'failed');
+  writeClaim(w, spawnSync(process.execPath, ['-e', ''], { windowsHide: true }).pid);
+  assert.equal(resumeIfDead(w.ctx, () => assert.fail('a failed go-live is not restarted')).resumed, false);
+});
+
+test('0.5.1 notices: the wait text leads with Restart Claude to sync your accounts, in the status line and the session notice', () => {
+  const w = world();
+  start(w, deps(w).d);
+  const text = takeGoLiveReport(w.ctx) ?? '';
+  assert.equal(text, '', 'a waiting runner is not announced before it has done something');
+  const lead = /Restart Claude to sync your accounts: quit Claude from the tray icon or app menu/;
+  const st = formatStatus(collectStatus(w.ctx, { probe: false })).join('\n');
+  assert.match(st, new RegExp(`^${lead.source}`), 'the first line of accounts status');
+  assert.match(st, /no time limit/);
+  assert.match(st, /Closing the window only hides it/);
 });

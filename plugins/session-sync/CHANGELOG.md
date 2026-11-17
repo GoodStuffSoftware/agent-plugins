@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.1 (2026-11-16)
+
+### Fixed
+
+* **session-sync:** `accounts go-live` no longer gives up after 30 minutes. The wait for you to quit Claude has no time limit (the later check and rollback waits have none either, so a linked but unchecked store is never left for you to sort out). The link starts as soon as the app stops: the runner looks twice a second and calls the app stopped on two readings half a second apart, so it begins about 2 seconds after the quit instead of up to 40.
+* **session-sync:** the runner survives a reboot or a crash while it waits. A session start restarts the runner of a go-live that is waiting (dead process or stale heartbeat), once, through the hidden launcher, never beside a live runner, never for a failed or finished go-live, and never more than five times without a runner coming up.
+* **session-sync:** running `accounts go-live` again while a runner waits for the app to stop replaces it with one from the current plugin version and keeps the go-live id and state (the wait holds no lock and changes nothing). In any other phase it leaves the runner alone.
+* **session-sync:** Claude is started again in every end state reached after it was quit: right after the verified link, right after a rollback, and also when the go-live fails or the runner stops on an error. `--no-relaunch` still opts out.
+
+### Changed
+
+* **session-sync:** the link prompt leads with one line: "Restart Claude to sync your accounts: quit Claude from the tray icon or app menu, the sync starts right away and Claude reopens by itself when it is done." It is shown only for an account that is not linked yet (the SessionStart question, `go-live`, `accounts status`), once per new account. After the link nothing asks you to restart or quit: owed work waits for your next normal quit and finishes silently, and a routine full pass sends no notification. A notice is only for a real problem.
+
 ## 0.5.0 (2026-11-16)
 
 ### Features

@@ -170,6 +170,21 @@ test('T21 waiter: nothing owed exits at once; an owed full pass runs; the lifeti
   assert.equal(claimGone(w), true);
 });
 
+test('0.5.1 waiter: an owed full pass after the link finishes silently (no toast); the first link still says it is done', async () => {
+  const w = world();
+  const first = [];
+  const s0 = stepper();
+  assert.equal((await runWaiter(w.ctx, { ...common, reason: 'link', clock: s0.clock, sleep: s0.sleep, notify: (t) => first.push(t) })).exit, 'done');
+  assert.equal(first.length, 1, 'the link itself is announced');
+  const st = loadState(w.ctx); st.fullPassOwed = true; saveState(w.ctx, st);
+  const toasts = [];
+  const s = stepper();
+  const out = await runWaiter(w.ctx, { ...common, reason: 'owed', clock: s.clock, sleep: s.sleep, notify: (t) => toasts.push(t) });
+  assert.equal(out.exit, 'done');
+  assert.equal(readJson(join(w.acc, 'last-pass.json')).op, 'full');
+  assert.deepEqual(toasts, [], 'no notice for routine owed work after the link');
+});
+
 test('T21 waiter: an unlink reason unlinks, and the toast says so', async () => {
   const w = world();
   assert.equal((await fullPass(w.ctx, { reasons: ['link'] })).ok, true);

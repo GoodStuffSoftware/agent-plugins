@@ -120,6 +120,8 @@ The desktop app keeps Code-tab conversations per account and organization, in `c
 
 **How it works.** Each conversation appears in every linked folder as a hard link to one file, so the app in either account reads the same bytes. The app's own save replaces a file, which breaks that link; a rectify pass then keeps the newest copy, copies the older one to a backup folder and links the name again. Tasks, backlog and settings are kept in step by a three-way merge against the state at the last full pass.
 
+**Restart Claude to sync your accounts.** Quit Claude from the tray icon or app menu (macOS: Cmd+Q; closing the window only hides it). The sync starts right away. With `go-live` Claude reopens by itself when it is done; a plain `answer yes` or `link` waits for you to quit, tells you when it is done, and you open Claude again.
+
 **How it triggers.** Nothing runs until you say so. When a SessionStart finds two or more accounts it asks once per pair (at most three times, a week apart). Answer yes and, if Claude is running, the link waits for you to quit it from the tray icon (Windows) or Cmd+Q (macOS), because closing the window only hides it. The `accountLink` setting controls the question:
 
 | `accountLink` | Effect |
@@ -142,7 +144,7 @@ node lib/cli.mjs config accountLink off     # ask | auto | off
 |---|---|
 | `status [--all] [--remote]` | accounts, pairs, link health, app state, tasks due a catch-up, and the claude.ai-only lists; `--remote` checks Drive for duplicates, `--all` lifts the list caps |
 | `answer yes\|no` | answer every pending pair (`yes` also re-answers pairs set to "no", so it links again after an unlink or rollback); yes links now when Claude is stopped, otherwise arms the link for when it exits |
-| `go-live [--yes] [--no-relaunch] [--quit-app]` | the whole go-live in one command: records your yes, then a hidden background runner waits for Claude to stop, backs up, links, verifies every folder, starts Claude again, runs a pass and checks the remote for duplicates. A failed check rolls back by itself. `--quit-app` has the runner ask Claude to quit a few seconds in (macOS only; on Windows and Linux you quit from the tray icon or the app menu and the runner waits). The next session start reports the result once. Running it again resumes an unfinished go-live |
+| `go-live [--yes] [--no-relaunch] [--quit-app]` | the whole go-live in one command: records your yes, then a hidden background runner waits for Claude to stop (no time limit: it starts as soon as you quit Claude, and a reboot or a dead runner is picked up again at the next session start), backs up, links, verifies every folder, starts Claude again (right after the link or the rollback, and after a failure too; `--no-relaunch` opts out), runs a pass and checks the remote for duplicates. A failed check rolls back by itself. `--quit-app` has the runner ask Claude to quit a few seconds in (macOS only; on Windows and Linux you quit from the tray icon or the app menu and the runner waits). The next session start reports the result once. Running it again resumes an unfinished go-live, and replaces a runner that is still waiting for Claude to stop with one from the current plugin version |
 | `link [--now]` | link; `--now` is refused while Claude is running |
 | `rectify` | one pass by app state (a live pass while Claude runs, a full pass when stopped) plus the remote check |
 | `unlink [--when-app-exits]` | keep the newest content, remove the mirrored copies, end the link |
@@ -152,7 +154,7 @@ Exit codes: `0` ok, `1` failed, `2` bad arguments, `3` refused (the app is runni
 
 ### Safety
 
-- **The app must be closed for the full pass.** While Claude runs, only a live pass happens: new conversations are linked, and anything else waits. A background waiter finishes the work after the app exits.
+- **The app must be closed for the full pass.** While Claude runs, only a live pass happens: new conversations are linked, and anything else waits. A background waiter finishes the work silently after your next normal quit. Once the accounts are linked nothing asks you to restart or quit Claude again; the only "Restart Claude to sync your accounts" prompt is for an account that is not linked yet (a new account that signs in later gets it once). A notice after the link is only for a real problem (a failed link or rollback, remote duplicates).
 - **A verified backup comes first.** Before the first link (and again before linking after an unlink or rollback) the plugin copies the affected files to `~/.claude/session-sync/accounts/backup/<stamp>/` and checks them. If verification fails, the link does not start.
 - **Nothing is erased.** A displaced or deleted conversation, task or memory file is copied to `accounts/rectify-backups/` first.
 - **Rollback** (`accounts rollback`) restores that backup. The backup folder also holds a standalone `rollback.mjs` that needs only Node, so it works even if the plugin is broken: `node "<backup folder>/rollback.mjs"`. Rollback also brings back conversations and scheduled tasks deleted after the link (a restored task keeps the backup's last run time, so its catch-up can run once) and reverts edits made after the link; the newer copies stay in a `pre-rollback-<stamp>` folder in `~/.claude/session-sync/accounts/`.
