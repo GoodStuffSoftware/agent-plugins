@@ -467,7 +467,14 @@ try {
     const idx = join(ACC, 'rectify-backups', 'index.jsonl');
     const backupShas = () => new Set(existsSync(idx) ? readFileSync(idx, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).sha256) : []);
     const versions = () => { const s = new Set(); for (const m of inventory(STORE).values()) for (const e of m.values()) s.add(sha(readFileSync(e.abs))); return s; };
-    const save = (f, id, label, extra = (() => {})) => { const t = tick(200); return appSave(pathIn(f, id), (r) => { touch(r, label, t); extra(r); }, t); };
+    // a version the app itself overwrote in the folder it saves into is an ancestor of the new one: the engine does not back up the other
+    // folders' links to it (S1, the unbounded-backup fix), so it is not "lost" when it leaves
+    const superseded = new Set();
+    const save = (f, id, label, extra = (() => {})) => {
+      const t = tick(200);
+      try { superseded.add(sha(readFileSync(pathIn(f, id)))); } catch { /* a new record: nothing to supersede */ }
+      return appSave(pathIn(f, id), (r) => { touch(r, label, t); extra(r); }, t);
+    };
     let lost = 0; let passes = 0;
     /** a targeted pass with the "no content lost" check: every version that left every folder is in the backups */
     const pass = async (label) => {
@@ -476,7 +483,7 @@ try {
       passes++;
       check(`switch: ${label}: the targeted pass ran`, res.ok === true, res.ok ? '' : `skipped ${res.skipped ?? JSON.stringify(res).slice(0, 120)}`);
       const after = versions(); const bk = backupShas();
-      for (const v of before) if (!after.has(v) && !bk.has(v)) lost++;
+      for (const v of before) if (!after.has(v) && !bk.has(v) && !superseded.has(v)) lost++;
       return res;
     };
     const sameInode = (id, f1, f2) => existsSync(pathIn(f1, id)) && existsSync(pathIn(f2, id)) && inoOf(pathIn(f1, id)) === inoOf(pathIn(f2, id));
