@@ -274,3 +274,14 @@ test('config accountLink: validated, saved, and shown by `config`', () => {
   assert.equal(JSON.parse(w.run(['config']).stdout).accountLink, 'auto');
   assert.equal(JSON.parse(readFileSync(join(w.stateDir, 'config.json'), 'utf8')).accountLink, 'auto');
 });
+
+test('config progressIcon: on by default, saved as false and shown by `config`', () => {
+  const w = cworld();
+  assert.equal(JSON.parse(w.run(['config']).stdout).progressIcon, true);
+  const off = w.run(['config', 'progressIcon', 'false']);
+  assert.equal(off.status, 0, off.stderr);
+  assert.equal(JSON.parse(off.stdout).progressIcon, false);
+  assert.equal(JSON.parse(w.run(['config']).stdout).progressIcon, false);
+  assert.equal(JSON.parse(readFileSync(join(w.stateDir, 'config.json'), 'utf8')).progressIcon, false);
+  assert.equal(JSON.parse(w.run(['config', 'progressIcon', 'true']).stdout).progressIcon, true);
+});

@@ -11,12 +11,14 @@ import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, rmSync,
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   planGoLive, beginGoLive, runGoLive, resumeIfDead, takeGoLiveReport, goLiveInProgress, runnerAlive, readGoLive, readGoLiveResult,
   goLiveFile, goLiveResultFile, goLiveLogFile, verifyLinked, expectedSet, readListing, defaultRollback, copyWords,
-  DEFAULT_TIMEOUTS, STOP_POLL_MS, STOP_GAP_MS, PLUGIN_VERSION, replaceWaitingRunner,
+  DEFAULT_TIMEOUTS, STOP_POLL_MS, STOP_GAP_MS, PLUGIN_VERSION, replaceWaitingRunner, PHASES, FINAL_STATUSES,
 } from '../lib/accounts/golive.mjs';
+import { stepWord, tooltipFor, startText, endText, progressInfo, createProgressUi, TRAY_SCRIPT, TITLE } from '../lib/accounts/progress.mjs';
+import { DEFAULTS, describeConfig } from '../lib/config.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations, accPath, rollbackMarkerFile } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey, listFolders } from '../lib/accounts/folders.mjs';
 import { link, fullPass } from '../lib/accounts/pass.mjs';
@@ -1377,4 +1379,194 @@ test('0.5.2 verify-stop through the real probe: the app comes back after the lin
   assert.equal(out.status, 'ok', readFileSync(goLiveLogFile(w.ctx), 'utf8'));
   assert.match(readGoLive(w.ctx).messages.join('\n'), /The app is running; the check waits/);
   assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /app lock marker is back/);
+});
+
+/* ------------------------------------------------------------------ 0.5.2: the progress indicator */
+
+/** A recording UI layer for runGoLive (deps.ui). */
+const fakeUi = (over = {}) => { const calls = []; return { calls, start: (i) => { calls.push(['start', i]); over.start?.(i); }, end: (r) => { calls.push(['end', r]); over.end?.(r); } }; };
+
+test('progress: every phase has plain words, the tooltip fits a NotifyIcon, and the start and end texts say what happens', () => {
+  for (const p of PHASES) {
+    assert.ok(stepWord(p) && stepWord(p) !== 'working', `a word for phase ${p}`);
+    assert.ok(tooltipFor(p).length <= 63, tooltipFor(p));
+    assert.match(tooltipFor(p), /^Syncing accounts: /);
+  }
+  assert.equal(stepWord('relist'), 'backing up');
+  assert.equal(stepWord('link'), 'backing up and linking');
+  assert.equal(stepWord('verify'), 'checking');
+  assert.equal(stepWord('relaunch'), 'reopening Claude');
+  assert.equal(stepWord('wait-start'), 'reopening Claude');
+  assert.equal(stepWord('finish'), 'finishing');
+  assert.equal(stepWord('nonsense'), 'working');
+  assert.equal(startText(), 'Syncing your Claude accounts. Claude will reopen by itself.');
+  assert.match(startText({ noRelaunch: true }), /Open Claude again/);
+  for (const s of FINAL_STATUSES) assert.ok(endText(s).length > 10 && !endText(s).includes('\u2014'), s);
+  assert.match(endText('ok'), /linked/);
+  assert.match(endText('rolled_back'), /undone.*nothing changed/);
+  assert.match(endText('attention'), /needs your attention/);
+  assert.deepEqual(progressInfo('verify', 'waiting'), { step: 'checking', tooltip: 'Syncing accounts: checking', headline: null });
+  assert.equal(progressInfo('done', 'ok').headline, endText('ok'));
+});
+
+test('progress: the runner starts the UI when the link begins (not while waiting for the stop), writes the step into the result, and ends it once', async () => {
+  const w = world();
+  w.setApp(true);
+  const ui = fakeUi({ start: () => { assert.equal(res(w).progress.tooltip, 'Syncing accounts: backing up', 'the result already holds the first step'); } });
+  const { d } = deps(w, { ui, onSleep: (n) => { if (n === 2) w.setApp(false); } });
+  start(w, d);
+  assert.equal(res(w).progress.step, 'waiting for Claude to close');
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'ok');
+  assert.deepEqual(ui.calls.map((c) => c[0]), ['start', 'end'], 'one start and one end, none for the wait');
+  assert.equal(ui.calls[0][1].resultFile, goLiveResultFile(w.ctx));
+  assert.equal(ui.calls[0][1].logFile, goLiveLogFile(w.ctx));
+  assert.equal(ui.calls[0][1].runnerPid, process.pid);
+  assert.equal(ui.calls[0][1].noRelaunch, false);
+  assert.equal(ui.calls[1][1].status, 'ok');
+  assert.equal(ui.calls[1][1].headline, endText('ok'));
+  assert.deepEqual(res(w).progress, { step: 'finishing', tooltip: 'Syncing accounts: finishing', headline: endText('ok') });
+});
+
+test('progress: while the runner only waits for the app to stop nothing is shown, and a rolled back go-live ends with its own text', async () => {
+  const w = world();
+  w.setApp(true);
+  const idle = fakeUi();
+  const { d: d1 } = deps(w, { ui: idle, haltAfter: 'wait-stop', onSleep: (n) => { if (n === 3) w.setApp(false); } });
+  start(w, d1);
+  assert.deepEqual(await runGoLive(w.ctx, d1), { exit: 'halted' });
+  assert.deepEqual(idle.calls, [], 'the wait for the stop shows nothing');
+  const rb = world();
+  const ui = fakeUi();
+  const { d } = deps(rb, { ui, ...damage(rb) });
+  start(rb, d);
+  const out = await runGoLive(rb.ctx, d);
+  assert.equal(out.status, 'rolled_back');
+  assert.deepEqual(ui.calls.map((c) => c[0]), ['start', 'end']);
+  assert.equal(ui.calls[1][1].status, 'rolled_back');
+  assert.equal(ui.calls[1][1].headline, endText('rolled_back'));
+});
+
+test('progress: an indicator that throws never stops the go-live, and --no-relaunch changes the start text input', async () => {
+  const w = world();
+  const ui = { start: () => { throw new Error('no tray'); }, end: () => { throw new Error('no tray either'); } };
+  const { d } = deps(w, { ui });
+  start(w, d);
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'ok');
+  assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /progress indicator: no tray/);
+  const w2 = world();
+  const rec = fakeUi();
+  const { d: d2 } = deps(w2, { ui: rec, timeouts: { startNoRelaunchMs: 1000 } });   // nobody starts Claude again: the run ends in attention
+  start(w2, d2, { noRelaunch: true });
+  await runGoLive(w2.ctx, d2);
+  assert.equal(rec.calls[0][1].noRelaunch, true);
+});
+
+test('progress: createProgressUi on Windows starts one hidden, non-detached powershell helper with the files it reads; a failing spawn is swallowed', () => {
+  const calls = [];
+  const spawnFn = (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { on() {}, unref() {} }; };
+  const ui = createProgressUi({ platform: 'win32', spawnFn, env: {} });
+  ui.start({ resultFile: 'C:\\acc\\go-live-result.json', logFile: 'C:\\acc\\go-live.log', runnerPid: 4321, noRelaunch: false });
+  assert.equal(calls.length, 1);
+  const c = calls[0];
+  assert.equal(c.cmd, 'powershell.exe');
+  assert.equal(c.opts.windowsHide, true);
+  assert.notEqual(c.opts.detached, true);
+  assert.deepEqual(c.args.slice(0, 7), ['-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', TRAY_SCRIPT]);
+  const arg = (n) => c.args[c.args.indexOf(n) + 1];
+  assert.equal(arg('-Result'), 'C:\\acc\\go-live-result.json');
+  assert.equal(arg('-RunnerPid'), '4321');
+  assert.equal(arg('-Log'), 'C:\\acc\\go-live.log');
+  assert.equal(arg('-StartText'), 'Syncing your Claude accounts. Claude will reopen by itself.');
+  assert.ok(existsSync(TRAY_SCRIPT), 'the helper script ships next to the module');
+  ui.end({ status: 'ok' });
+  assert.equal(calls.length, 1, 'on Windows the helper itself shows the end from the result file');
+  assert.doesNotThrow(() => createProgressUi({ platform: 'win32', spawnFn: () => { throw new Error('spawn failed'); }, env: {} }).start({}));
+});
+
+test('progress: macOS and Linux get a notification at the start and one at the end; disabled and the test seam show nothing', () => {
+  for (const platform of ['darwin', 'linux']) {
+    const sent = [];
+    const spawnFn = () => assert.fail('no helper process off Windows');
+    const ui = createProgressUi({ platform, spawnFn, notifyFn: (t, b, o) => sent.push({ t, b, o }), env: {} });
+    ui.start({ noRelaunch: false });
+    ui.end({ status: 'rolled_back', headline: endText('rolled_back') });
+    assert.equal(sent.length, 2, platform);
+    assert.equal(sent[0].t, TITLE);
+    assert.match(sent[0].b, /Claude will reopen by itself/);
+    assert.equal(sent[1].b, endText('rolled_back'));
+    assert.equal(sent[1].o.persist, true, 'a problem stays until dismissed');
+    assert.ok(!createProgressUi({ platform, notifyFn: () => { throw new Error('x'); }, env: {} }).start());
+  }
+  let n = 0;
+  const count = () => { n++; };
+  createProgressUi({ enabled: false, platform: 'darwin', notifyFn: count, env: {} }).start({});
+  createProgressUi({ platform: 'win32', spawnFn: count, env: { SESSION_SYNC_TEST_APP_STATE: 'x' } }).start({});
+  createProgressUi({ platform: 'darwin', notifyFn: count, env: { SESSION_SYNC_TEST_APP_STATE: 'x' } }).end({ status: 'ok' });
+  assert.equal(n, 0);
+  createProgressUi({ platform: 'darwin', notifyFn: count, env: { SESSION_SYNC_TEST_APP_STATE: 'x', SESSION_SYNC_TEST_PROGRESS_UI: '1' } }).start({});
+  assert.equal(n, 1);
+});
+
+test('progress: config progressIcon defaults to on and is described', () => {
+  assert.equal(DEFAULTS.progressIcon, true);
+  assert.equal(describeConfig({ ...DEFAULTS, remoteFrom: 'default' }).progressIcon, true);
+  assert.equal(describeConfig({ ...DEFAULTS, progressIcon: false, remoteFrom: 'default' }).progressIcon, false);
+});
+
+/* the real helper script under real Windows PowerShell, in -DryRun (no icon, no message loop; what it would show goes to a trace file) */
+
+const onWin = { skip: process.platform !== 'win32' ? 'Windows PowerShell only' : false };
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const resultDoc = (status, phase) => JSON.stringify({ v: 1, id: 'gl-1', status, phase, progress: progressInfo(phase, status) });
+
+function trayRun(dir, { runnerPid, extra = [] }) {
+  const resultFile = join(dir, 'go-live-result.json');
+  const trace = join(dir, 'trace.txt');
+  const logFile = join(dir, 'go-live.log');
+  writeFileSync(logFile, 'x');
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', TRAY_SCRIPT,
+    '-Result', resultFile, '-RunnerPid', String(runnerPid), '-Log', logFile, '-StartText', startText(), '-DryRun', '-Trace', trace, '-PollMs', '100', '-LingerMs', '400', ...extra],
+  { windowsHide: true, stdio: 'ignore' });
+  const exited = new Promise((resolve) => { child.on('exit', (code) => resolve(code)); });
+  const read = () => { try { return readFileSync(trace, 'utf8').split(/\r?\n/).filter(Boolean); } catch { return []; } };
+  const until = async (pred, ms = 15000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (pred(read())) return true; await sleepMs(50); } return false; };
+  return { child, exited, read, until, resultFile };
+}
+
+test('progress helper (real PowerShell, dry run): it exits on its own when the runner dies, without a final result', onWin, async () => {
+  const dir = join(tmpdir(), `ss-tray-${Date.now()}-a`); mkdirSync(dir, { recursive: true });
+  const dead = spawnSync(process.execPath, ['-e', ''], { windowsHide: true });   // a pid that has just ended
+  writeFileSync(join(dir, 'go-live-result.json'), resultDoc('waiting', 'verify'));
+  const h = trayRun(dir, { runnerPid: dead.pid });
+  try {
+    assert.equal(await Promise.race([h.exited, sleepMs(20000).then(() => 'hung')]), 0, 'exit code 0, no hang');
+    const t = h.read();
+    assert.ok(t.includes('balloon: Syncing your Claude accounts. Claude will reopen by itself.'), t.join('|'));
+    assert.ok(t.includes('tip: Syncing accounts: checking'), t.join('|'));
+    assert.ok(t.includes('exit: runner-gone'), t.join('|'));
+    assert.ok(!t.some((l) => l.startsWith('balloon: ') && /linked|undone|stopped/.test(l)), 'no closing balloon for a dead runner');
+  } finally { try { h.child.kill(); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('progress helper (real PowerShell, dry run): the tooltip follows the result file, the closing balloon comes from it, then the icon is removed and it exits', onWin, async () => {
+  const dir = join(tmpdir(), `ss-tray-${Date.now()}-b`); mkdirSync(dir, { recursive: true });
+  const fake = fakeRunner();   // a live "runner"
+  writeFileSync(join(dir, 'go-live-result.json'), resultDoc('waiting', 'relist'));
+  const h = trayRun(dir, { runnerPid: fake.pid });
+  try {
+    assert.ok(await h.until((t) => t.includes('tip: Syncing accounts: backing up')), h.read().join('|'));
+    writeFileSync(join(dir, 'go-live-result.json'), resultDoc('waiting', 'link'));
+    assert.ok(await h.until((t) => t.includes('tip: Syncing accounts: backing up and linking')), h.read().join('|'));
+    writeFileSync(join(dir, 'go-live-result.json'), resultDoc('waiting', 'relaunch'));
+    assert.ok(await h.until((t) => t.includes('tip: Syncing accounts: reopening Claude')), h.read().join('|'));
+    writeFileSync(join(dir, 'go-live-result.json'), resultDoc('attention', 'done'));
+    assert.equal(await Promise.race([h.exited, sleepMs(20000).then(() => 'hung')]), 0);
+    const t = h.read();
+    assert.ok(t.includes(`balloon: ${endText('attention')} Click to open the log.`), t.join('|'));
+    assert.equal(t.at(-1), 'exit: done', 'the icon is removed after the closing balloon');
+    assert.ok(!t.includes('exit: runner-gone'));
+    assert.ok(alive(fake.pid), 'the helper never touches the runner');
+  } finally { fake.kill(); try { h.child.kill(); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
 });

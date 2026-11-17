@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.2 (2026-11-16)
+
+### Fixed
+
+* **session-sync:** `accounts go-live` (and the waiter) now notice that you quit Claude on Windows. The process probe used to exit with code 1 when no `claude` process existed, which was read as "unknown", so the link never started after a real quit. The probe now prints an end marker and exits 0; an empty list means "not running", and only a missing marker means "unknown". The link starts about 1 to 1.5 seconds after the last Claude process ends, with the lock-file check held as before.
+* **session-sync:** a restart of Claude is noticed by the lock file's creation time (a latch), so a quit followed by a quick reopen is logged and does not corrupt anything: a reopen after the link has begun is caught by the existing guard, which aborts safely and lets the runner retry.
+* **session-sync:** when the process probe stays unknown for 10 seconds while the lock marker is gone, the go-live log and the waiter log say so, with the probe's exit status and error text.
+
+### Added
+
+* **session-sync:** a progress indicator while the go-live runs with Claude closed. On Windows a tray icon (a hidden PowerShell helper, no console window, no focus steal) shows the step ("Syncing accounts: backing up and linking", "checking", "reopening Claude", "finishing"), a balloon when the sync starts and one with the result (done, rolled back, needs attention) when it ends, then removes itself. Double-clicking the icon opens the go-live log. The helper reads the result file and exits by itself if the runner dies. macOS shows a notification at the start and at the end, Linux does the same with `notify-send` when it is installed. `config progressIcon false` turns it off; the go-live itself is unchanged.
+
+
 ## 0.5.1 (2026-11-16)
 
 ### Fixed

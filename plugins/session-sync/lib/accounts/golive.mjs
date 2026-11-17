@@ -16,7 +16,8 @@
  * A link or verify failure rolls back automatically (the app is closed by then).
  *
  * Every side effect the runner has is a dependency (`deps`), so tests run it with no real app:
- *   link, fullPass, rollback, relaunch, rectify, remoteCheck, copies, getPush, setPush, appStatus, sleep, clock.
+ *   link, fullPass, rollback, relaunch, rectify, remoteCheck, copies, getPush, setPush, appStatus, sleep, clock, ui.
+ * `ui` ({start(info), end(result)}, progress.mjs) is the progress indicator; the default shows nothing.
  */
 
 import { appendFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
@@ -32,6 +33,7 @@ import { link, fullPass } from './pass.mjs';
 import { groupHealth, WAIT_NOTE } from './report.mjs';
 import { sessionSyncCopies, relaunchApp } from './desktop.mjs';
 import { requestAppQuit } from './appquit.mjs';
+import { nullUi, progressInfo, UI_PHASES } from './progress.mjs';
 
 export const PHASES = ['wait-stop', 'relist', 'link', 'verify', 'relaunch', 'wait-start', 'wait-capability', 'rectify', 'remote', 'finish'];
 export const FINAL_STATUSES = ['ok', 'rolled_back', 'attention', 'failed'];
@@ -155,6 +157,7 @@ function writeResult(ctx, gl, status, extra = {}) {
     push: { pausedByGoLive: !!gl.pausedPush, reEnabled: !!gl.pushReEnabled, enabledBefore: gl.before?.pushEnabled ?? null },
     relaunch: gl.relaunch ?? null,
     messages: gl.messages ?? [], attention: gl.attention ?? [], log: goLiveLogFile(ctx),
+    progress: progressInfo(gl.phase, status, FINAL_STATUSES),   // what the tray helper shows (progress.mjs); it reads this file, not the runner
     ...extra,
   });
 }
@@ -438,9 +441,23 @@ export async function runGoLive(ctx, deps = {}) {
     save();
     writeResult(ctx, gl, status);
     log(`result: ${status}`);
+    uiEnd(status);
     return END;
   };
   const attention = (msg) => { gl.flags.attention = true; (gl.attention ||= []).push(msg); note(msg); };
+
+  // the progress indicator: shown from the first phase of the link until the final result (never for the wait for the stop)
+  const ui = deps.ui ?? nullUi;
+  let uiShown = false;
+  const uiStart = () => {
+    if (uiShown) return;
+    uiShown = true;
+    try { ui.start({ resultFile: goLiveResultFile(ctx), logFile: goLiveLogFile(ctx), runnerPid: process.pid, noRelaunch: !!gl.opts?.noRelaunch, id: gl.id }); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
+  };
+  const uiEnd = (status) => {
+    if (!uiShown) return;
+    try { ui.end({ status, ...progressInfo(gl.phase, status, FINAL_STATUSES) }); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
+  };
 
   /** Wait until the app is stopped on two readings a gap apart. 'ok' | 'timeout'. */
   async function waitStopped(name, ms) {
@@ -685,6 +702,7 @@ export async function runGoLive(ctx, deps = {}) {
       const fn = steps[gl.phase];
       if (!fn) { await finalize('failed', `Unknown phase "${gl.phase}" in the go-live state.`); break; }
       await deps.onPhase?.(gl.phase);
+      if (UI_PHASES.includes(gl.phase)) uiStart();
       log(`phase: ${gl.phase}`);
       const done = gl.phase;
       const next = await fn();
@@ -697,6 +715,7 @@ export async function runGoLive(ctx, deps = {}) {
     try { await startAppAgain('runner error'); } catch { /* best effort */ }
     note(`The runner stopped on an error: ${e?.message ?? e}. Run: accounts go-live (it resumes).`);
     save(); writeResult(ctx, gl, 'failed');
+    uiEnd('failed');
     return { exit: 'failed', status: 'failed' };
   } finally {
     clearInterval(hbTimer);

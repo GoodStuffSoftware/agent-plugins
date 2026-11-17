@@ -37,6 +37,7 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
+import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
@@ -491,6 +492,7 @@ const goLiveDeps = () => ({
   setPush: (on) => { saveConfig({ enabled: !!on }); log(`config: enabled -> ${!!on} (go-live)`); },
   rectify: async (ctx) => summarizePass(await accountsPass(ctx, 'go-live')),
   remoteCheck: accountsRemoteCheck,
+  ui: createProgressUi({ enabled: loadConfig().progressIcon !== false }),   // config progressIcon (default on): the tray icon, or notifications on macOS and Linux
 });
 
 /** y/n on a terminal; null when there is no terminal to ask on. */
@@ -735,7 +737,7 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, remote: v.value, warning: v.warning || null, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  if (key === 'enabled' || key === 'notifications') {
+  if (key === 'enabled' || key === 'notifications' || key === 'progressIcon') {
     const on = /^(true|1|yes|on)$/i.test(value);
     saveConfig({ [key]: on });
     log(`config: ${key} -> ${on}`);
@@ -773,7 +775,7 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, accountLink: value, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink`);
+  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon`);
   process.exit(2);
 }
 
