@@ -37,6 +37,23 @@ export function rcSettings(cfg = {}) {
   };
 }
 
+/**
+ * Artifact sharing across linked accounts (artifacts.mjs). enabled: on by default (it still does nothing unless accounts are
+ * linked). emails: claude.ai account id (full uuid or a prefix of it) -> that account's email, which the share skill types into
+ * claude.ai's Share dialog. session-sync does not know the emails by itself: the app's config holds them next to sign-in data, which
+ * this plugin never reads.
+ */
+export function artifactShareSettings(cfg = {}) {
+  const raw = cfg?.artifactShare && typeof cfg.artifactShare === 'object' ? cfg.artifactShare : {};
+  const emails = {};
+  if (raw.emails && typeof raw.emails === 'object' && !Array.isArray(raw.emails)) {
+    for (const [k, v] of Object.entries(raw.emails)) {
+      if (/^[0-9a-f-]{4,36}$/i.test(k) && typeof v === 'string' && /^[^\s@]+@[^\s@]+$/.test(v.trim())) emails[k.toLowerCase()] = v.trim();
+    }
+  }
+  return { enabled: raw.enabled !== false, emails };
+}
+
 export const DEFAULTS = Object.freeze({
   // <rclone remote>:<path>. The path is yours — put it wherever you keep things.
   remote: 'gdrive:Claude/live',
@@ -80,6 +97,8 @@ export const DEFAULTS = Object.freeze({
   //   days:    only sessions active within this many days are looked at (1-90)
   //   wake:    after the restart, the first prompt of one session wakes the rest with one short turn each (costs a turn per session)
   rcRestore: RC_DEFAULTS,
+  // Invite new artifacts to the other linked account when the user switches accounts (artifacts.mjs; `config artifactShare.enabled|email`).
+  artifactShare: Object.freeze({ enabled: true, emails: Object.freeze({}) }),
 });
 
 export const ACCOUNT_LINK_MODES = Object.freeze(['ask', 'auto', 'off']);
@@ -88,6 +107,7 @@ export function loadConfig() {
   let file = {};
   try { file = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')); } catch { /* absent or corrupt -> defaults */ }
   const cfg = { ...DEFAULTS, ...file };
+  cfg.artifactShare = artifactShareSettings(file);
   cfg.rcRestore = rcSettings(file);   // nested: a partial block keeps the other defaults, a bad value falls back
   const fromEnv = String(process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK ?? '').trim().toLowerCase();
   const fromFile = String(cfg.accountLink ?? '').trim().toLowerCase();
@@ -109,6 +129,11 @@ export function saveConfig(patch) {
   try { current = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')); } catch {}
   const next = { ...current, ...patch };
   if (patch.rcRestore && typeof patch.rcRestore === 'object') next.rcRestore = { ...(current.rcRestore && typeof current.rcRestore === 'object' ? current.rcRestore : {}), ...patch.rcRestore };
+  if (patch.artifactShare && typeof patch.artifactShare === 'object') {
+    const cur = current.artifactShare && typeof current.artifactShare === 'object' ? current.artifactShare : {};
+    next.artifactShare = { ...cur, ...patch.artifactShare };
+    if (patch.artifactShare.emails) next.artifactShare.emails = { ...(cur.emails && typeof cur.emails === 'object' ? cur.emails : {}), ...patch.artifactShare.emails };
+  }
   // Never persist derived fields
   delete next.remoteFrom;
   mkdirSync(dirname(CONFIG_FILE), { recursive: true });
@@ -163,6 +188,7 @@ export function describeConfig(cfg = loadConfig()) {
     accountLink: cfg.accountLink || DEFAULTS.accountLink,
     progressIcon: cfg.progressIcon !== false,
     rcRestore: rcSettings(cfg),
+    artifactShare: artifactShareSettings(cfg),
     extraExcludes: cfg.extraExcludes || [],
     configFile: CONFIG_FILE,
     configExists: existsSync(CONFIG_FILE),

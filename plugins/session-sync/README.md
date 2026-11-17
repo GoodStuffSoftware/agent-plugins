@@ -170,6 +170,24 @@ Exit codes: `0` ok, `1` failed, `2` bad arguments, `3` refused (the app is runni
 
 Windows needs no administrator rights and the plugin opens no windows. The macOS and Linux paths follow the app's standard data folders and are untested.
 
+## Sharing new artifacts across accounts
+
+Artifacts live on claude.ai, not on disk, so linking accounts does not share them: an artifact belongs to the account whose session published it. The other account gets access only through a share invite with Editor access, which has to be sent from a browser signed in as the owner and accepted as the receiver. session-sync automates the part an agent can do. It needs linked accounts; `config artifactShare.enabled false` turns it off.
+
+1. **Capture.** A `PostToolUse` hook on the `Artifact` tool queues every newly published artifact (a publish with no `url`, including one made from a `type_url`; updates, uploads, reads, lists and deletes are ignored) in `~/.claude/session-sync/artifact-queue/`, with the account the app runs as at that moment as its owner. It prints nothing.
+2. **Trigger.** A `UserPromptSubmit` hook (its own small command, so a prompt with nothing pending costs a directory listing and a few small reads) notices when the app's account is no longer the owner of queued artifacts and tells one interactive session (claimed with an exclusive file create, once per switch; a terminal, headless or scheduled session never takes it) to run the `share-artifacts` skill in a single background browser subagent. It stays silent until the emails of both accounts are set (below). Any error exits 0 with no output.
+3. **Share.** The skill drives the Claude desktop app's browser pane, which is signed in as one account, sends an Editor invite for each artifact that account owns, and records the invitation links. The session gives you the links; you open each one while signed in as the other account and click Accept. Nothing opens a browser window by itself, and nothing calls claude.ai's APIs. Public ("Anyone with the link") artifacts are skipped and left as they are. Artifacts owned by an account no driveable browser holds stay pending. After you accept, the session checks with the `Artifact` tool's `read` (the header says "(writer)") and marks them done.
+
+One setting is needed once, because the plugin never reads the app's account fields: the email of each linked account.
+
+```bash
+node lib/cli.mjs config artifactShare.email <account id or its first 8 characters> <email>   # once per account
+node lib/cli.mjs config artifactShare.enabled true                                            # default; false turns it off
+node lib/cli.mjs artifacts pending|list [--json]                                              # the queue
+node lib/cli.mjs artifacts mark <id> pending|invited|done|failed|skipped [--link L] [--reason R]
+node lib/cli.mjs artifacts forget <id>
+```
+
 ## Remote Control after a restart
 
 After any restart of the Claude desktop app, Remote Control is off for every Code session, and after an account switch the CLI can reattach to a link that was made in a cross-account fallback (a random name that a rename never reaches). From 0.5.4 (Windows; macOS and Linux do nothing) the plugin repairs both, with the same background watcher that follows account switches. It also runs with one account that was never linked, and it never writes while Claude runs.

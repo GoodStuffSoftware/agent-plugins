@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** new artifacts are invited to the other linked claude.ai account when you switch accounts. A `PostToolUse` hook on the `Artifact` tool queues every newly published artifact (a publish with no `url`, including a create from a `type_url`) with the account the app runs as; after you switch to the other account, a `UserPromptSubmit` hook tells one session (exclusive claim, nothing otherwise) to run the new `share-artifacts` skill in one background browser subagent. The subagent sends an Editor invite from the desktop app's browser pane (signed in as the owner) and records the invitation links; the session gives you the links to Accept, then checks `Artifact` `read` for "(writer)". Public artifacts are skipped, artifacts owned by an account no driveable browser holds stay pending. Drive the UI only: no browser window is opened by a script and claude.ai's APIs are never called.
+* **session-sync:** `artifacts pending|list|mark|forget|pane` commands for the queue, and settings `artifactShare.enabled` (default on once accounts are linked) and `artifactShare.email <account id> <email>` (the two account emails, set once: the plugin never reads the app's account fields).
+
 ## 0.5.4 (2026-11-17)
 
 ### Added
