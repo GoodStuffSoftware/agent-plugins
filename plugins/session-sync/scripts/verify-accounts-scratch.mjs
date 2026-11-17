@@ -467,7 +467,7 @@ try {
     const idx = join(ACC, 'rectify-backups', 'index.jsonl');
     const backupShas = () => new Set(existsSync(idx) ? readFileSync(idx, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).sha256) : []);
     const versions = () => { const s = new Set(); for (const m of inventory(STORE).values()) for (const e of m.values()) s.add(sha(readFileSync(e.abs))); return s; };
-    const save = (f, id, label, extra = (() => {})) => { const t = tick(); return appSave(pathIn(f, id), (r) => { touch(r, label, t); extra(r); }, t); };
+    const save = (f, id, label, extra = (() => {})) => { const t = tick(200); return appSave(pathIn(f, id), (r) => { touch(r, label, t); extra(r); }, t); };
     let lost = 0; let passes = 0;
     /** a targeted pass with the "no content lost" check: every version that left every folder is in the backups */
     const pass = async (label) => {
@@ -518,7 +518,8 @@ try {
     await pass('switch back to A');
     const inA = pool.slice(0, Math.min(10, pool.length));
     for (let i = 0; i < inA.length; i++) save(fa, inA[i], `A2-save-${i}`);
-    await pass('saves in A again');
+    tick(G_SWITCH_MS + 1000);
+    await pass('saves in A again, after the grace window');
     check('switch: B is current after the switch back', inA.every((id) => sameInode(id, fa, fb)));
     // the flush race: a last save in A, and the app loads B before any pass could run
     const idR = pool[1];
