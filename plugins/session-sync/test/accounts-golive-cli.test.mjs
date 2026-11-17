@@ -8,9 +8,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { readJson } from '../lib/accounts/state.mjs';
-import { pairKey } from '../lib/accounts/folders.mjs';
+import { pairKey, answerPairs } from '../lib/accounts/folders.mjs';
+import { PLUGIN_VERSION } from '../lib/accounts/golive.mjs';
 import { cworld, cleanupWorlds, A, B } from './fixtures/cliworld.mjs';
+import { addFolder, putRecord, uuid } from './fixtures/store.mjs';
 
 test.after(() => cleanupWorlds());
 
@@ -45,6 +48,7 @@ test('go-live --yes (app stopped): consent recorded, state and result saved, ONE
   // status shows it
   const st = run(w, ['accounts', 'status']);
   assert.match(st.stdout, /Go-live: waiting \(phase wait-stop\)/);
+  assert.match(st.stdout.split('\n')[0], /^Restart Claude to sync your accounts/, 'status leads with the one line while a go-live waits');
 });
 
 test('go-live while the app runs: tells the user to quit from the tray icon; --quit-app reports it cannot yet', () => {
@@ -52,7 +56,9 @@ test('go-live while the app runs: tells the user to quit from the tray icon; --q
   w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
   const r = run(w, ['accounts', 'go-live', '--yes']);
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout, /tray icon/);
+  assert.match(r.stdout.split('\n')[0], /^Restart Claude to sync your accounts: quit Claude from the tray icon or app menu, the sync starts right away and Claude reopens by itself when it is done\./, 'the one line leads');
+  assert.match(r.stdout, /no time limit/);
+  assert.match(r.stdout, /Closing the window only hides it/);
   assert.match(r.stdout, /Claude is running/);
   const q = cworld();
   q.setApp({ running: true, signedIn: A, startedAtMs: 1 });
@@ -121,6 +127,7 @@ test('SessionStart hook: a final go-live result is added to the context once, in
   assert.match(text, /go-live finished/);
   assert.match(text, /4 conversation\(s\) in 2 folder\(s\)/);
   assert.match(text, /accounts answer yes/, 'the pending-pair ask rides along in the same object');
+  assert.match(text, /Restart Claude to sync your accounts/, 'the ask leads with the one line');
   const b = w.run(['auto-pull', '--from-hook']);
   assert.equal(b.stdout, '', 'reported once; the ask is also once a day');
 });
@@ -137,4 +144,117 @@ test('hidden launch-detached (the helper the SessionStart hook starts) launches 
   const bad2 = run(w, ['accounts', 'launch-detached', 'accounts', 'rollback']);
   assert.equal(bad2.status, 1);
   assert.equal(launched(w).length, 2, 'nothing else was launched');
+});
+
+/* ------------------------------------------------------------------ 0.5.1 */
+
+/** A stand-in for a runner: an idle, hidden node process. Only it is ever ended by these tests. */
+const fakeRunner = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+const runners = (w) => launched(w).filter((a) => a[1] === 'golive-run').length;
+const claimOf = (w, pid, extra = {}) => writeFileSync(join(w.acc, 'go-live.claim'), JSON.stringify({ pid, at: Date.now(), beatAt: Date.now(), ...extra }));
+
+test('go-live run again while a runner waits in wait-stop replaces a runner of another version (same id and state); one of this version is left alone', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  assert.equal(run(w, ['accounts', 'go-live', '--yes']).status, 0);
+  const id = readJson(join(w.acc, 'go-live.json')).id;
+  const old = fakeRunner(); const cur = fakeRunner();
+  try {
+    claimOf(w, old.pid);                                         // a 0.5.0 runner: no version in its claim
+    const r = run(w, ['accounts', 'go-live', '--yes', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.equal(out.replaced, true);
+    assert.equal(out.toVersion, PLUGIN_VERSION);
+    assert.equal(alive(old.pid), false, 'the old runner was ended');
+    assert.equal(runners(w), 2, 'one new runner was launched');
+    const gl = readJson(join(w.acc, 'go-live.json'));
+    assert.equal(gl.id, id);
+    assert.equal(gl.phase, 'wait-stop');
+    assert.equal(readJson(join(w.acc, 'go-live-result.json')).status, 'waiting');
+    // a runner of this version: not touched, and the text says it waits without a limit
+    claimOf(w, cur.pid, { version: PLUGIN_VERSION });
+    const again = run(w, ['accounts', 'go-live', '--yes']);
+    assert.equal(again.status, 0, again.stderr);
+    assert.match(again.stdout, /already running/);
+    assert.match(again.stdout, /no time limit/);
+    assert.equal(alive(cur.pid), true);
+    assert.equal(runners(w), 2);
+  } finally { for (const c of [old, cur]) { try { c.kill(); } catch { /* gone */ } } }
+});
+
+test('go-live run again in any other phase than wait-stop does not touch the runner', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  assert.equal(run(w, ['accounts', 'go-live', '--yes']).status, 0);
+  const gl = readJson(join(w.acc, 'go-live.json'));
+  writeFileSync(join(w.acc, 'go-live.json'), JSON.stringify({ ...gl, phase: 'verify' }));
+  const busy = fakeRunner();
+  try {
+    claimOf(w, busy.pid);
+    const r = run(w, ['accounts', 'go-live', '--yes']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /already running/);
+    assert.equal(alive(busy.pid), true);
+    assert.equal(runners(w), 1);
+  } finally { try { busy.kill(); } catch { /* gone */ } }
+});
+
+test('SessionStart hook: a go-live in wait-stop whose runner is gone gets ONE runner through the launcher, never a second', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  assert.equal(run(w, ['accounts', 'go-live', '--yes']).status, 0);   // its launch is only logged: no runner holds the claim
+  assert.equal(runners(w), 1);
+  assert.equal(run(w, ['auto-pull', '--from-hook']).status, 0);
+  assert.equal(runners(w), 2, 'the hook launched the runner again');
+  assert.equal(run(w, ['auto-pull', '--from-hook']).status, 0);
+  assert.equal(runners(w), 2, 'not twice in a row');
+});
+
+test('SessionStart hook: a failed go-live is not restarted', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  assert.equal(run(w, ['accounts', 'go-live', '--yes']).status, 0);
+  const res = join(w.acc, 'go-live-result.json');
+  writeFileSync(res, JSON.stringify({ ...readJson(res), status: 'failed', resumable: true }));
+  assert.equal(run(w, ['auto-pull', '--from-hook']).status, 0);
+  assert.equal(runners(w), 1);
+});
+
+test('scope: once the accounts are linked nothing asks the user to restart or quit; owed work waits silently', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; s.fullPassOwed = true; });
+  mkdirSync(w.acc, { recursive: true });
+  writeFileSync(join(w.acc, 'hook-rectify.stamp'), String(Date.now()));   // the hook does not start a rectify of its own here
+  const hook = run(w, ['auto-pull', '--from-hook']);
+  assert.equal(hook.status, 0, hook.stderr);
+  assert.equal(hook.stdout, '', 'the session start adds no notice');
+  const st = run(w, ['accounts', 'status']);
+  assert.equal(st.status, 0, st.stderr);
+  assert.match(st.stdout, /Linked: yes/);
+  assert.doesNotMatch(st.stdout, /Restart Claude|tray icon|quit/i);
+  const rect = run(w, ['accounts', 'link']);   // a link when already linked prints nothing that asks for a quit either
+  assert.doesNotMatch(rect.stdout, /Restart Claude/);
+});
+
+test('scope: the restart prompt appears once per new unlinked account, never after the link', () => {
+  const w = cworld();
+  const ask = (r) => { assert.equal(r.status, 0, r.stderr); return r.stdout.trim() ? JSON.parse(r.stdout.trim()).hookSpecificOutput.additionalContext : ''; };
+  // the first sign-in of a second account: asked once
+  const first = ask(run(w, ['auto-pull', '--from-hook']));
+  assert.match(first, /^session-sync: Restart Claude to sync your accounts: quit Claude from the tray icon or app menu/);
+  assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'not asked again');
+  // yes, and the link is done
+  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; });
+  writeFileSync(join(w.acc, 'hook-rectify.stamp'), String(Date.now()));
+  assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'no prompt once linked');
+  // a third account appears later: it is asked once
+  const C = uuid('c', 7);
+  putRecord(addFolder(w.store, C, uuid('3', 3)).path, 9, { title: 'C 9' }, 1_800_000_000_000);
+  const third = ask(run(w, ['auto-pull', '--from-hook']));
+  assert.match(third, /Restart Claude to sync your accounts/);
+  assert.ok(third.includes(C.slice(0, 8)), 'it names the new account');
+  assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'once per new account');
 });

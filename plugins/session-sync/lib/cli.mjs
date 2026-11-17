@@ -632,7 +632,8 @@ async function accountsCommand(sub, args) {
     if (!app.fullAllowed) {
       if (has('--now')) return refused('app-running', 'Quit Claude from the tray icon first (closing the window only hides it).');
       const w = armWaiter(ctx, 'link');
-      if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, [RESTART_LEAD_WAITER, 'Claude is running; closing the window only hides it.']);
+      // already linked: the waiter finishes what is owed after the next normal quit, and nothing asks for one
+      if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, state.linked ? ['The accounts are already linked. Anything still owed runs by itself after your next normal quit of Claude.'] : [RESTART_LEAD_WAITER, 'Claude is running; closing the window only hides it.']);
       return 0;
     }
     const res = await link(ctx, { app });
