@@ -13,7 +13,7 @@ import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadState, accPath, readJson, rollbackActive } from './state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, RECORD } from './folders.mjs';
-import { appState } from './appstate.mjs';
+import { appState, nameIsHeld } from './appstate.mjs';
 import { owedWork } from './pass.mjs';
 import { waiterStatus } from './waiter.mjs';
 import { accountLists, tasksDueCatchUp } from './lists.mjs';
@@ -147,15 +147,15 @@ export function heldConversations(group, state, app) {
   const out = [];
   for (const f of group) {
     if (loaded.has(f.key)) continue;
-    const since = Math.max(state.signed?.unloadedAt?.[f.acct] ?? 0, app.startedAtMs ?? 0);
     let names = []; try { names = readdirSync(f.path); } catch { /* unreadable */ }
     for (const n of names) {
       const m = RECORD.exec(n);
       if (!m) continue;
       const id = `local_${m[1].toLowerCase()}`;
       const st = stat(join(f.path, n));
-      if (!st || st.nlink !== 1n || Number(st.mtimeNs / 1000000n) <= since) continue;
-      if (state.records?.[id]?.ino === `${st.dev}:${st.ino}`) continue;
+      if (!st) continue;
+      // the same rule the engine uses (appstate.nameIsHeld): recorded as held, or alone and written after an unload seen in this app run
+      if (!nameIsHeld(state, { id, folder: f.key, inoKey: `${st.dev}:${st.ino}`, nlink: Number(st.nlink), mtimeMs: Number(st.mtimeNs / 1000000n) }, app.startedAtMs ?? 0)) continue;
       out.push({ id: id8(id.slice(6)), runningIn: id8(f.acct), idleCopyIn: inLoaded.has(id) ? id8(app.signedIn) : null });
     }
   }

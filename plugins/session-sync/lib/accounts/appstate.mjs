@@ -374,6 +374,30 @@ export function folderRoles(app, folders, state, now, gainedKeys = []) {
   return { loaded, cooling };
 }
 
+/**
+ * From when a name in an unloaded folder counts as written by a PARKED session (a session of that account that is still running):
+ * only from an unload this watcher saw during THIS app run (`state.signed.unloadedAt`). An unknown unload time means nothing is held:
+ * every write the app made earlier in the run is then field drift, which must converge to the newest copy (B1). A parked session only
+ * exists after a switch away from its account, and a restart of the app ends every parked session.
+ * @returns {number} ms, or Infinity (never held)
+ */
+export function heldSinceOf(state, acct, appStartedAtMs = 0) {
+  const t = state.signed?.unloadedAt?.[acct];
+  return typeof t === 'number' && t >= appStartedAtMs ? t : Infinity;
+}
+
+/**
+ * Is this record name (in a folder that is neither loaded nor cooling) a parked session's file? Pure.
+ *   - `state.held[id][folder] === ino`: seen as held before (S3: a link another folder took to it does not end the hold, nlink is not used);
+ *   - else not an inode a pass of ours left there (`state.records[id].ino`), alone (nlink 1) and written after the folder was unloaded.
+ * @param {{id:string, folder:string, inoKey:string, nlink:number, mtimeMs:number}} e
+ */
+export function nameIsHeld(state, e, appStartedAtMs = 0) {
+  if (state.held?.[e.id]?.[e.folder] === e.inoKey) return true;
+  const ours = state.records?.[e.id]?.ino;
+  return ours !== e.inoKey && e.nlink === 1 && e.mtimeMs > heldSinceOf(state, String(e.folder).split('/')[0], appStartedAtMs);
+}
+
 /** When the next cooling period ends (ms), or 0 when none is running. */
 export function coolingEndsAt(state, now) {
   let t = 0;
