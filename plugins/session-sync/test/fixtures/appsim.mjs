@@ -14,7 +14,7 @@
  */
 
 import {
-  openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync,
+  openSync, writeSync, fsyncSync, closeSync, renameSync, readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { setMtime, recordName } from './store.mjs';
@@ -120,6 +120,68 @@ export function createSim({ clock, appFile }) {
         if (slot > after) fired.push(t.id);
       }
       return fired.length ? fired : null;
+    },
+
+    /* ---- account switches: what the app holds in memory and when it reads a folder (app bundle: doInitialize / loadSessions) ---- */
+
+    memory: new Map(),         // id -> the record the app loaded or last saved (it never re-reads a loaded file)
+    signedIn: null,
+    current: null,             // the folder of the signed-in account
+    startedAtMs: 0,
+
+    /** The app starts and loads `folder` for `acct`. Writes the seam and config.json (lastKnownAccountUuid), like the app. */
+    start(acct, folder, userData) {
+      sim.startedAtMs = clock.tick();
+      sim.signedIn = acct; sim.current = folder; sim.memory = new Map(); sim.parked = [];
+      sim.writeConfig(userData, acct);
+      sim.setApp({ running: true, signedIn: acct, startedAtMs: sim.startedAtMs });
+      sim.load(folder);
+    },
+
+    writeConfig(userData, acct) {
+      if (userData) writeFileSync(join(userData, 'config.json'), JSON.stringify({ lastKnownAccountUuid: acct }));
+    },
+
+    /** loadSessions: read every local_*.json of the folder; ids already in memory are skipped (an external change is never seen). */
+    load(folder) {
+      const dir = folderPath(folder);
+      for (const n of readdirSync(dir)) {
+        const m = /^(local_[0-9a-f-]{36})\.json$/.exec(n);
+        if (!m || sim.memory.has(m[1])) continue;
+        try { sim.memory.set(m[1], JSON.parse(readFileSync(join(dir, n), 'utf8'))); } catch { /* unreadable: the app skips it */ }
+      }
+    },
+
+    /** Sign-out: nothing is flushed, cleared or re-read; the config key is not cleared and running sessions keep saving to `current`. */
+    signOut() { sim.signedOut = true; },
+
+    /**
+     * Sign in as another account (sign-out first or a direct switch): the switch flush writes `flush` ([{id, patch}]) into the OLD
+     * folder, `multi` parks the ids in `running` (they keep saving there), then config.json changes and the new folder is loaded.
+     */
+    signIn(acct, folder, { userData, flush = [], multi = false, running = [] } = {}) {
+      const old = sim.current;
+      for (const f of flush) sim.save(old, f.id, f.patch ?? {});
+      sim.parked = multi ? running.map((id) => ({ folder: old, id })) : [];
+      sim.writeConfig(userData, acct);
+      sim.signedIn = acct; sim.current = folder; sim.signedOut = false; sim.memory = new Map();
+      sim.setApp({ running: true, signedIn: acct, startedAtMs: sim.startedAtMs });
+      sim.load(folder);
+    },
+
+    /** The same account signs in again: only names the app does not hold yet are read. */
+    reSignInSame() { sim.signedOut = false; sim.load(sim.current); },
+
+    /** A save from memory (the clobber model): the whole in-memory record is written, whatever is on disk now. */
+    saveFromMemory(id, patch = {}) {
+      const cur = sim.memory.get(id) ?? {};
+      const t = clock.tick();
+      const next = { ...cur, lastActivityAt: new Date(t).toISOString(), ...patch };
+      sim.memory.set(id, next);
+      const p = join(folderPath(sim.current), `${id}.json`);
+      atomicWrite(p, JSON.stringify(next));
+      setMtime(p, t);
+      return p;
     },
 
     /** Set the mocked app state (the seam file) and point the environment at it. */

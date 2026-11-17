@@ -382,8 +382,11 @@ function run(group, o, rep) {
     }
     if (!acted && !plan.losers.length && !plan.add.length) rep.counts.ok++;
 
+    // the inode of "our" copy: a winner that is a parked session's file (held, in a free folder) is not ours to remember, or the next pass
+    // would stop seeing it as held
+    const heldWinner = mode === 'targeted' && !roles.loaded.has(plan.W.folder) && !roles.cooling.has(plan.W.folder) && !!blockedWhy(plan.W);
     state.records[plan.id] = {
-      home: plan.home, folders: [...folders].sort(), ino: plan.W.inoKey, mtimeMs: plan.W.mtimeMs, keys: plan.keys,
+      home: plan.home, folders: [...folders].sort(), ino: heldWinner ? (state.records[plan.id]?.ino ?? null) : plan.W.inoKey, mtimeMs: plan.W.mtimeMs, keys: plan.keys,
     };
   }
 

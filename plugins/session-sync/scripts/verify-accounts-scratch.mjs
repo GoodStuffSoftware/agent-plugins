@@ -16,6 +16,14 @@
  *      simulated app saves from both accounts (a split) then rectify, a delete then rectify, push
  *      and the remote duplicate check, unlink, a re-link with an injected mid-link failure, and
  *      rollback checked byte for byte against the tree as it was just before that re-link.
+ *   3b. After the rollback it links again and rehearses the account switches of the desktop app over the
+ *      copy (a simulated app on the seam, virtual time, the watcher's targeted pass): 50 saves in A, a
+ *      sign-out window, a sign-in to B, 20 saves in B, a switch back, a flush race with a stale load, a delete
+ *      and an archive, a never-linked third account, then the quit. It checks that B loads the newest copy, a
+ *      loaded or just-left folder is never rewritten, no content is lost (every displaced version is in the
+ *      backups), one inode per conversation after the quit, nothing owed, and the push filter picks each
+ *      conversation from exactly one folder. It never signs out, switches, quits or starts the real app and
+ *      never reads or writes the real config.json.
  *   4. Prints a PASS/FAIL/WARN/INFO table (INFO rows give the record count of every account folder
  *      before and after the link), asserts the SOURCE tree was not changed BY THIS SCRIPT, and exits 0
  *      only when every check passed. The scratch folder is kept for inspection; delete it by hand.
@@ -281,6 +289,9 @@ const state = () => { try { return JSON.parse(readFileSync(join(ACC, 'state.json
 Object.assign(process.env, { USERPROFILE: HOME, HOME, APPDATA: CHILD_ENV.APPDATA, XDG_CONFIG_HOME: CHILD_ENV.XDG_CONFIG_HOME });
 const { makeCtx, loadState, saveState } = await import('../lib/accounts/state.mjs');
 const { listFolders: libFolders, accountsOf, pendingPairs, answerPairs, pairKey } = await import('../lib/accounts/folders.mjs');
+const { livePass, fullPass, owedWork } = await import('../lib/accounts/pass.mjs');
+const { accountsPushFilter } = await import('../lib/sync.mjs');
+const { G_SWITCH_MS } = await import('../lib/accounts/appstate.mjs');
 const ctx = makeCtx({ store: STORE, userData: USERDATA, acc: ACC });
 function answerYes() {
   const st = loadState(ctx);
@@ -436,6 +447,128 @@ try {
   const d = diffMaps(treeHashes(STORE, ROLLBACK_UNTOUCHED), new Map([...s1].filter(([k]) => !ROLLBACK_UNTOUCHED.test(k))));
   check('after rollback the store matches the pre-link tree byte for byte', d.length === 0, d.length ? `${d.length} differences, first: ${d.slice(0, 3).join('; ')}` : `${s1.size} files compared`);
   check('after rollback nothing is linked', state()?.linked === false);
+
+  // 9. account switches. The app is simulated over the scratch copy: it loads a folder only at sign-in, saves by tmp + rename, and
+  //    writes config.json (lastKnownAccountUuid) when the account changes. The targeted pass is what the watcher runs; time is virtual,
+  //    so the grace window after a switch passes without waiting. Nothing here touches the real app, store or config.
+  forceYes();
+  const rl = cli(['accounts', 'link', '--now', '--json']);
+  check('switch rehearsal: the accounts are linked again', rl.code === 0 && state()?.linked === true, `exit ${rl.code}`);
+  if (state()?.linked) {
+    let vt = Date.now();
+    const vctx = { ...ctx, now: () => vt };
+    const tick = (ms = 1000) => (vt += ms);
+    const runStart = vt - 600000;
+    const A = fa.acct; const B = fb.acct;
+    process.env.SESSION_SYNC_TEST_APP_STATE = APP;
+    const seam = (running, acct) => writeFileSync(APP, JSON.stringify({ running, signedIn: running ? acct : null, startedAtMs: running ? runStart : 0 }));
+    const setConfig = (acct) => writeFileSync(join(USERDATA, 'config.json'), JSON.stringify({ lastKnownAccountUuid: acct }));
+    const allIds = [...inventory(STORE).keys()].sort();
+    const idx = join(ACC, 'rectify-backups', 'index.jsonl');
+    const backupShas = () => new Set(existsSync(idx) ? readFileSync(idx, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).sha256) : []);
+    const versions = () => { const s = new Set(); for (const m of inventory(STORE).values()) for (const e of m.values()) s.add(sha(readFileSync(e.abs))); return s; };
+    const save = (f, id, label, extra = (() => {})) => { const t = tick(); return appSave(pathIn(f, id), (r) => { touch(r, label, t); extra(r); }, t); };
+    let lost = 0; let passes = 0;
+    /** a targeted pass with the "no content lost" check: every version that left every folder is in the backups */
+    const pass = async (label) => {
+      const before = versions();
+      const res = await livePass(vctx, {});
+      passes++;
+      check(`switch: ${label}: the targeted pass ran`, res.ok === true, res.ok ? '' : `skipped ${res.skipped ?? JSON.stringify(res).slice(0, 120)}`);
+      const after = versions(); const bk = backupShas();
+      for (const v of before) if (!after.has(v) && !bk.has(v)) lost++;
+      return res;
+    };
+    const sameInode = (id, f1, f2) => existsSync(pathIn(f1, id)) && existsSync(pathIn(f2, id)) && inoOf(pathIn(f1, id)) === inoOf(pathIn(f2, id));
+    const pool = allIds.filter((id) => existsSync(pathIn(fa, id)) && existsSync(pathIn(fb, id)));
+
+    // the app is on A
+    setConfig(A); seam(true, A);
+    await pass('first sight of the signed-in account');
+    const burst = pool.slice(0, Math.min(50, pool.length));
+    for (let i = 0; i < burst.length; i++) { save(fa, burst[i], `A-save-${i}`); if (i % 10 === 9) await pass(`saves in A ${i + 1}`); }
+    await pass('saves in A, last');
+    check('switch: 50 saves in A are current in B while A is still loaded', burst.every((id) => sameInode(id, fa, fb)), `${burst.length} conversations`);
+    // a sign-out window: the running session saves and a new conversation appears
+    const idS = pool[0];
+    save(fa, idS, 'while-signed-out');
+    const newA = randomUUID(); const tpl = JSON.parse(readFileSync(pathIn(fa, idS), 'utf8'));
+    tpl.sessionId = `local_${newA}`; tpl.cliSessionId = randomUUID(); tpl.title = 'scratch new in A while signed out';
+    writeFileSync(pathIn(fa, newA), JSON.stringify(tpl)); utimesSync(pathIn(fa, newA), tick() / 1000, vt / 1000);
+    await pass('sign-out window');
+    check('switch: the sign-out window\'s save and new conversation reached B', sameInode(idS, fa, fb) && existsSync(pathIn(fb, newA)));
+    tick(60000);
+    // sign in to B: it loads the current copy of everything
+    setConfig(B); seam(true, B);
+    const shaA = new Map([...inventory(STORE)].map(([id, m]) => [id, m.has(fa.key) ? sha(readFileSync(m.get(fa.key).abs)) : null]));
+    const stale = [...shaA].filter(([id, s]) => s && existsSync(pathIn(fb, id)) && sha(readFileSync(pathIn(fb, id))) !== s).length;
+    check('switch: B loads the newest copy of every conversation', stale === 0, `${stale} stale`);
+    const toB = await pass('switch to B');
+    check('switch: the switch is seen and A cools', toB.switched === true && (toB.cooling ?? []).includes(fa.key), `cooling ${(toB.cooling ?? []).length}`);
+    const inB = pool.slice(0, Math.min(20, pool.length));
+    for (let i = 0; i < inB.length; i++) save(fb, inB[i], `B-save-${i}`);
+    const aBefore = new Map(inB.map((id) => [id, inoOf(pathIn(fa, id))]));
+    await pass('saves in B');
+    check('switch: A is left alone during the grace window', inB.every((id) => inoOf(pathIn(fa, id)) === aBefore.get(id)));
+    tick(G_SWITCH_MS + 1000);
+    await pass('after the grace window');
+    check('switch: A is current in A after the grace window', inB.every((id) => sameInode(id, fa, fb)), `${inB.length} conversations`);
+    // back to A
+    setConfig(A); seam(true, A);
+    await pass('switch back to A');
+    const inA = pool.slice(0, Math.min(10, pool.length));
+    for (let i = 0; i < inA.length; i++) save(fa, inA[i], `A2-save-${i}`);
+    await pass('saves in A again');
+    check('switch: B is current after the switch back', inA.every((id) => sameInode(id, fa, fb)));
+    // the flush race: a last save in A, and the app loads B before any pass could run
+    const idR = pool[1];
+    save(fa, idR, 'A-flush');
+    setConfig(B); seam(true, B);
+    const stalePre = inoOf(pathIn(fb, idR));
+    const raced = await pass('flush race, first pass');
+    check('switch: the loaded folder is not rewritten (B keeps the stale copy it loaded)', inoOf(pathIn(fb, idR)) === stalePre && (raced.rectify?.owed ?? []).some((o) => `local_${idR}` === o.id || idR === o.id.replace(/^local_/, '')));
+    save(fb, idR, 'B-continued', (r) => { r.cliSessionId = randomUUID(); });
+    tick(G_SWITCH_MS + 1000);
+    await pass('flush race, after the grace window');
+    const conflict = state()?.conflicts?.[`local_${idR}`];
+    check('switch: the stale continuation is recorded as a conflict (transcript changed: toast)', !!conflict && conflict.cliChanged === true, JSON.stringify(conflict ?? null));
+    check('switch: the newest copy is in A too', sameInode(idR, fa, fb));
+    // a delete and an archive made in B
+    const idD = pool[2]; const idV = pool[3];
+    unlinkSync(pathIn(fb, idD)); writeFileSync(join(fb.path, `deleted_${idD}`), String(tick()));
+    save(fb, idV, 'archived', (r) => { r.isArchived = true; });
+    await pass('delete and archive');
+    check('switch: the delete reached A (backup first, tombstone written)', !existsSync(pathIn(fa, idD)) && existsSync(join(fa.path, `deleted_${idD}`)) && existsSync(idx) && readFileSync(idx, 'utf8').includes(`local_${idD}.json`));
+    check('switch: the archive reached A', JSON.parse(readFileSync(pathIn(fa, idV), 'utf8')).isArchived === true);
+    // a never-linked account C signs in: a synthetic folder in the scratch store, its pairs answered
+    const C = randomUUID(); const OC = randomUUID(); const fc = { acct: C, org: OC, key: `${C}/${OC}`, path: join(STORE, C, OC) };
+    mkdirSync(fc.path, { recursive: true });
+    const cId = randomUUID(); const ctpl = JSON.parse(readFileSync(pathIn(fa, pool[4] ?? pool[0]), 'utf8'));
+    ctpl.sessionId = `local_${cId}`; ctpl.cliSessionId = randomUUID(); ctpl.title = 'scratch conversation of a new account';
+    writeFileSync(pathIn(fc, cId), JSON.stringify(ctpl)); utimesSync(pathIn(fc, cId), tick() / 1000, vt / 1000);
+    forceYes();
+    seam(true, A); setConfig(A);
+    const joined = await pass('a new account joins the group');
+    check('switch: the joined account is held (names only) until the full pass', (joined.cooling ?? []).includes(fc.key) && state()?.fullPassOwed === true);
+    check('switch: its conversation reached the other accounts', existsSync(pathIn(fa, cId)) && existsSync(pathIn(fb, cId)));
+    setConfig(C); seam(true, C);
+    await pass('switch to the new account');
+    // the quit: one full pass finishes everything
+    seam(false, null);
+    tick(G_SWITCH_MS + 1000);
+    const fin = await fullPass(vctx, {});
+    check('switch: the quit runs the full pass', fin.ok === true, fin.ok ? '' : String(fin.reason ?? ''));
+    const nAll = listFolders(STORE).length;
+    const invEnd = inventory(STORE);
+    check('switch: one inode per conversation in every folder after the quit', unlinkedIds(invEnd, nAll).length === 0, `${invEnd.size} conversations, ${nAll} folders, ${unlinkedIds(invEnd, nAll).length} not linked`);
+    check('switch: nothing is owed after the quit', owedWork(vctx, {}).owed === false);
+    check('switch: no content was lost (every displaced version is in the backups)', lost === 0, `${lost} lost over ${passes} passes`);
+    const filter = accountsPushFilter({ ctx: vctx, state: loadState(ctx) });
+    let multi = 0;
+    for (const [id, byKey] of invEnd) if ([...byKey.keys()].filter((k) => filter(`${k}/local_${id}.json`)).length !== 1) multi++;
+    check('switch: every conversation uploads from exactly one folder (home-only push)', multi === 0, `${multi} of ${invEnd.size} do not`);
+    delete process.env.SESSION_SYNC_TEST_APP_STATE;
+  }
 } catch (e) {
   check('flow completed', false, e?.message ?? e);
 }
