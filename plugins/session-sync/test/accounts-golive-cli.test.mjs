@@ -266,3 +266,87 @@ test('scope: the restart prompt appears once per new unlinked account, never aft
   assert.ok(third.includes(C.slice(0, 8)), 'it names the new account');
   assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'once per new account');
 });
+
+/* ------------------------------------------------------------------ 0.5.2 review round: S7 an older waiter is replaced by go-live and by answer yes, nothing else is touched */
+
+/** A live idle hidden node whose command line ends in `args`, detached from us (init reaps it, like a real waiter). */
+const fakeProc = (args) => {
+  const code = `const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)',...${JSON.stringify(args)}],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)`;
+  const pid = Number(String(spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true }).stdout).trim());
+  return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
+};
+/** An armed waiter of an older version (no version in its claim) as `pid`. */
+const oldWaiter = (w, pid) => {
+  const iso = new Date().toISOString();
+  mkdirSync(w.acc, { recursive: true });
+  writeFileSync(join(w.acc, 'waiter.json'), JSON.stringify({ pid, armedAt: iso, heartbeatAt: iso, reasons: ['link'] }));
+  writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid, at: Date.now() }));
+};
+const waitersLaunched = (w) => launched(w).filter((a) => a[1] === 'wait').length;
+
+test('S7 accounts answer yes: a waiter left by an older version is ended and this copy arms its own', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  const old = fakeProc(['accounts', 'wait']);
+  try {
+    oldWaiter(w, old.pid);
+    const r = run(w, ['accounts', 'answer', 'yes', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(alive(old.pid), false, 'the old waiter was ended');
+    assert.equal(JSON.parse(r.stdout).waiter, 'spawned', 'a new waiter was armed');
+    assert.equal(waitersLaunched(w), 1);
+  } finally { old.kill(); }
+});
+
+test('S7 accounts answer yes with nothing left to answer still replaces an older waiter and arms the link for this copy', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); });   // answered, not linked
+  const old = fakeProc(['accounts', 'wait']);
+  try {
+    oldWaiter(w, old.pid);
+    const r = run(w, ['accounts', 'answer', 'yes', '--json']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(alive(old.pid), false);
+    assert.equal(JSON.parse(r.stdout).waiter, 'spawned');
+    assert.equal(waitersLaunched(w), 1);
+    // nothing to replace and nothing pending: the plain answer, nothing armed
+    const again = run(w, ['accounts', 'answer', 'yes', '--json']);
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(JSON.parse(again.stdout).answered, 0);
+    assert.equal(waitersLaunched(w), 1);
+  } finally { old.kill(); }
+});
+
+test('S7 accounts go-live ends a waiter of an older version, and leaves a process that is not a waiter alone', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  const old = fakeProc(['accounts', 'wait']);
+  const other = fakeProc(['something-else']);
+  try {
+    oldWaiter(w, old.pid);
+    const r = run(w, ['accounts', 'go-live', '--yes']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(alive(old.pid), false, 'the old waiter was ended');
+    assert.equal(runners(w), 1);
+    // a stale claim that names an unrelated live process: dropped, the process is never ended
+    oldWaiter(w, other.pid);
+    const again = run(w, ['accounts', 'go-live', '--yes']);
+    assert.equal(again.status, 0, again.stderr);
+    assert.equal(alive(other.pid), true, 'an unrelated process is never ended');
+    assert.equal(existsSync(join(w.acc, 'waiter.claim')), false, 'its stale claim is dropped');
+  } finally { old.kill(); other.kill(); }
+});
+
+test('S7 a waiter of the current version is not touched by go-live or answer yes', () => {
+  const w = cworld();
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  const cur = fakeProc(['accounts', 'wait']);
+  try {
+    oldWaiter(w, cur.pid);
+    writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: cur.pid, at: Date.now(), version: PLUGIN_VERSION }));
+    assert.equal(run(w, ['accounts', 'go-live', '--yes']).status, 0);
+    assert.equal(run(w, ['accounts', 'answer', 'yes']).status, 0);
+    assert.equal(alive(cur.pid), true);
+  } finally { cur.kill(); }
+});

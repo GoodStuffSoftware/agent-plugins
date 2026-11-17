@@ -23,7 +23,8 @@ import { loadState, saveState, emptyState, readJson, resetMutations, accPath, ro
 import { answerPairs, pairKey, listFolders } from '../lib/accounts/folders.mjs';
 import { link, fullPass } from '../lib/accounts/pass.mjs';
 import { cliCopies, sessionSyncCopies, copyCapability, desktopCopies, relaunchApp, resolveAumid } from '../lib/accounts/desktop.mjs';
-import { launchDetached, launchViaHelper, forwardedEnv, CLI_PATH } from '../lib/accounts/launcher.mjs';
+import { launchDetached, launchViaHelper, launchProgram, forwardedEnv, CLI_PATH } from '../lib/accounts/launcher.mjs';
+import { processInfo, verifyProcess, RUNNER_MARKER, WAITER_MARKER } from '../lib/accounts/procid.mjs';
 import { collectStatus, formatStatus, formatGoLive } from '../lib/accounts/report.mjs';
 import { requestAppQuit, quitSupport } from '../lib/accounts/appquit.mjs';
 import { remoteRecordList } from '../lib/sync.mjs';
@@ -1592,6 +1593,266 @@ test('progress helper (real PowerShell, dry run): the tooltip follows the result
     assert.ok(t.includes(`balloon: ${endText('attention')} Click to open the log.`), t.join('|'));
     assert.equal(t.at(-1), 'exit: done', 'the icon is removed after the closing balloon');
     assert.ok(!t.includes('exit: runner-gone'));
+    assert.ok(alive(fake.pid), 'the helper never touches the runner');
+  } finally { fake.kill(); try { h.child.kill(); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
+});
+
+/* ------------------------------------------------------------------ 0.5.2 review round: B1 identity, S1 tray lifetime, S2 phase, S3 claim, S4 back-off, S6 hide */
+
+/** A live process that is NOT a runner (its command line has no `golive-run`), detached from us like a real one. */
+const fakeOther = () => {
+  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)','something-else'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
+  const pid = Number(String(spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true }).stdout).trim());
+  return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
+};
+/** A world whose go-live waits in wait-stop (the app runs) with a claim for `pid`. */
+function waitingWorld(pid, claim = {}) {
+  const w = world();
+  w.setApp(true);
+  start(w, deps(w).d);
+  writeClaim(w, pid, claim);
+  return w;
+}
+const okVerify = () => ({ ok: true, reason: 'match' });
+
+test('B1 procid: ps and CIM output parse; a pid that is gone and one the OS cannot answer for are told apart', () => {
+  const ps = (stdout, status = 0, error) => ({ spawnSyncFn: () => ({ status, stdout, error }), platform: 'linux' });
+  const at = Date.parse('Mon Nov 16 10:00:00 2026');
+  assert.deepEqual(processInfo(42, ps('Mon Nov 16 10:00:00 2026 /usr/bin/node /p/cli.mjs accounts golive-run\n')), { commandLine: '/usr/bin/node /p/cli.mjs accounts golive-run', startedAtMs: at });
+  assert.deepEqual(processInfo(42, ps('Tue Nov  3 09:05:01 2026 node x\n')), { commandLine: 'node x', startedAtMs: Date.parse('Tue Nov  3 09:05:01 2026') }, 'a one digit day is padded with a space');
+  assert.deepEqual(processInfo(42, ps('', 1)), { gone: true }, 'ps exits 1 for a pid that does not exist');
+  assert.equal(processInfo(42, ps('', 2)), null, 'no output and another status: the OS could not be asked');
+  assert.equal(processInfo(42, ps('garbage\n')), null);
+  assert.equal(processInfo(42, ps('', 0, new Error('ENOENT'))), null);
+  assert.equal(processInfo(0, ps('')), null);
+  assert.equal(processInfo(1.5, ps('')), null);
+  const win = (stdout, status = 0) => ({ spawnSyncFn: (cmd, args, o) => { assert.equal(cmd, 'powershell.exe'); assert.equal(o.windowsHide, true); return { status, stdout }; }, platform: 'win32' });
+  assert.deepEqual(processInfo(42, win('{"cmd":"node cli.mjs accounts golive-run","at":1700000000000}\r\n')), { commandLine: 'node cli.mjs accounts golive-run', startedAtMs: 1700000000000 });
+  assert.deepEqual(processInfo(42, win('{"gone":true}')), { gone: true });
+  assert.equal(processInfo(42, win('', 1)), null);
+  assert.equal(processInfo(42, win('not json')), null);
+  assert.equal(processInfo(42, win('{"cmd":"x","at":0}')), null);
+});
+
+test('B1 procid: verifyProcess needs the marker in the command line and a start no later than the claim (2 s slack)', () => {
+  const want = (info, extra = {}) => ({ marker: RUNNER_MARKER, claimedAt: 100000, info: () => info, ...extra });
+  const cmd = 'node cli.mjs accounts golive-run';
+  assert.equal(verifyProcess(1, want({ commandLine: cmd, startedAtMs: 99000 })).reason, 'match');
+  assert.equal(verifyProcess(1, want({ commandLine: cmd, startedAtMs: 101900 })).ok, true, 'inside the slack: the claim is stamped a moment after the start');
+  assert.equal(verifyProcess(1, want({ commandLine: cmd, startedAtMs: 102500 })).reason, 'newer-process', 'a pid reused after the claim');
+  assert.equal(verifyProcess(1, want({ commandLine: 'chrome.exe --type=gpu', startedAtMs: 1 })).reason, 'other-command');
+  assert.equal(verifyProcess(1, want({ gone: true })).reason, 'gone');
+  assert.equal(verifyProcess(1, want(null)).reason, 'unverified');
+  assert.equal(RUNNER_MARKER.test('node cli.mjs accounts golive-run'), true);
+  assert.equal(RUNNER_MARKER.test('node my-golive-runner.js'), false);
+  assert.equal(WAITER_MARKER.test('node cli.mjs accounts wait'), true);
+  assert.equal(WAITER_MARKER.test('node cli.mjs accounts waiting-room'), false);
+});
+
+test('B1 procid (real OS): a live process reports its real command line and start; a dead pid is gone', () => {
+  const child = fakeRunner();
+  try {
+    const before = Date.now();
+    const info = processInfo(child.pid);
+    assert.ok(info && !info.gone, JSON.stringify(info));
+    assert.match(info.commandLine, /golive-run/);
+    assert.ok(info.startedAtMs <= Date.now() + 2000 && info.startedAtMs > before - 60000, `started ${info.startedAtMs}`);
+    assert.equal(verifyProcess(child.pid, { marker: RUNNER_MARKER, claimedAt: Date.now() }).reason, 'match');
+    assert.equal(verifyProcess(child.pid, { marker: RUNNER_MARKER, claimedAt: 1000 }).reason, 'newer-process');
+    assert.equal(verifyProcess(child.pid, { marker: WAITER_MARKER, claimedAt: Date.now() }).reason, 'other-command');
+  } finally { child.kill(); }
+  const dead = spawnSync(process.execPath, ['-e', ''], { windowsHide: true }).pid;
+  assert.deepEqual(processInfo(dead), { gone: true });
+});
+
+test('B1 replace: a live process that is not the runner (a reused pid) is never ended; the claim is dropped as stale', () => {
+  const other = fakeOther();
+  try {
+    const w = waitingWorld(other.pid);                       // the claim names an unrelated live process
+    const r = replaceWaitingRunner(w.ctx, { appRunning: () => true, kill: () => assert.fail('an unrelated process must not be ended') });
+    assert.equal(r.replaced, true);
+    assert.equal(r.stale, true);
+    assert.equal(alive(other.pid), true, 'the unrelated process lives on');
+    assert.equal(existsSync(claimPath(w)), false, 'the stale claim is gone');
+    assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /is stale \(other-command[^\n]*nothing was ended/);
+    assert.equal(readGoLive(w.ctx).phase, 'wait-stop');
+  } finally { other.kill(); }
+});
+
+test('B1 replace: a process that started after the claim (pid reuse) is stale, even with a runner-like command line; nothing is ended', () => {
+  const child = fakeRunner();
+  try {
+    const w = waitingWorld(child.pid, { at: 1000 });   // claimed long before this process began
+    const r = replaceWaitingRunner(w.ctx, { appRunning: () => true, kill: () => assert.fail('a newer process must not be ended') });
+    assert.deepEqual([r.replaced, r.stale], [true, true]);
+    assert.equal(alive(child.pid), true);
+    assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /newer-process/);
+  } finally { child.kill(); }
+});
+
+test('B1 replace: when the OS cannot be asked the runner is left alone and the claim stays (unverified)', () => {
+  const w = waitingWorld(process.ppid);
+  const r = replaceWaitingRunner(w.ctx, { appRunning: () => true, verify: () => ({ ok: false, reason: 'unverified' }), kill: () => assert.fail('nothing may be ended on a guess') });
+  assert.deepEqual(r, { replaced: false, reason: 'unverified', pid: process.ppid });
+  assert.equal(existsSync(claimPath(w)), true);
+});
+
+test('S2 replace: the persisted phase is read again after the slow app probe; a runner that moved on is not ended', () => {
+  const w = waitingWorld(process.ppid);
+  const moveOn = () => {                                    // the 0.5.2 runner saw the app stop during the probe and began the link
+    const g = readGoLive(w.ctx); g.phase = 'link'; writeFileSync(goLiveFile(w.ctx), JSON.stringify(g));
+    return true;
+  };
+  const r = replaceWaitingRunner(w.ctx, { appRunning: moveOn, verify: okVerify, kill: () => assert.fail('a runner past wait-stop must not be ended') });
+  assert.deepEqual(r, { replaced: false, reason: 'busy', phase: 'link' });
+  assert.equal(existsSync(claimPath(w)), true, 'the claim is untouched');
+  assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /replace refused: the runner moved on \(phase link\)/);
+});
+
+test('S2 replace: a runner that holds accounts.lock (a pass is running) is not ended, and a result that stopped waiting is not either', () => {
+  const w = waitingWorld(process.ppid);
+  writeFileSync(join(w.acc, 'accounts.lock'), JSON.stringify({ pid: process.ppid, at: Date.now() }));
+  assert.equal(replaceWaitingRunner(w.ctx, { appRunning: () => true, verify: okVerify, kill: () => assert.fail('lock held') }).reason, 'busy');
+  unlinkSync(join(w.acc, 'accounts.lock'));
+  const r = JSON.parse(readFileSync(goLiveResultFile(w.ctx), 'utf8'));
+  const flip = () => { writeFileSync(goLiveResultFile(w.ctx), JSON.stringify({ ...r, status: 'ok' })); return true; };
+  assert.equal(replaceWaitingRunner(w.ctx, { appRunning: flip, verify: okVerify, kill: () => assert.fail('finished') }).reason, 'busy');
+  // and a claim another runner took over while we asked
+  writeFileSync(goLiveResultFile(w.ctx), JSON.stringify(r));
+  const swap = () => { writeClaim(w, process.pid, { at: w.ctx.now() + 5 }); return true; };
+  assert.equal(replaceWaitingRunner(w.ctx, { appRunning: swap, verify: okVerify, kill: () => assert.fail('claim changed') }).reason, 'busy');
+});
+
+test('S3 runner: a claim another process took over ends the runner while it waits; nothing is linked and no result is written', async () => {
+  const w = world();
+  w.setApp(true);
+  const { d } = deps(w, { onSleep: (n) => { if (n === 3) writeClaim(w, process.ppid, { at: 1 }); } });
+  start(w, d);
+  const before = res(w);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'lost-claim' });
+  assert.equal(loadState(w.ctx).linked, false);
+  assert.deepEqual(res(w), before, 'the result is not changed by a runner that no longer owns the go-live');
+  assert.equal(readJson(claimPath(w)).pid, process.ppid, 'the new holder keeps its claim');
+  assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /another runner holds the claim now/);
+});
+
+test('S3 runner: a claim file that vanished is taken back by the runner that is still alive, and the go-live goes on', async () => {
+  const w = world();
+  const { d } = deps(w, { onPhase: (p) => { if (p === 'relist') unlinkSync(claimPath(w)); } });
+  start(w, d);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'done', status: 'ok' });
+  assert.doesNotMatch(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /another runner holds the claim/);
+});
+
+test('S4 wait-stop: an unknown process probe is looked at every pollMs after 20 quick readings, says so in the result, and the note goes when it answers', async () => {
+  const w = probeWorld();
+  w.app.quit();
+  w.app.broken = true;
+  const sleeps = []; let mid = null;
+  const { d } = deps(w, {
+    appStatus: undefined, haltAfter: 'wait-stop', pollMs: 30000, stopPollMs: 500,
+    sleep: async (ms) => {
+      sleeps.push(ms);
+      if (sleeps.length === 26) { mid = res(w).messages.join('\n'); }
+      if (sleeps.length === 30) w.app.broken = false;
+    },
+  });
+  start(w, d);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'halted' });
+  assert.ok(sleeps.slice(0, 15).every((ms) => ms === 500), 'quick readings first');
+  assert.ok(sleeps.slice(21, 29).every((ms) => ms === 30000), `then every pollMs: ${sleeps.join(',')}`);
+  assert.match(mid, /Claude seems closed, but the check for its processes does not answer \(.*\)\. Checking every 30 seconds until it does\./);
+  assert.equal((readFileSync(goLiveLogFile(w.ctx), 'utf8').match(/does not answer/g) ?? []).length, 1, 'said once');
+  assert.doesNotMatch(readGoLive(w.ctx).messages.join('\n'), /does not answer/, 'the note is removed when the probe answers');
+});
+
+test('S6 runner: when Claude is back before the link finishes the indicator is taken away and the next link shows a new one', async () => {
+  const w = world();
+  let flipped = false;
+  const ui = { calls: [], start(i) { this.calls.push(['start', i.run]); }, hide() { this.calls.push(['hide']); }, end(r) { this.calls.push(['end', r.status]); } };
+  const { d } = deps(w, {
+    ui,
+    onPhase: (p) => { if (p === 'link' && !flipped) { flipped = true; w.setApp(true); } },
+    onSleep: () => { if (flipped) w.setApp(false); },
+  });
+  start(w, d);
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'ok');
+  const id = res(w).id;
+  assert.deepEqual(ui.calls.map((c) => c[0]), ['start', 'hide', 'start', 'end']);
+  assert.deepEqual(ui.calls.filter((c) => c[0] === 'start').map((c) => c[1]), [`${id}-1`, `${id}-2`], 'each shown run has its own id');
+  assert.equal(res(w).progress.run, `${id}-2`);
+});
+
+test('S6 runner: back in wait-stop the result carries no run id, so the helper of the first run leaves', async () => {
+  const w = world();
+  let flipped = false; let during = 'unset';
+  const { d } = deps(w, {
+    ui: fakeUi(),
+    onPhase: (p) => { if (p === 'link' && !flipped) { flipped = true; w.setApp(true); } if (p === 'wait-stop' && flipped) during = res(w).progress?.run ?? null; },
+    onSleep: () => { if (flipped) w.setApp(false); },
+  });
+  start(w, d);
+  await runGoLive(w.ctx, d);
+  assert.equal(during, null);
+});
+
+test('S1 progress: the Windows helper is started through the launcher (outside the runner job) with its run id; a plain child is only the fallback and end() waits for it', async () => {
+  const launched = []; const spawned = [];
+  const launchFn = (exe, args, o) => { launched.push({ exe, args, o }); return { ok: true, pid: 77, method: 'cim' }; };
+  const ui = createProgressUi({ platform: 'win32', launchFn, spawnFn: (...a) => { spawned.push(a); return { on() {}, unref() {} }; }, env: {} });
+  ui.start({ resultFile: 'C:\\acc\\r.json', logFile: 'C:\\acc\\l.log', runnerPid: 9, run: 'gl-1-2' });
+  assert.equal(spawned.length, 0, 'no plain child when the launcher worked');
+  assert.equal(launched.length, 1);
+  const a = launched[0].args;
+  assert.deepEqual(a.slice(0, 7), ['-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', TRAY_SCRIPT]);
+  assert.equal(a[a.indexOf('-Run') + 1], 'gl-1-2');
+  assert.match(launched[0].exe, /powershell\.exe$/i);
+  assert.equal(ui.end({ status: 'ok' }), undefined, 'a helper outside the job needs no wait: it shows the balloon after the runner is gone');
+  // the launcher failed: a plain hidden child, and end() resolves when it exits, or after endWaitMs
+  const child = new EventEmitter(); child.unref = () => {};
+  const ui2 = createProgressUi({ platform: 'win32', launchFn: () => ({ ok: false }), spawnFn: () => child, env: {}, endWaitMs: 5000 });
+  ui2.start({ resultFile: 'r', runnerPid: 1 });
+  const p = ui2.end({ status: 'ok' });
+  assert.equal(typeof p.then, 'function');
+  setTimeout(() => child.emit('exit', 0), 10);
+  await p;
+  const hung = new EventEmitter(); hung.unref = () => {};
+  const ui3 = createProgressUi({ platform: 'win32', launchFn: () => ({ ok: false }), spawnFn: () => hung, env: {}, endWaitMs: 30 });
+  ui3.start({ resultFile: 'r', runnerPid: 1 });
+  await ui3.end({ status: 'ok' });   // resolves by itself after endWaitMs
+});
+
+test('S1 launcher: launchProgram logs under the test seam, is Windows only, and starts the program through one hidden CIM powershell', () => {
+  const log = join(tmpdir(), `ss-lp-${Date.now()}.log`);
+  try {
+    const r = launchProgram('C:\\x\\powershell.exe', ['-File', 'a b.ps1'], { env: { SESSION_SYNC_TEST_LAUNCH_LOG: log } });
+    assert.deepEqual([r.ok, r.method], [true, 'test-log']);
+    assert.deepEqual(JSON.parse(readFileSync(log, 'utf8').trim()), { program: 'C:\\x\\powershell.exe', args: ['-File', 'a b.ps1'] });
+  } finally { rmSync(log, { force: true }); }
+  assert.equal(launchProgram('x', [], { env: {}, platform: 'linux' }).ok, false);
+  const seen = [];
+  const spawnSyncFn = (cmd, args, o) => { seen.push({ cmd, args, o }); return { status: 0, stdout: '{"rc":0,"pid":555}\n' }; };
+  const ok = launchProgram('C:\\x\\powershell.exe', ['-File', 'a b.ps1'], { env: {}, platform: 'win32', spawnSyncFn });
+  assert.deepEqual([ok.ok, ok.pid, ok.method], [true, 555, 'cim']);
+  assert.equal(seen[0].cmd, 'powershell.exe');
+  assert.equal(seen[0].o.windowsHide, true);
+  assert.equal(seen[0].o.env.SS_LAUNCH_CMD, 'C:\\x\\powershell.exe -File "a b.ps1"');
+  assert.equal(launchProgram('x', [], { env: {}, platform: 'win32', spawnSyncFn: () => ({ status: 1, stderr: 'no' }) }).ok, false);
+});
+
+test('S6 progress helper (real PowerShell, dry run): it leaves when the result names another run than its own, or none', onWin, async () => {
+  const dir = join(tmpdir(), `ss-tray-${Date.now()}-c`); mkdirSync(dir, { recursive: true });
+  const fake = fakeRunner();
+  const doc = (run) => JSON.stringify({ v: 1, id: 'gl-1', status: 'waiting', phase: 'link', progress: { ...progressInfo('link', 'waiting'), ...(run ? { run } : {}) } });
+  writeFileSync(join(dir, 'go-live-result.json'), doc('gl-1-1'));
+  const h = trayRun(dir, { runnerPid: fake.pid, extra: ['-Run', 'gl-1-1'] });
+  try {
+    assert.ok(await h.until((t) => t.includes('tip: Syncing accounts: backing up and linking')), h.read().join('|'));
+    assert.ok(!h.read().includes('exit: superseded'), 'its own run keeps the icon');
+    writeFileSync(join(dir, 'go-live-result.json'), doc(null));   // the link went back to waiting for Claude to close
+    assert.equal(await Promise.race([h.exited, sleepMs(20000).then(() => 'hung')]), 0);
+    assert.equal(h.read().at(-1), 'exit: superseded');
     assert.ok(alive(fake.pid), 'the helper never touches the runner');
   } finally { fake.kill(); try { h.child.kill(); } catch { /* gone */ } rmSync(dir, { recursive: true, force: true }); }
 });
