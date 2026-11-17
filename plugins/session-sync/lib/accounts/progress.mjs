@@ -140,7 +140,8 @@ export function createProgressUi(o = {}) {
         if (platform === 'win32') {
           const child = fallbackChild; fallbackChild = null;
           if (!child?.once) return undefined;
-          return new Promise((resolve) => { const t = setTimeout(resolve, o.endWaitMs ?? END_WAIT_MS); t.unref?.(); child.once('exit', () => { clearTimeout(t); resolve(); }); });
+          // the timer is NOT unref'd: it is what keeps the runner alive while the child (which is unref'd) shows the balloon
+          return new Promise((resolve) => { const t = setTimeout(resolve, o.endWaitMs ?? END_WAIT_MS); child.once('exit', () => { clearTimeout(t); resolve(); }); });
         }
         notifyFn(TITLE, result.headline ?? endText(result.status), { tag: 'accounts-progress', persist: result.status !== 'ok' });
       } catch { /* best effort */ }
