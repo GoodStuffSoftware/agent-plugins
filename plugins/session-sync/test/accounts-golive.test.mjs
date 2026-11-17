@@ -27,6 +27,7 @@ import { requestAppQuit, quitSupport } from '../lib/accounts/appquit.mjs';
 import { remoteRecordList } from '../lib/sync.mjs';
 import { findRclone } from '../lib/rclone.mjs';
 import { makeRoot, makeClock, addFolder, putRecord, putTombstone, uuid, treeHashes, recordName } from './fixtures/store.mjs';
+import { makeProbeApp } from './fixtures/probe-app.mjs';
 
 afterEach(() => {
   delete process.env.SESSION_SYNC_TEST_APP_STATE;
@@ -1310,4 +1311,70 @@ test('0.5.1 notices: the wait text leads with Restart Claude to sync your accoun
   assert.match(st, new RegExp(`^${lead.source}`), 'the first line of accounts status');
   assert.match(st, /no time limit/);
   assert.match(st, /Closing the window only hides it/);
+});
+
+/* ------------------------------------------------------------------ 0.5.2: the stop waits go through the REAL probe (no seam) */
+
+/** world() minus the seam: the app is a real lockfile plus an injected PowerShell answer (fixtures/probe-app.mjs). */
+function probeWorld(opts) {
+  const w = world(opts);
+  delete process.env.SESSION_SYNC_TEST_APP_STATE;
+  const app = makeProbeApp(w.ctx);
+  return { ...w, ctx: app.ctx, app, setApp: (running) => app.setApp(running) };
+}
+
+test('0.5.2 wait-stop through the real probe: the app quits and no claude process is left (the 0.5.1 bug); the link starts within 3 readings', async () => {
+  const w = probeWorld();
+  w.app.start();
+  let quitAt = 0;
+  const { d, s } = deps(w, { appStatus: undefined, haltAfter: 'wait-stop', onSleep: (n) => { if (n === 3) { quitAt = n; w.app.quit(); } } });
+  start(w, d);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'halted' });
+  assert.equal(readGoLive(w.ctx).phase, 'relist');
+  assert.ok(s.sleeps <= quitAt + 3, `slept ${s.sleeps} times, the app quit at sleep ${quitAt}`);
+  assert.ok(w.app.probes >= 3, 'the process probe ran');
+  const log = readFileSync(goLiveLogFile(w.ctx), 'utf8');
+  assert.match(log, /app lock marker gone \(S1 true -> false\)/);
+  assert.doesNotMatch(log, /WARN|is unknown/, 'a probe that answers is never reported as unknown');
+});
+
+test('0.5.2 wait-stop through the real probe: a quit that is undone within one reading does not start the link; the next quit does', async () => {
+  const w = probeWorld();
+  w.app.start();
+  // sleep 2: quit; sleep 3: Claude is back before the second stopped reading; sleep 4: quit again
+  const { d, s } = deps(w, { appStatus: undefined, haltAfter: 'wait-stop', onSleep: (n) => { if (n === 2) w.app.quit(); if (n === 3) w.app.start(); if (n === 4) w.app.quit(); } });
+  start(w, d);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'halted' });
+  assert.ok(s.sleeps >= 5, `the blip must not count (slept ${s.sleeps})`);
+  const log = readFileSync(goLiveLogFile(w.ctx), 'utf8');
+  assert.match(log, /app lock marker gone/);
+  assert.match(log, /app lock marker is back \(S1 false -> true\) after \d+ ms/);
+});
+
+test('0.5.2 wait-stop: a probe that stays unknown while the lock marker is gone is logged with its reason, then a WARN, and the link waits for a real answer', async () => {
+  const w = probeWorld();
+  w.app.quit();
+  w.app.broken = true;
+  let t = 0;
+  const { d } = deps(w, { appStatus: undefined, haltAfter: 'wait-stop', clock: () => (t += 1000), onSleep: (n) => { if (n === 30) w.app.broken = false; } });
+  start(w, d);
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'halted' }, 'it ends once the probe answers "no process"');
+  const log = readFileSync(goLiveLogFile(w.ctx), 'utf8');
+  assert.equal((log.match(/is unknown while the lock marker is gone/g) ?? []).length, 1, 'once, not once per poll');
+  assert.match(log, /WARN: the process probe has been unknown for \d+ ms[^\n]*status 1[^\n]*boom/);
+});
+
+test('0.5.2 verify-stop through the real probe: the app comes back after the link, the check waits for the real stop and the go-live ends ok', async () => {
+  const w = probeWorld();
+  let came = false;
+  const { d } = deps(w, {
+    appStatus: undefined,
+    onPhase: (p) => { if (p === 'verify' && !came) { came = true; w.app.start(); } },
+    onSleep: (n) => { if (came && n % 6 === 0) w.app.quit(); },
+  });
+  start(w, d);
+  const out = await runGoLive(w.ctx, d);
+  assert.equal(out.status, 'ok', readFileSync(goLiveLogFile(w.ctx), 'utf8'));
+  assert.match(readGoLive(w.ctx).messages.join('\n'), /The app is running; the check waits/);
+  assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /app lock marker is back/);
 });

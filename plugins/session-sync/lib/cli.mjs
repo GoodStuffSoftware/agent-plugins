@@ -705,7 +705,7 @@ async function accountsCommand(sub, args) {
 
   if (sub === 'wait') {
     const i = args.indexOf('--reason');
-    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', notify: accountsToast });
+    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', notify: accountsToast, log });
     log(`accounts waiter: ${out.exit}${out.report ? ` (${out.report.op} ${out.report.ok ? 'ok' : out.report.error ?? out.report.reason ?? 'not ok'})` : ''}`);
     return 0;
   }

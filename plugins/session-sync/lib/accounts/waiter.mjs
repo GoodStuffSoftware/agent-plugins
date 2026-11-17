@@ -14,7 +14,7 @@
  * Liveness: the pid is alive and `heartbeatAt` is younger than 5 minutes.
  * Trigger: an fs.watch on USERDATA for the lock marker plus a poll timer
  * (SESSION_SYNC_TEST_POLL_MS shrinks every interval in tests). The pass runs only
- * after 2 consecutive "app stopped" readings at least `gapMs` (10 s) apart, so a
+ * after 2 consecutive "app stopped" readings at least `gapMs` (0.5 s) apart, so a
  * restart gap or a flapping lockfile never triggers it.
  */
 
@@ -22,13 +22,18 @@ import { openSync, writeSync, closeSync, unlinkSync, mkdirSync, watch } from 'no
 import { dirname } from 'node:path';
 import { pidAlive } from '../lock.mjs';
 import { accPath, readJson, writeJsonAtomic, loadState } from './state.mjs';
-import { appState, lockfilePresent } from './appstate.mjs';
+import { createStopWatch } from './appstate.mjs';
 import { fullPass, link, unlink, owedWork } from './pass.mjs';
 
 export const HEARTBEAT_STALE_MS = 5 * 60 * 1000;
 export const MAX_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 const POLL_MS = 30 * 1000;
-const GAP_MS = 10 * 1000;
+// The pass starts when the app has stopped on two readings this far apart. Half a second is enough: the S1 guard aborts a pass
+// the moment the app's lock marker comes back, and the waiter tries again at the next quit.
+const GAP_MS = 500;
+/** While the app's lock marker is gone the waiter looks this often (the stop is being confirmed); otherwise it sleeps POLL_MS. */
+const FAST_POLL_MS = 500;
+const FAST_NULL_LIMIT = 20;   // a probe that stays unknown does not keep PowerShell running twice a second for days
 const PROBE_EVERY_MS = 10 * 60 * 1000;
 
 const waiterFile = (ctx) => accPath(ctx, 'waiter.json');
@@ -133,6 +138,7 @@ function lastPassOf(op, res, ctx) {
  * @param {object} o  {reason, pollMs, gapMs, probeEveryMs, maxLifetimeMs, watchLockfile, passOpts, notify, sleep}
  *   passOpts: () => extra options for fullPass/link/unlink (tests inject a guard)
  *   notify(title, body): the toast function (cli passes a config-aware one)
+ *   log(line): where the stop watch says what it sees (the marker going and coming, an unknown process probe, a restart)
  */
 export async function runWaiter(ctx, o = {}) {
   const testPoll = Number(process.env.SESSION_SYNC_TEST_POLL_MS) || 0;
@@ -173,13 +179,13 @@ export async function runWaiter(ctx, o = {}) {
     const wantsOp = reasons.some((r) => r === 'link' || r === 'unlink') || !st0.linked;
     if (!wantsOp && !owedWork(ctx, {}).owed) return { exit: 'nothing-owed' };
 
-    let negatives = 0; let firstNegAt = 0; let lastProbe = -Infinity;
+    let negatives = 0; let firstNegAt = 0; let nullStreak = 0;
+    const watch = createStopWatch(ctx, { log: o.log ? (l) => o.log(`waiter: ${l}`) : undefined, clock, probeEveryMs });
     while (clock() - startedAt < maxLife) {
       reasons = beat();
       const now = clock();
-      const probe = !lockfilePresent(ctx) || now - lastProbe >= probeEveryMs;
-      if (probe) lastProbe = now;
-      const app = appState({ ctx, probeProcesses: probe, now: ctx.now() });
+      const app = watch.read({ now });
+      nullStreak = app.s2 === null && app.s1 === false ? nullStreak + 1 : 0;
       if (app.fullAllowed) { if (!negatives) firstNegAt = now; negatives++; } else { negatives = 0; }
 
       if (negatives >= 2 && now - firstNegAt >= gapMs) {
@@ -203,7 +209,8 @@ export async function runWaiter(ctx, o = {}) {
         }
         return { exit: res.ok ? 'done' : 'gave-up', report };
       }
-      await sleep(pollMs);
+      // the lock marker is gone: the stop is being confirmed, so look again at once (not after 30 s)
+      await sleep(app.s1 === false && nullStreak < FAST_NULL_LIMIT ? Math.min(pollMs, FAST_POLL_MS) : pollMs);
     }
     return { exit: 'expired' };
   } finally {

@@ -27,7 +27,7 @@ import {
   accPath, readJson, writeJsonAtomic, loadState, saveState, rollbackActive, LOCK_TTL_MS,
 } from './state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs, RECORD, TOMB } from './folders.mjs';
-import { appState, lockfilePresent } from './appstate.mjs';
+import { appState, createStopWatch } from './appstate.mjs';
 import { link, fullPass } from './pass.mjs';
 import { groupHealth, WAIT_NOTE } from './report.mjs';
 import { sessionSyncCopies, relaunchApp } from './desktop.mjs';
@@ -406,14 +406,9 @@ export async function runGoLive(ctx, deps = {}) {
   const note = (msg) => { gl.messages.push(msg); log(msg); };
   const save = () => saveGoLive(ctx, gl);
   const beat = () => beatClaim(ctx);
-  let lastProbe = -Infinity;
-  const stopped = () => {
-    const now = clock();
-    const probe = !lockfilePresent(ctx) || now - lastProbe >= probeEveryMs;
-    if (probe) lastProbe = now;
-    if (deps.appStatus) return !!deps.appStatus(ctx).fullAllowed;
-    return !!appState({ ctx, probeProcesses: probe, now: ctx.now() }).fullAllowed;
-  };
+  // one watcher for every stop wait: it reads the app, and logs the marker going and coming, an unknown process probe and a restart
+  const watch = createStopWatch(ctx, { log, clock, probeEveryMs, status: deps.appStatus });
+  const stopped = () => !!watch.read().fullAllowed;
   const running = () => (deps.appStatus ? !!deps.appStatus(ctx).running : !!appState({ ctx, probeProcesses: true, now: ctx.now() }).running);
   // no limit (Infinity): nothing is stored, and a limit an older runner stored for this name is dropped
   const deadline = (name, ms) => {

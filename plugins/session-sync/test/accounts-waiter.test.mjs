@@ -15,6 +15,7 @@ import { answerPairs, pairKey } from '../lib/accounts/folders.mjs';
 import { AppRunningError } from '../lib/accounts/appstate.mjs';
 import { fullPass } from '../lib/accounts/pass.mjs';
 import { makeRoot, makeClock, addFolder, putRecord, uuid, nlinkOf, recordName } from './fixtures/store.mjs';
+import { makeProbeApp } from './fixtures/probe-app.mjs';
 
 afterEach(() => { delete process.env.SESSION_SYNC_TEST_APP_STATE; resetMutations(); });
 
@@ -227,4 +228,51 @@ test('T21 waiter: a stale claim from a dead pid is taken over', async () => {
   const s = stepper();
   const out = await runWaiter(w.ctx, { ...common, reason: 'link', clock: s.clock, sleep: s.sleep, notify: () => {} });
   assert.equal(out.exit, 'done');
+});
+
+/** world() minus the seam: a real lockfile plus an injected PowerShell answer, so the real probe code decides (fixtures/probe-app.mjs). */
+function probeWorld() {
+  const w = world();
+  delete process.env.SESSION_SYNC_TEST_APP_STATE;
+  const app = makeProbeApp(w.ctx);
+  return { ...w, ctx: app.ctx, app };
+}
+
+test('0.5.2 waiter through the real probe: the app quits and no claude process is left (the 0.5.1 bug); the link runs and the stop is logged', async () => {
+  const w = probeWorld();
+  w.app.start();
+  const s = stepper((n) => { if (n === 3) w.app.quit(); });
+  const lines = [];
+  const out = await runWaiter(w.ctx, { ...common, reason: 'link', clock: s.clock, sleep: s.sleep, notify: () => {}, log: (l) => lines.push(l) });
+  assert.equal(out.exit, 'done');
+  assert.equal(loadState(w.ctx).linked, true);
+  assert.ok(s.sleeps <= 6, `slept ${s.sleeps} times`);
+  assert.ok(lines.some((l) => /^waiter: app lock marker gone/.test(l)), lines.join('\n'));
+  assert.ok(!lines.some((l) => /WARN|unknown/.test(l)));
+});
+
+test('0.5.2 waiter through the real probe: a probe that keeps failing never links, logs a WARN, and a good answer then links', async () => {
+  const w = probeWorld();
+  w.app.quit();
+  w.app.broken = true;
+  let t = 0;
+  const s = stepper((n) => { if (n === 25) w.app.broken = false; });
+  const lines = [];
+  const out = await runWaiter(w.ctx, { ...common, reason: 'link', clock: () => (t += 1000), sleep: s.sleep, notify: () => {}, log: (l) => lines.push(l) });
+  assert.equal(out.exit, 'done');
+  assert.ok(s.sleeps >= 25, 'no pass while the probe could not say');
+  assert.ok(lines.some((l) => /WARN: the process probe has been unknown/.test(l) && /boom/.test(l)), lines.join('\n'));
+});
+
+test('0.5.2 waiter: the default confirm gap is half a second, and after the lock marker goes it looks again at once, not after 30 s', async () => {
+  const w = probeWorld();
+  w.app.start();
+  const naps = [];
+  const sleep = async (ms) => { naps.push(ms); if (naps.length === 1) w.app.quit(); };
+  // real defaults for pollMs and gapMs (30 s / 0.5 s); a real clock with a fake sleep that never waits
+  let t = 0;
+  const out = await runWaiter(w.ctx, { watchLockfile: false, probeEveryMs: 1, reason: 'link', clock: () => (t += 400), sleep, notify: () => {} });
+  assert.equal(out.exit, 'done');
+  assert.equal(naps[0], 30000, 'app up: the slow poll');
+  assert.ok(naps.slice(1).every((n) => n <= 500), `after the marker went: ${naps.join(', ')}`);
 });
