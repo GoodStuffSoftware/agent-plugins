@@ -21,6 +21,22 @@ import { join, dirname } from 'node:path';
 export const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 export const CONFIG_FILE = join(STATE_DIR, 'config.json');
 
+/** Remote Control restore (accounts/rcrestore.mjs). Defined here, with the other settings; rcrestore.mjs re-exports it. */
+export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4 });
+
+/** The `rcRestore` settings from a loaded config, validated: a partial block keeps the other defaults, a bad value falls back. */
+export function rcSettings(cfg = {}) {
+  const raw = cfg?.rcRestore && typeof cfg.rcRestore === 'object' ? cfg.rcRestore : {};
+  const days = Number(raw.days);
+  const wakeMax = Number(raw.wakeMax);
+  return {
+    enabled: raw.enabled === undefined ? RC_DEFAULTS.enabled : raw.enabled !== false,
+    days: Number.isFinite(days) && days >= 1 && days <= 90 ? days : RC_DEFAULTS.days,
+    wake: raw.wake === undefined ? RC_DEFAULTS.wake : raw.wake !== false,
+    wakeMax: Number.isInteger(wakeMax) && wakeMax >= 1 && wakeMax <= 50 ? wakeMax : RC_DEFAULTS.wakeMax,
+  };
+}
+
 export const DEFAULTS = Object.freeze({
   // <rclone remote>:<path>. The path is yours — put it wherever you keep things.
   remote: 'gdrive:Claude/live',
@@ -59,6 +75,11 @@ export const DEFAULTS = Object.freeze({
   // While the account go-live runs with Claude closed, show progress: a tray icon with the current step and a start and end
   // balloon on Windows, a start and end notification on macOS and Linux. false: nothing is shown (the go-live still runs).
   progressIcon: true,
+  // Remote Control restore after a restart of the Claude desktop app (accounts/rcrestore.mjs). Windows only; elsewhere it does nothing.
+  //   enabled: relink stale links and mark sessions so the app reconnects them at its next start (free, no model turn)
+  //   days:    only sessions active within this many days are looked at (1-90)
+  //   wake:    after the restart, the first prompt of one session wakes the rest with one short turn each (costs a turn per session)
+  rcRestore: RC_DEFAULTS,
 });
 
 export const ACCOUNT_LINK_MODES = Object.freeze(['ask', 'auto', 'off']);
@@ -67,6 +88,7 @@ export function loadConfig() {
   let file = {};
   try { file = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')); } catch { /* absent or corrupt -> defaults */ }
   const cfg = { ...DEFAULTS, ...file };
+  cfg.rcRestore = rcSettings(file);   // nested: a partial block keeps the other defaults, a bad value falls back
   const fromEnv = String(process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK ?? '').trim().toLowerCase();
   const fromFile = String(cfg.accountLink ?? '').trim().toLowerCase();
   // an unknown value never enables linking: it falls back to the default ('ask')
@@ -86,6 +108,7 @@ export function saveConfig(patch) {
   let current = {};
   try { current = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')); } catch {}
   const next = { ...current, ...patch };
+  if (patch.rcRestore && typeof patch.rcRestore === 'object') next.rcRestore = { ...(current.rcRestore && typeof current.rcRestore === 'object' ? current.rcRestore : {}), ...patch.rcRestore };
   // Never persist derived fields
   delete next.remoteFrom;
   mkdirSync(dirname(CONFIG_FILE), { recursive: true });
@@ -139,6 +162,7 @@ export function describeConfig(cfg = loadConfig()) {
     debounceMinutes: Number.isFinite(cfg.debounceMinutes) ? cfg.debounceMinutes : DEFAULTS.debounceMinutes,
     accountLink: cfg.accountLink || DEFAULTS.accountLink,
     progressIcon: cfg.progressIcon !== false,
+    rcRestore: rcSettings(cfg),
     extraExcludes: cfg.extraExcludes || [],
     configFile: CONFIG_FILE,
     configExists: existsSync(CONFIG_FILE),

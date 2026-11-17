@@ -14,6 +14,19 @@
         ]
       }
     ],
+    "UserPromptSubmit": [
+      {
+        "_comment": "0.5.4, Remote Control restore: the first real prompt of an interactive session after a restart of the Claude app gets a one-time instruction to wake the other sessions (rcRestore.wake). Not SessionStart: a session that starts is not yet a session the user is talking to. The command claims the restart with an exclusive file create, so one session acts; it answers nothing and exits at once for every other prompt, on every OS (Windows only acts).",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs", "rc-wake", "--from-hook"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SessionEnd": [
       {
         "_comment": "Hooks fire PER CONVERSATION, not per client. 'clear' is excluded: clearing context is not finishing work, and it would push on every /clear. 'resume' IS included, deliberately and after a reversal. It was dropped on 2026-09-07 on the assumption that a resumed conversation always fires a later, non-resume SessionEnd — but Claude Code's docs guarantee no such thing. If a conversation's ONLY SessionEnd ever fires with reason=resume (app force-closed or crashed after a resume), excluding it means that conversation's final state NEVER reaches the remote. That is the one failure this plugin exists to prevent, so the redundant fires are absorbed instead of avoided: a hook-triggered push now RECORDS a request and coalesces onto a single background worker rather than running (or dropping) one per fire — see lib/defer.mjs. The pull/push/pull triplet inside 0.7s that motivated the removal now costs one recorded request, not a lost push. Restored 2026-09-07.",

@@ -78,3 +78,25 @@ test('accountLink: defaults to ask; the plugin option env var wins; an unknown v
     if (prior === undefined) delete process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK; else process.env.CLAUDE_PLUGIN_OPTION_ACCOUNTLINK = prior;
   }
 });
+
+test('rcRestore: defaults, a partial block keeps the other defaults, a bad value falls back, saveConfig merges the block', async () => {
+  const { loadConfig, saveConfig, describeConfig, rcSettings, RC_DEFAULTS, CONFIG_FILE } = await import('../lib/config.mjs');
+  assert.deepEqual({ ...DEFAULTS.rcRestore }, { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual({ ...RC_DEFAULTS }, { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual(describeConfig({ ...DEFAULTS, remoteFrom: 'default' }).rcRestore, { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4 });
+  assert.equal(rcSettings({ rcRestore: { days: 'x' } }).days, 3);
+  assert.equal(rcSettings({ rcRestore: { days: 91 } }).days, 3);
+  assert.equal(rcSettings({ rcRestore: { days: 1 } }).days, 1);
+  // the file is under the test sandbox (test/sandbox-env.mjs): never the real one
+  assert.ok(process.env.SESSION_SYNC_TEST_SANDBOX && CONFIG_FILE.startsWith(process.env.SESSION_SYNC_TEST_SANDBOX), CONFIG_FILE);
+  const { existsSync, unlinkSync } = await import('node:fs');
+  const had = existsSync(CONFIG_FILE);
+  assert.equal(had, false, 'a sandbox with no config file yet');
+  try {
+    saveConfig({ rcRestore: { days: 5 } });
+    saveConfig({ rcRestore: { wake: false } });
+    assert.deepEqual(JSON.parse((await import('node:fs')).readFileSync(CONFIG_FILE, 'utf8')).rcRestore, { days: 5, wake: false });
+    assert.deepEqual(loadConfig().rcRestore, { enabled: true, days: 5, wake: false, wakeMax: 4 });
+  } finally { try { unlinkSync(CONFIG_FILE); } catch { /* none */ } }
+});

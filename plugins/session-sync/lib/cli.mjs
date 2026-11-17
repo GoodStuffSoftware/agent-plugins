@@ -37,6 +37,7 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
+import { rcSettings, decideWake } from './accounts/rcrestore.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
@@ -332,7 +333,18 @@ const spawnWaiter = (reason) => {
   if (!r.ok) throw new Error(r.error ?? 'could not start the waiter');
   return r.pid;
 };
-const armWaiter = (ctx, reason) => ensureWaiter(ctx, reason, spawnWaiter);
+let waiterArmedHere = false;   // this process already armed (or joined) the waiter: a second arm right behind it would race the first one's start
+const armWaiter = (ctx, reason) => { waiterArmedHere = true; return ensureWaiter(ctx, reason, spawnWaiter); };
+
+/** The Remote Control restore settings (config rcRestore.*), read afresh. Windows only: elsewhere the whole feature is off. */
+const rcRestoreNow = () => (platform() === 'win32' ? rcSettings(loadConfig()) : { enabled: false, days: 3, wake: false, wakeMax: 4 });
+
+/** The watcher also prepares Remote Control at the quit, with one account or several: a session start with the app running makes sure it is there. */
+function rcHookArm() {
+  if (waiterArmedHere || !rcRestoreNow().enabled) return;
+  const ctx = makeCtx();
+  if (ctx.store && lockfilePresent(ctx)) armWaiter(ctx, 'watch');
+}
 
 /**
  * For the interactive commands (go-live, answer yes), never the hook: end a waiter left by an older copy of the plugin, so the
@@ -473,6 +485,7 @@ async function accountsHookStep() {
     // a go-live result no session has been told about yet (once), or a mid-run notice
     try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     await accountsHookStepInner(parts);
+    try { rcHookArm(); } catch { /* never block a session */ }   // after the account step: that one may have armed the waiter with a reason of its own
   } finally {
     if (parts.length) writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: parts.join('\n\n') } })}\n`);
   }
@@ -766,7 +779,7 @@ async function accountsCommand(sub, args) {
     const i = args.indexOf('--reason');
     // ui (S4): every pass that runs with Claude closed shows a tray icon and balloons (a notification on macOS and Linux); config progressIcon turns it off
     const ui = createProgressUi({ enabled: loadConfig().progressIcon !== false });
-    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', watch: true, notify: accountsToast, log, ui, logFile: LOG });
+    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', watch: true, notify: accountsToast, log, ui, logFile: LOG, rcRestore: rcRestoreNow });
     log(`accounts waiter: ${out.exit}${out.report ? ` (${out.report.op} ${out.report.ok ? 'ok' : out.report.error ?? out.report.reason ?? 'not ok'})` : ''}`);
     return 0;
   }
@@ -834,8 +847,57 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, accountLink: value, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error(`unknown setting "${key}". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon`);
+  if (key === 'rcRestore.enabled' || key === 'rcRestore.wake') {
+    const sub = key.split('.')[1];
+    const on = /^(true|1|yes|on)$/i.test(value);
+    saveConfig({ rcRestore: { [sub]: on } });
+    log(`config: ${key} -> ${on}`);
+    console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  if (key === 'rcRestore.wakeMax') {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 1 || n > 50) {
+      console.error(`"${value}" is not a valid rcRestore.wakeMax: use a whole number of sessions from 1 to 50.`);
+      process.exit(2);
+    }
+    saveConfig({ rcRestore: { wakeMax: n } });
+    log(`config: rcRestore.wakeMax -> ${n}`);
+    console.log(JSON.stringify({ ok: true, 'rcRestore.wakeMax': n, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  if (key === 'rcRestore.days') {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 1 || n > 90) {
+      console.error(`"${value}" is not a valid rcRestore.days: use a whole number of days from 1 to 90.`);
+      process.exit(2);
+    }
+    saveConfig({ rcRestore: { days: n } });
+    log(`config: rcRestore.days -> ${n}`);
+    console.log(JSON.stringify({ ok: true, 'rcRestore.days': n, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax');
   process.exit(2);
+}
+
+// The UserPromptSubmit hook (0.5.4): the first real prompt of an interactive session after a restart of the Claude app gets a one-time
+// instruction to wake the other sessions (Remote Control). Independent of rclone and `enabled`; never throws, never blocks the prompt.
+if (cmd === 'rc-wake') {
+  try {
+    let input = {};
+    try { if (!process.stdin.isTTY) input = JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { /* no input */ }
+    const settings = rcRestoreNow();
+    const prompt = String(input.prompt ?? '').trim();
+    if (settings.enabled && settings.wake && input.session_id && prompt && !prompt.startsWith('/')) {
+      const d = decideWake(makeCtx(), { settings, sessionId: String(input.session_id) });
+      if (d.act) {
+        log(`rc-wake: instruction given to session ${String(input.session_id).slice(0, 8)}`);
+        writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`);
+      }
+    }
+  } catch (e) { log(`rc-wake failed: ${e?.message || e}`); }
+  process.exit(0);
 }
 
 // `accounts ...` never needs rclone or `enabled`, so it is dispatched before those checks.

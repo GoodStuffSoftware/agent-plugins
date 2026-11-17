@@ -26,12 +26,18 @@ import { openSync, writeSync, closeSync, unlinkSync, mkdirSync, watch } from 'no
 import { dirname } from 'node:path';
 import { pidAlive } from '../lock.mjs';
 import { accPath, readJson, writeJsonAtomic, loadState, saveState, withAccountsLock } from './state.mjs';
-import { createStopWatch, coolingEndsAt, readSignedIn } from './appstate.mjs';
+import { createStopWatch, coolingEndsAt, readSignedIn, appState } from './appstate.mjs';
 import { listFolders } from './folders.mjs';
 import { fullPass, livePass, link, unlink, owedWork } from './pass.mjs';
 import { PLUGIN_VERSION, codeHash } from './version.mjs';
 import { verifyProcess, WAITER_MARKER } from './procid.mjs';
 import { nullUi, progressInfo } from './progress.mjs';
+import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS } from './rcrestore.mjs';
+
+const asksOp = (rs) => rs.some((r) => r === 'link' || r === 'unlink');
+/** How long the watcher looks for the app's own launch-restore lines after a start (they come within a minute or two). */
+const LAUNCH_LOOK_MS = 10 * 60 * 1000;
+const RC_MAX_TRIES = 3;
 
 export const HEARTBEAT_STALE_MS = 5 * 60 * 1000;
 export const MAX_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
@@ -242,6 +248,10 @@ async function toastConflicts(ctx, notify) {
  *   status(ctx, {probeProcesses}): replaces appState in the stop watch (tests count the probes)
  *   log(line): where the stop watch says what it sees (the marker going and coming, an unknown process probe, a restart)
  *   watchFn: fs.watch (tests deliver the events themselves)
+ *   rcRestore: () => ({enabled, days}) or {enabled, days}: Remote Control restore (rcrestore.mjs). With it on, a watcher also does the
+ *     quit-time relink and free restore after the account pass (or alone, when the accounts are not linked), keeps the marker young
+ *     while Claude stays closed and logs what the app's launch restore did. The caller passes it only where it applies (Windows).
+ *   rcOpts: extra options for rcrestore (projects dir, app log file, now; tests)
  */
 export async function runWaiter(ctx, o = {}) {
   const testPoll = Number(process.env.SESSION_SYNC_TEST_POLL_MS) || 0;
@@ -253,6 +263,7 @@ export async function runWaiter(ctx, o = {}) {
   const reason = o.reason ?? 'deferred';
   const watching = o.watch === true;
   const watchFn = o.watchFn ?? watch;
+  const rcCfg = () => { try { const c = typeof o.rcRestore === 'function' ? o.rcRestore() : o.rcRestore; return c && c.enabled ? c : null; } catch { return null; } };
 
   if (!claimWaiter(ctx)) return { exit: 'already-running' };
   const armedAt = new Date(ctx.now()).toISOString();
@@ -275,12 +286,12 @@ export async function runWaiter(ctx, o = {}) {
   const uiOn = ui !== nullUi;
   const passResultFile = accPath(ctx, 'waiter-pass-result.json');
   let uiRun = null; let uiRuns = 0;
-  const passUiStart = () => {
+  const passUiStart = (startText = PASS_START_TEXT) => {
     if (!uiOn) return;
     uiRun = `${process.pid}-${++uiRuns}`;
     try {
       writeJsonAtomic(passResultFile, { status: 'running', progress: progressInfo('pass', 'running', undefined, uiRun) });
-      ui.start({ resultFile: passResultFile, logFile: o.logFile ?? '', runnerPid: process.pid, run: uiRun, startText: PASS_START_TEXT });
+      ui.start({ resultFile: passResultFile, logFile: o.logFile ?? '', runnerPid: process.pid, run: uiRun, startText });
     } catch (e) { o.log?.(`waiter: progress indicator: ${e?.message ?? e}`); }
   };
   /** status: ok | failed | retry (the app came back or the pass could not start: the icon goes away quietly, the next try shows it again). */
@@ -293,12 +304,65 @@ export async function runWaiter(ctx, o = {}) {
       if (headline && !quiet) info.headline = headline;
       writeJsonAtomic(passResultFile, { status: quiet ? 'waiting' : status, progress: info });
       await ui.end({ status, headline: info.headline, quiet });
+      w.uiEndedAt = Date.now();   // the next balloon (the Remote Control step) waits uiGapMs so this one shows first
     } catch (e) { o.log?.(`waiter: progress indicator: ${e?.message ?? e}`); }
   };
 
   const clock = o.clock ?? Date.now;           // loop timing; ctx.now() stays the stamp for files and state
+
+  // ---- Remote Control restore (rcrestore.mjs): runs after the account pass, once per stop; the marker is kept young while Claude stays closed
+  const rcOptions = () => ({ days: rcCfg()?.days, ...(o.rcOpts ?? {}), refreshMs: rcRefreshMs, log: (l) => o.log?.(l) });
+  const readApp = (probeProcesses) => (o.status ? o.status(ctx, { probeProcesses }) : appState({ ctx, probeProcesses, now: ctx.now() }));
+  /** One attempt. w.rcDone is set when it is settled for this stop (done, or nothing to do); a busy lock or a refusal leaves it for a retry. */
+  const rcStep = async () => {
+    w.rcTries++;
+    let shown = false;
+    if (uiOn && Date.now() - w.uiEndedAt < uiGapMs) await new Promise((r) => setTimeout(r, uiGapMs - (Date.now() - w.uiEndedAt)));   // the helper of the account pass shows its closing balloon first
+    let r;
+    try {
+      r = await rcQuitStep(ctx, { ...rcOptions(), onStart: () => { shown = true; passUiStart(RC_START_TEXT); } });
+    } catch (e) {
+      o.log?.(`waiter: remote control step failed: ${e?.message ?? e}`);
+      if (shown) { await passUiEnd('failed', 'Remote Control could not be prepared. Click to open the log.'); w.uiEndedAt = Date.now(); }
+      return;
+    }
+    if (!r.ran) { if (r.reason !== 'locked') { w.rcDone = true; w.rcRefreshAt = clock(); } return; }
+    const res = r.res;
+    o.log?.(`waiter: remote control restore: ${res.relinked} relinked, ${res.marked} marked, ${res.refreshed} refreshed, status ${res.status}`);
+    if (res.status === 'refused_app_running') { if (shown) { await passUiEnd('retry'); w.uiEndedAt = Date.now(); } return; }
+    const ok = res.status === 'ok';
+    if (shown) { await passUiEnd(ok ? 'ok' : 'failed', ok ? rcDoneText(res) : `Remote Control: only part of it was prepared (${res.relinked} links reset, ${res.marked} sessions). Click to open the log.`); w.uiEndedAt = Date.now(); }
+    if (ok || w.rcTries >= RC_MAX_TRIES) {
+      w.rcDone = true; w.rcRefreshAt = clock();
+      if (res.marked || res.refreshed || res.relinked) w.rcLaunch = { since: (o.rcOpts?.now ?? ctx.now()), runSince: 0 };
+    }
+  };
+  /** While Claude stays closed: keep the marker younger than the hour the app accepts. The app is read afresh (with the process probe) first. */
+  const rcRefresh = async () => {
+    w.rcRefreshAt = clock();
+    let a; try { a = readApp(true); } catch { return; }
+    if (!a?.fullAllowed) return;
+    try { await rcQuitStep(ctx, rcOptions()); } catch (e) { o.log?.(`waiter: remote control refresh failed: ${e?.message ?? e}`); }
+  };
+  /** After the app started: say what its own launch restore did (the pass line with its outcome), so we learn whether the server flags allow it here. */
+  const rcLaunchLook = () => {
+    const L = w.rcLaunch;
+    if (!L.runSince) L.runSince = clock();
+    const out = readLaunchOutcome(o.rcOpts?.appLog ?? defaultAppLog(ctx.platform), L.since);
+    const timedOut = clock() - L.runSince >= LAUNCH_LOOK_MS;
+    if (out.outcome || timedOut) {
+      if (out.found) { o.log?.(`waiter: the app's launch restore: outcome ${out.outcome ?? 'none logged'}`); for (const l of out.lines) o.log?.(`waiter:   ${l}`); }
+      else o.log?.('waiter: the app logged nothing about a launch restore (no marker was consumed, or its log is elsewhere)');
+      w.rcLaunch = null;
+    }
+  };
   // the watcher's own state: events only set flags (S6: an event is a hint, the poll does the same work)
-  const w = { dirty: false, dirtyAt: 0, event: false, coolUntil: 0, fullDone: false, settledProbeAt: -Infinity, uiMuteUntil: 0 };
+  const w = { dirty: false, dirtyAt: 0, event: false, coolUntil: 0, fullDone: false, settledProbeAt: -Infinity, uiMuteUntil: 0,
+    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0 };
+  const rcRefreshMs = o.rcRefreshMs ?? MARKER_REFRESH_MS;
+  const uiGapMs = o.uiGapMs ?? (testPoll ? 0 : 1500);
+  /** The accounts are not linked and nothing asks for a link: this watcher only does the Remote Control restore. */
+  const rcOnly = (rs) => watching && !!rcCfg() && !asksOp(rs);
   let wake = null;
   const sleep = o.sleep ?? ((ms) => new Promise((res) => {
     const t = setTimeout(done, ms);
@@ -339,8 +403,8 @@ export async function runWaiter(ctx, o = {}) {
   try {
     let reasons = beat();
     const st0 = loadState(ctx);
-    const wantsOp = reasons.some((r) => r === 'link' || r === 'unlink') || !st0.linked;
-    if (!wantsOp && !owedWork(ctx, {}).owed && !(watching && st0.linked)) return { exit: 'nothing-owed' };
+    const wantsOp = asksOp(reasons) || (!st0.linked && !rcOnly(reasons));
+    if (!wantsOp && !owedWork(ctx, {}).owed && !(watching && (st0.linked || rcCfg()))) return { exit: 'nothing-owed' };
 
     let negatives = 0; let firstNegAt = 0; let nullStreak = 0;
     const stopWatch = createStopWatch(ctx, { log: o.log ? (l) => o.log(`waiter: ${l}`) : undefined, clock, probeEveryMs, status: o.status });
@@ -355,13 +419,15 @@ export async function runWaiter(ctx, o = {}) {
       // S4: settled = the pass for this stop is done (or none was owed) and nothing new is asked. The app is closed and the lock
       // marker is gone, so the stop watch would start a hidden PowerShell every poll just to learn the same thing again. While
       // settled it asks the OS only every probeEveryMs; the lock marker coming back wakes the loop and is read without a probe.
-      const settled = watching && w.fullDone && !reasons.some((r) => r === 'link' || r === 'unlink') && (() => { const s = loadState(ctx); return s.linked && !s.fullPassOwed; })();
+      const settled = watching && w.fullDone && !asksOp(reasons) && (() => { const s = loadState(ctx); return s.linked ? !s.fullPassOwed : rcOnly(reasons); })();
       const skipProbe = settled && now - w.settledProbeAt < probeEveryMs;
       if (settled && !skipProbe) w.settledProbeAt = now;
       const app = stopWatch.read({ now, ...(skipProbe ? { probeProcesses: false } : {}) });
       nullStreak = app.s2 === null && app.s1 === false ? nullStreak + 1 : 0;
       if (app.fullAllowed) { if (!negatives) firstNegAt = now; negatives++; } else { negatives = 0; }
-      if (app.running) w.fullDone = false;
+      if (app.running) { w.fullDone = false; w.rcDone = false; w.rcTries = 0; }
+      if (app.running && w.rcLaunch && rcCfg()) rcLaunchLook();
+      else if (!app.running && w.rcDone && rcCfg() && clock() - w.rcRefreshAt >= rcRefreshMs) await rcRefresh();
 
       // ---- the app runs and the accounts are linked: keep the folders the app has not loaded current
       if (watching && app.running) {
@@ -390,7 +456,7 @@ export async function runWaiter(ctx, o = {}) {
       // ---- the stop is confirmed: the pass that is owed
       if (negatives >= 2 && now - firstNegAt >= gapMs) {
         const state = loadState(ctx);
-        const asked = reasons.some((r) => r === 'link' || r === 'unlink') || !state.linked;
+        const asked = asksOp(reasons) || (!state.linked && !rcOnly(reasons));
         // a watcher runs a full pass once per stop, and only when one is owed (the old waiter ran one pass and exited)
         const needed = !watching || asked || state.fullPassOwed || (!w.fullDone && owedWork(ctx, { state, app }).owed);
         if (needed) {
@@ -429,13 +495,15 @@ export async function runWaiter(ctx, o = {}) {
           }
           if (watching && res.ok && op.name !== 'unlink') {   // linked, or a full pass done: go on watching for the next start
             w.fullDone = true; negatives = 0; reasons = dropAsked();
-            await sleep(pollMs);
+            await sleep(rcCfg() && !w.rcDone ? Math.min(pollMs, FAST_POLL_MS) : pollMs);   // the Remote Control step is next: not after 30 s
             continue;
           }
           return { exit: res.ok ? 'done' : 'gave-up', report };
         } else if (watching) {
           w.fullDone = true;   // nothing is owed at this stop: settled until the app runs again (the probe backs off)
         }
+        // Remote Control restore: after the account pass (the records are one inode per conversation by now), once per stop
+        if (watching && w.fullDone && !w.rcDone && rcCfg() && w.rcTries < RC_MAX_TRIES) { await rcStep(); if (!w.rcDone) { negatives = 0; await sleep(pollMs); continue; } }
       }
       // the lock marker is gone: the stop is being confirmed, so look again at once (not after 30 s)
       await sleep(app.s1 === false && !settled && nullStreak < FAST_NULL_LIMIT && (!watching || negatives < 2) ? Math.min(pollMs, FAST_POLL_MS) : pollMs);
