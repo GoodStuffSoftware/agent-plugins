@@ -911,7 +911,7 @@ test('S1 heartbeat: a timer keeps the claim fresh while a step awaits, and a run
     },
   });
   start(w, d);
-  assert.equal((await runGoLive(w.ctx, d)).status, 'ok');
+  assert.deepEqual(await runGoLive(w.ctx, d), { exit: 'lost-claim' }, 'S3: a runner that lost its claim ends');
   assert.equal(readJson(claim).pid, process.ppid, 'releaseClaim does not delete a claim that is not ours either');
   assert.ok(seen);
 });
@@ -1074,7 +1074,7 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
  *  It is NOT our child (its parent exits at once, so init reaps it like a real detached runner; a child of ours would stay
  *  a zombie that still answers kill(pid, 0) on Linux and macOS). */
 const fakeRunner = () => {
-  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
+  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)','golive-run'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
   const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true });
   const pid = Number(String(r.stdout).trim());
   return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
@@ -1173,13 +1173,28 @@ test('0.5.1 relaunch, rolled_back: Claude is started right after the rollback, b
   assert.match(res(w).messages.join('\n'), /Claude was started again/);
 });
 
-test('0.5.1 relaunch, failed (the rollback never finishes): Claude is started, and the failure text stays the last message', async () => {
+test('0.5.2 S5 relaunch, failed (the rollback never finishes): Claude is NOT started, and the failure text says so and stays the last message', async () => {
   const { rel, out, w } = await endState((w0) => ({ ...damage(w0), rollback: async () => ({ ok: false, code: 3 }) }));
   assert.equal(out.status, 'failed');
-  assert.equal(rel.length, 1);
+  assert.deepEqual(rel, [], 'the store is left as the failed rollback left it');
   const m = res(w).messages;
-  assert.match(m[m.length - 1], /The rollback did not finish/);
-  assert.ok(m.some((x) => /Claude was started again/.test(x)));
+  assert.match(m[m.length - 1], /The rollback did not finish\. Claude was not started/);
+  assert.ok(!m.some((x) => /Claude was started again/.test(x)));
+});
+
+test('0.5.2 S5 relaunch, failed (the rollback finished but files do not match the backup): Claude is NOT started and the message says the files stay as they are', async () => {
+  const { rel, out, w } = await endState((w0) => ({ ...damage(w0), rollback: async () => ({ ok: false, code: 4, errors: ['a.json', 'b.json'], snapshot: 'C:/snap' }) }));
+  assert.equal(out.status, 'failed');
+  assert.deepEqual(rel, []);
+  const m = res(w).messages;
+  assert.match(m[m.length - 1], /2 file\(s\) do not match the backup[\s\S]*Claude was not started, so the files stay as they are/);
+  assert.equal(res(w).relaunch, null, 'no start was attempted');
+});
+
+test('0.5.2 S5 relaunch: a rollback that works still starts Claude (only a failed one does not)', async () => {
+  const { rel, out } = await endState(damage);
+  assert.equal(out.status, 'rolled_back');
+  assert.deepEqual(rel, ['verify']);
 });
 
 test('0.5.1 relaunch, failed (another pass holds the lock too long): Claude is started; a second failure after another quit starts it again', async () => {
@@ -1425,7 +1440,8 @@ test('progress: the runner starts the UI when the link begins (not while waiting
   assert.equal(ui.calls[0][1].noRelaunch, false);
   assert.equal(ui.calls[1][1].status, 'ok');
   assert.equal(ui.calls[1][1].headline, endText('ok'));
-  assert.deepEqual(res(w).progress, { step: 'finishing', tooltip: 'Syncing accounts: finishing', headline: endText('ok') });
+  assert.deepEqual(res(w).progress, { step: 'finishing', tooltip: 'Syncing accounts: finishing', headline: endText('ok'), run: `${res(w).id}-1` }, 'the run id names the helper that belongs to this result');
+  assert.equal(ui.calls[0][1].run, `${res(w).id}-1`);
 });
 
 test('progress: while the runner only waits for the app to stop nothing is shown, and a rolled back go-live ends with its own text', async () => {

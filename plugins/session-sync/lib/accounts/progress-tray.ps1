@@ -1,11 +1,13 @@
 # progress-tray.ps1 - the Windows progress indicator of the session-sync account go-live.
 #
-# Started hidden by lib/accounts/progress.mjs (powershell.exe -STA -File, CREATE_NO_WINDOW). It shows ONE tray icon
+# Started hidden by lib/accounts/progress.mjs through the launcher (CIM, so it outlives the runner and still shows the closing
+# balloon; powershell.exe -STA -File, no window). It shows ONE tray icon
 # (System.Windows.Forms.NotifyIcon) driven by a message loop with no window, so it never takes focus. Everything it shows
 # comes from go-live-result.json (written by the runner): the tooltip is progress.tooltip, the closing balloon is
 # progress.headline. It never talks to the runner. It removes the icon and exits when
 #   - the result is final: after the closing balloon, -LingerMs later;
 #   - the runner process is gone and the result is not final;
+#   - the result names another run (or none) than -Run: the link went back to waiting, or a newer helper took over;
 #   - -MaxMs have passed (a safety net).
 # Double click on the icon, or a click on a balloon, opens the go-live log.
 #
@@ -19,6 +21,7 @@ param(
   [string]$Title = 'Claude accounts',
   [string]$StartText = '',
   [string]$Icon = '',
+  [string]$Run = '',
   [int]$PollMs = 500,
   [int]$LingerMs = 8000,
   [int]$MaxMs = 10800000,
@@ -88,6 +91,9 @@ function Invoke-Tick {
   if ($elapsed -ge $MaxMs) { Stop-Tray 'max-lifetime'; return }
   $r = Read-Result
   if ($r -and $r.progress) {
+    # -Run names the run this helper was started for. The result carries the current run while the indicator is shown, and none
+    # while the runner is back to waiting for Claude to close (or when another helper took over): then this icon goes away.
+    if ($Run -and ([string]$r.progress.run) -ne $Run) { Stop-Tray 'superseded'; return }
     if ($r.progress.tooltip) { Set-Tip ([string]$r.progress.tooltip) }
     $status = [string]$r.status
     if ($FinalStatuses -contains $status) {

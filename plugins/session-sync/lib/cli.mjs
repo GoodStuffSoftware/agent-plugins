@@ -36,7 +36,7 @@ import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic, roll
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './accounts/folders.mjs';
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
-import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
+import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
@@ -334,6 +334,19 @@ const spawnWaiter = (reason) => {
 };
 const armWaiter = (ctx, reason) => ensureWaiter(ctx, reason, spawnWaiter);
 
+/**
+ * For the interactive commands (go-live, answer yes), never the hook: end a waiter left by an older copy of the plugin, so the
+ * next one (armWaiter, or the runner) comes from this copy. Never throws.
+ */
+function replaceStaleWaiter(ctx) {
+  try {
+    const r = replaceOldWaiter(ctx);
+    if (r.replaced) log(`accounts: waiter (pid ${r.pid}, version ${r.version ?? 'older'}) ${r.stale ? 'was stale and was dropped' : 'ended'} for the version ${PLUGIN_VERSION}`);
+    else if (r.reason === 'unverified' || r.reason === 'busy') log(`accounts: an older waiter (pid ${r.pid}) was left alone (${r.reason})`);
+    return r;
+  } catch (e) { log(`accounts: replacing the old waiter failed: ${e?.message ?? e}`); return { replaced: false, reason: 'error' }; }
+}
+
 /** A "done" toast, honouring `notifications` and `notifyMode: failures`. */
 function accountsToast(title, body) {
   if (CFG.notifications === false || CFG.notifyMode === 'failures') return;
@@ -411,11 +424,13 @@ async function accountsDailyRemoteCheck() {
   } catch (e) { log(`accounts remote check failed: ${e?.message || e}`); }
 }
 
-const askText = (n, ids) => `session-sync: ${RESTART_LEAD_WAITER} `
-  + `(The Claude desktop app on this machine has been signed into ${n} claude.ai accounts (${ids.join(', ')}). `
-  + 'session-sync can show every Code-tab conversation, local scheduled task and app setting in all of them.) '
+// The restart line comes AFTER the question: a restart without a yes does nothing, so it is not the first thing the user reads.
+const askText = (n, ids) => 'session-sync: '
+  + `The Claude desktop app on this machine has been signed into ${n} claude.ai accounts (${ids.join(', ')}). `
+  + 'session-sync can show every Code-tab conversation, local scheduled task and app setting in all of them. '
   + 'If you are talking with the user, ask them once whether to share these across the accounts, and point them to /session-sync:accounts for details. '
   + `Record the answer with: node "${resolve(process.argv[1])}" accounts answer yes   (or: no). `
+  + `Only after a yes, tell them: ${RESTART_LEAD_WAITER} `
   + 'If this session runs unattended (no user to ask), do nothing.';
 
 /** `ask-claim-<pairhash>-<YYYYMMDD>`: created with `wx`, so two sessions starting together ask once. */
@@ -514,6 +529,7 @@ async function goLiveCommand(ctx, args) {
   const weak = (r) => (r.method === 'spawn-fallback' ? [`Warning: the runner could not be started outside Claude (${r.note ?? 'the Windows launch failed'}). It stops if this session is archived or the account is switched; if that happens, run: accounts go-live`] : []);
   const tail = ['The rest runs by itself, with no window. Follow it with: accounts status', `Log: ${goLiveLogFile(ctx)}`, `Result: ${goLiveResultFile(ctx)}`];
 
+  replaceStaleWaiter(ctx);   // a waiter of an older copy cannot be trusted with the stop; this copy's runner (or waiter) takes over
   const prog = goLiveInProgress(ctx);
   if (prog) {
     const where = `phase ${prog.result.phase}, ${prog.result.status}`;
@@ -521,13 +537,13 @@ async function goLiveCommand(ctx, args) {
       // a runner waiting for the app to stop (no lock, no change made) is swapped for one from this copy of the plugin
       const rep = replaceWaitingRunner(ctx);
       if (!rep.replaced) {
-        emit({ ok: true, command: 'go-live', alreadyRunning: true, phase: prog.result.phase, reason: rep.reason }, [`A go-live is already running (${where}).`, ...(prog.result.phase === 'wait-stop' ? [WAIT_NOTE] : []), ...tail]);
+        emit({ ok: true, command: 'go-live', alreadyRunning: true, phase: prog.result.phase, reason: rep.reason }, [`A go-live is already running (${where}).`, ...(prog.result.phase === 'wait-stop' ? [WAIT_NOTE] : []), ...(rep.reason === 'unverified' ? ['The running process could not be checked, so it was left alone. Run this again in a moment.'] : []), ...tail]);
         return 0;
       }
       const r = launchRunner();
       if (!r.ok) return refuse('launch-failed', `The old runner was ended but the new one could not start: ${r.error}. Run: accounts go-live again (the go-live state is kept).`, 1);
-      emit({ ok: true, command: 'go-live', replaced: true, fromVersion: rep.version, toVersion: PLUGIN_VERSION, runner: { pid: r.pid, method: r.method } },
-        [WAIT_NOTE, `Replaced the waiting runner (${rep.version ?? 'older version'}) with one from version ${PLUGIN_VERSION}. It is the same go-live; nothing was changed.`, ...weak(r), ...tail]);
+      emit({ ok: true, command: 'go-live', replaced: true, stale: !!rep.stale, fromVersion: rep.version, toVersion: PLUGIN_VERSION, runner: { pid: r.pid, method: r.method } },
+        [WAIT_NOTE, rep.stale ? 'The earlier runner was not running any more (its record was stale), so a new one was started. It is the same go-live; nothing was changed.' : `Replaced the waiting runner (${rep.version ?? 'older version'}) with one from version ${PLUGIN_VERSION}. It is the same go-live; nothing was changed.`, ...weak(r), ...tail]);
       return 0;
     }
     if (!yes) {
@@ -610,9 +626,19 @@ async function accountsCommand(sub, args) {
     // An explicit `yes` also re-answers pairs set to "no" (after an unlink or a rollback). The SessionStart step
     // keeps asking only about undecided pairs, so a "no" is never re-asked automatically.
     const pend = pendingPairs(state, accountsOf(listFolders(ctx.store)), { includeNo: answer === 'yes' });
-    if (!pend.length) { emit({ ok: true, command: 'answer', answered: 0 }, ['No pending account pairs.']); return 0; }
-    answerPairs(state, pend, answer, 'cli', ctx.now());
-    saveState(ctx, state);
+    // A waiter left by an older copy of the plugin is replaced even when there is nothing left to answer (a re-run of `answer yes`):
+    // this copy then arms its own waiter for the link, or for what is owed.
+    const rep = answer === 'yes' ? replaceStaleWaiter(ctx) : null;
+    if (!pend.length) {
+      if (!(rep?.replaced && !state.linked && groupOf(state, listFolders(ctx.store)).length >= 2)) {
+        if (rep?.replaced && state.fullPassOwed) armWaiter(ctx, 'owed');
+        emit({ ok: true, command: 'answer', answered: 0, ...(rep?.replaced ? { waiterReplaced: true } : {}) }, ['No pending account pairs.', ...(rep?.replaced ? ['A waiter left by an older version of session-sync was replaced.'] : [])]);
+        return 0;
+      }
+    } else {
+      answerPairs(state, pend, answer, 'cli', ctx.now());
+      saveState(ctx, state);
+    }
     if (answer === 'no') { emit({ ok: true, command: 'answer', answered: pend.length, answer }, [`Recorded: not sharing (${pend.length} pair(s)). Change your mind with: accounts answer yes, or config accountLink.`]); return 0; }
     const app = appState({ ctx, probeProcesses: true });
     if (app.fullAllowed) {

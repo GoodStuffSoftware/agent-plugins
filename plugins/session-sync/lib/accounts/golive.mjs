@@ -20,7 +20,7 @@
  * `ui` ({start(info), end(result)}, progress.mjs) is the progress indicator; the default shows nothing.
  */
 
-import { appendFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, unlinkSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { pidAlive } from '../lock.mjs';
@@ -34,6 +34,11 @@ import { groupHealth, WAIT_NOTE } from './report.mjs';
 import { sessionSyncCopies, relaunchApp } from './desktop.mjs';
 import { requestAppQuit } from './appquit.mjs';
 import { nullUi, progressInfo, UI_PHASES } from './progress.mjs';
+import { PLUGIN_VERSION } from './version.mjs';
+import { verifyProcess, RUNNER_MARKER } from './procid.mjs';
+
+/** Thrown inside the runner when another process holds the claim: this runner ends without writing a result or touching Claude. */
+class LostClaim extends Error {}
 
 export const PHASES = ['wait-stop', 'relist', 'link', 'verify', 'relaunch', 'wait-start', 'wait-capability', 'rectify', 'remote', 'finish'];
 export const FINAL_STATUSES = ['ok', 'rolled_back', 'attention', 'failed'];
@@ -52,7 +57,7 @@ export const STOP_POLL_MS = 500;
 export const STOP_GAP_MS = 500;
 const MIN = 60 * 1000;
 /** The plugin version of this copy (written into the claim so a newer copy can replace an older waiting runner). */
-export const PLUGIN_VERSION = (() => { try { return String(JSON.parse(readFileSync(new URL('../../.claude-plugin/plugin.json', import.meta.url), 'utf8')).version ?? '') || null; } catch { return null; } })();
+export { PLUGIN_VERSION };
 // stopMs limits every wait for the app to stop (wait-stop, verify-stop, rollback-stop). It is Infinity: the user quits Claude
 // whenever they like, and giving up would make them run go-live again. A limit on the verify or rollback wait would leave a
 // linked but unchecked store, or a failed link not undone, for the user to sort out. A finite value is the test seam.
@@ -157,7 +162,7 @@ function writeResult(ctx, gl, status, extra = {}) {
     push: { pausedByGoLive: !!gl.pausedPush, reEnabled: !!gl.pushReEnabled, enabledBefore: gl.before?.pushEnabled ?? null },
     relaunch: gl.relaunch ?? null,
     messages: gl.messages ?? [], attention: gl.attention ?? [], log: goLiveLogFile(ctx),
-    progress: progressInfo(gl.phase, status, FINAL_STATUSES),   // what the tray helper shows (progress.mjs); it reads this file, not the runner
+    progress: progressInfo(gl.phase, status, FINAL_STATUSES, gl.uiRun),   // what the tray helper shows (progress.mjs); it reads this file, not the runner
     ...extra,
   });
 }
@@ -195,6 +200,23 @@ const beatClaim = (ctx) => {
     writeFileSync(claimFile(ctx), JSON.stringify({ pid: process.pid, at: c.at ?? ctx.now(), beatAt: ctx.now(), version: c.version ?? PLUGIN_VERSION }));
   } catch { /* best effort */ }
 };
+/**
+ * Does this process still hold the claim? A runner lives for days and crosses sleep and hibernate: after a wake with an old
+ * heartbeat a session start can see no live runner and start a second one, which takes the claim. The first runner then ends
+ * (never a second runner). A missing claim file is taken back (nobody else holds it); a claim of another pid is lost.
+ */
+function ownsClaim(ctx) {
+  const c = readJson(claimFile(ctx), null);
+  if (c) return c.pid === process.pid;
+  try {
+    const fd = openSync(claimFile(ctx), 'wx');
+    try { writeSync(fd, JSON.stringify({ pid: process.pid, at: ctx.now(), beatAt: ctx.now(), version: PLUGIN_VERSION })); } finally { closeSync(fd); }
+    return true;
+  } catch {
+    const again = readJson(claimFile(ctx), null);   // unreadable (a beat is being written): no proof of loss
+    return again ? again.pid === process.pid : true;
+  }
+}
 const releaseClaim = (ctx) => { const c = readJson(claimFile(ctx), null); if (!c || c.pid === process.pid) { try { unlinkSync(claimFile(ctx)); } catch { /* none */ } } };
 
 /* ------------------------------------------------------------------ preflight, consent and the first state */
@@ -293,8 +315,16 @@ const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuf
  * `accounts go-live` run again while a runner waits for the app to stop (phase wait-stop): that runner is ended so the caller
  * can start one from this copy of the plugin. Safe because the wait holds no lock and changes nothing; the go-live id and
  * state stay. Replaces only a runner of another version (a claim with no version is an older one), and only while the app is
- * still running (a stopped app means the link is starting: it is not interrupted). Any other phase is not touched.
- * deps: { kill(pid), alive(pid), appRunning(), sleep(ms) } (tests). @returns {{replaced:boolean, reason?:string, pid?:number, version?:string|null}}
+ * still running (a stopped app means the link is starting: it is not interrupted).
+ *
+ * Nothing is ended unless it is proven to be the runner AND still waiting:
+ *   - identity (procid.verifyProcess): the pid's command line holds `golive-run` and it started no later than the claim. A pid
+ *     that fails this is not the runner (it died and the pid was reused): the claim is stale, it is dropped, nothing is ended.
+ *     When the OS cannot be asked the claim is left alone (`unverified`).
+ *   - phase: read again from the persisted go-live.json right before the kill (the app probe takes a second or more, long enough
+ *     for a 0.5.2 runner to see the stop and move on); any phase but wait-stop, or accounts.lock held by the runner, refuses.
+ * deps: { kill(pid), alive(pid), appRunning(), sleep(ms), verify(pid, want) } (tests).
+ * @returns {{replaced:boolean, reason?:string, stale?:boolean, pid?:number, version?:string|null, phase?:string}}
  */
 export function replaceWaitingRunner(ctx, deps = {}) {
   const p = goLiveInProgress(ctx);
@@ -305,16 +335,36 @@ export function replaceWaitingRunner(ctx, deps = {}) {
   if (PLUGIN_VERSION && claim.version === PLUGIN_VERSION) return { replaced: false, reason: 'current', version: claim.version };
   const appRunning = deps.appRunning ?? (() => !!appState({ ctx, probeProcesses: true, now: ctx.now() }).running);
   if (!appRunning()) return { replaced: false, reason: 'app-stopped' };
+  const v = (deps.verify ?? ((pid, want) => verifyProcess(pid, want)))(claim.pid, { marker: RUNNER_MARKER, claimedAt: claim.at });
+  if (v.reason === 'unverified') return { replaced: false, reason: 'unverified', pid: claim.pid };
+  const sameClaim = () => { const c = readJson(claimFile(ctx), null); return c?.pid === claim.pid && c?.at === claim.at; };
+  const dropClaim = () => {
+    try { unlinkSync(claimFile(ctx)); } catch { /* none */ }
+    const gl = readGoLive(ctx);
+    if (gl?.id === p.gl.id) { gl.deadlines = {}; saveGoLive(ctx, gl); }   // a 0.5.0 runner kept a 30 minute limit; the state is kept
+  };
+  if (!v.ok) {
+    // pid reuse: the claimant is gone and something else owns the pid. Treat the claim as stale; end nothing.
+    if (sameClaim()) dropClaim();
+    glog(ctx, `claim of pid ${claim.pid} is stale (${v.reason}: that pid is not the runner); dropped, nothing was ended`);
+    return { replaced: true, stale: true, pid: claim.pid, version: claim.version ?? null };
+  }
+  // the persisted phase, read again right before the kill
+  const cur = readGoLive(ctx); const res = readGoLiveResult(ctx);
+  const lock = readJson(accPath(ctx, 'accounts.lock'), null);
+  const lockHeld = !!lock && lock.pid === claim.pid && pidAlive(lock.pid);
+  if (cur?.id !== p.gl.id || cur.phase !== 'wait-stop' || res?.status !== 'waiting' || lockHeld || !sameClaim()) {
+    glog(ctx, `replace refused: the runner moved on (phase ${cur?.phase ?? '?'}${lockHeld ? ', holds accounts.lock' : ''})`);
+    return { replaced: false, reason: 'busy', phase: cur?.phase };
+  }
   const alive = deps.alive ?? pidAlive;
   try { (deps.kill ?? ((pid) => process.kill(pid)))(claim.pid); } catch { /* it may already be gone */ }
   const nap = deps.sleep ?? sleepSync;
   for (let i = 0; i < 50 && alive(claim.pid); i++) nap(100);
   if (alive(claim.pid)) return { replaced: false, reason: 'kill-failed', pid: claim.pid };
-  // the old runner is gone: drop its claim and the time limit it stored (a 0.5.0 runner kept a 30 minute one); the state is kept
-  try { unlinkSync(claimFile(ctx)); } catch { /* none */ }
-  const gl = readGoLive(ctx);
-  if (gl?.id === p.gl.id) { gl.deadlines = {}; saveGoLive(ctx, gl); }
-  glog(ctx, `waiting runner (pid ${claim.pid}, version ${claim.version ?? 'older'}) replaced by version ${PLUGIN_VERSION}`);
+  dropClaim();
+  const after = readGoLive(ctx);
+  glog(ctx, `waiting runner (pid ${claim.pid}, version ${claim.version ?? 'older'}) replaced by version ${PLUGIN_VERSION}${after?.phase && after.phase !== 'wait-stop' ? `; WARN: it had already moved to phase ${after.phase}, which a new runner resumes` : ''}`);
   return { replaced: true, pid: claim.pid, version: claim.version ?? null };
 }
 
@@ -408,7 +458,8 @@ export async function runGoLive(ctx, deps = {}) {
   const log = (line) => glog(ctx, line);
   const note = (msg) => { gl.messages.push(msg); log(msg); };
   const save = () => saveGoLive(ctx, gl);
-  const beat = () => beatClaim(ctx);
+  // every loop and phase beats through here: a runner that lost its claim to another one ends at once (S3)
+  const beat = () => { if (!ownsClaim(ctx)) throw new LostClaim(); beatClaim(ctx); };
   // one watcher for every stop wait: it reads the app, and logs the marker going and coming, an unknown process probe and a restart
   const watch = createStopWatch(ctx, { log, clock, probeEveryMs, status: deps.appStatus });
   const stopped = () => !!watch.read().fullAllowed;
@@ -424,7 +475,7 @@ export async function runGoLive(ctx, deps = {}) {
    * state reached after the app was stopped. Not with --no-relaunch, not when this go-live already started it since the last
    * stop, not when the app is running (it never stopped, or the user started it).
    */
-  async function startAppAgain(why) {
+  async function startAppAgain(why) {   // not after a rollback that failed (see finalize's noStart)
     if (gl.opts.noRelaunch || gl.relaunch) return;
     if (running()) return;
     const rl = await doRelaunch(ctx);
@@ -433,15 +484,19 @@ export async function runGoLive(ctx, deps = {}) {
     else note(`Could not start Claude (${rl?.error ?? 'unknown'}). Open it yourself.`);
     save();
   }
-  const finalize = async (status, msg) => {
-    try { await startAppAgain(`end: ${status}`); } catch (e) { log(`relaunch failed: ${e?.message ?? e}`); }   // before the failure text, which stays the last message
+  /**
+   * noStart: do not start Claude (a rollback that failed: the app's first saves could rewrite the very files that do not match
+   * the backup, and the rollback marker may still be present, so the user has to quit again anyway).
+   */
+  const finalize = async (status, msg, { noStart = false } = {}) => {
+    if (!noStart) { try { await startAppAgain(`end: ${status}`); } catch (e) { log(`relaunch failed: ${e?.message ?? e}`); } }   // before the failure text, which stays the last message
     if (msg) note(msg);
     if (status === 'ok' && gl.flags.attention) status = 'attention';
     gl.phase = status === 'failed' ? gl.phase : 'done';
     save();
     writeResult(ctx, gl, status);
     log(`result: ${status}`);
-    uiEnd(status);
+    await uiEnd(status);
     return END;
   };
   const attention = (msg) => { gl.flags.attention = true; (gl.attention ||= []).push(msg); note(msg); };
@@ -449,27 +504,52 @@ export async function runGoLive(ctx, deps = {}) {
   // the progress indicator: shown from the first phase of the link until the final result (never for the wait for the stop)
   const ui = deps.ui ?? nullUi;
   let uiShown = false;
+  // Each shown run has its own id in the result (`progress.run`); the helper started for it leaves when the result names another
+  // run, or none (the link went back to waiting for the app, S6).
   const uiStart = () => {
     if (uiShown) return;
     uiShown = true;
-    try { ui.start({ resultFile: goLiveResultFile(ctx), logFile: goLiveLogFile(ctx), runnerPid: process.pid, noRelaunch: !!gl.opts?.noRelaunch, id: gl.id }); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
+    gl.uiCount = (gl.uiCount ?? 0) + 1;
+    gl.uiRun = `${gl.id}-${gl.uiCount}`;
+    try { save(); writeResult(ctx, gl, 'waiting'); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }   // the helper reads its run from this file
+    try { ui.start({ resultFile: goLiveResultFile(ctx), logFile: goLiveLogFile(ctx), runnerPid: process.pid, noRelaunch: !!gl.opts?.noRelaunch, id: gl.id, run: gl.uiRun }); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
   };
-  const uiEnd = (status) => {
+  /** The link went back to waiting for the app to close: take the indicator away; the next link shows it again. */
+  const uiHide = () => {
     if (!uiShown) return;
-    try { ui.end({ status, ...progressInfo(gl.phase, status, FINAL_STATUSES) }); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
+    uiShown = false; gl.uiRun = null;
+    try { ui.hide?.(); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
+  };
+  /** Resolves once the indicator is done (Windows helper started as a plain child: after it has shown the closing balloon). */
+  const uiEnd = async (status) => {
+    if (!uiShown) return;
+    try { await ui.end({ status, ...progressInfo(gl.phase, status, FINAL_STATUSES) }); } catch (e) { log(`progress indicator: ${e?.message ?? e}`); }
   };
 
+  const FAST_NULL_LIMIT = 20;   // the waiter's back-off: an unknown process probe does not start PowerShell twice a second for days
   /** Wait until the app is stopped on two readings a gap apart. 'ok' | 'timeout'. */
   async function waitStopped(name, ms) {
     const dl = deadline(name, ms);
-    let neg = 0; let firstNeg = 0; let lastBeat = 0;
+    let neg = 0; let firstNeg = 0; let lastBeat = 0; let nullStreak = 0; let slowMsg = null;
     for (;;) {
+      if (!ownsClaim(ctx)) throw new LostClaim();                                    // every loop (S3)
       if (Date.now() - lastBeat >= 10 * 1000) { beat(); lastBeat = Date.now(); }   // looking twice a second: the timer and this keep the claim fresh
       const now = clock();
       if (now >= dl) { delete gl.deadlines[name]; save(); return 'timeout'; }
-      if (stopped()) { if (!neg) firstNeg = now; neg++; } else neg = 0;
-      if (neg >= 2 && now - firstNeg >= gapMs) { delete gl.deadlines[name]; gl.relaunch = null; save(); return 'ok'; }   // the app is down: a new relaunch is owed
-      await sleep(stopPollMs);
+      const app = watch.read();
+      nullStreak = app.s1 === false && app.s2 === null ? nullStreak + 1 : 0;
+      if (app.fullAllowed) { if (!neg) firstNeg = now; neg++; } else neg = 0;
+      if (neg >= 2 && now - firstNeg >= gapMs) {   // the app is down: a new relaunch is owed
+        delete gl.deadlines[name]; gl.relaunch = null;
+        if (slowMsg) gl.messages = gl.messages.filter((m) => m !== slowMsg);
+        save(); return 'ok';
+      }
+      // S4: the process probe has not answered FAST_NULL_LIMIT times in a row: look at the poll rate, not twice a second, and say so
+      if (nullStreak >= FAST_NULL_LIMIT && !slowMsg) {
+        slowMsg = `Claude seems closed, but the check for its processes does not answer (${app.s2Detail ?? 'no detail'}). Checking every ${Math.round(pollMs / 1000)} seconds until it does.`;
+        note(slowMsg); save(); writeResult(ctx, gl, 'waiting');   // `accounts status` and the result show why the link has not started
+      }
+      await sleep(nullStreak >= FAST_NULL_LIMIT ? pollMs : stopPollMs);
     }
   }
 
@@ -506,12 +586,13 @@ export async function runGoLive(ctx, deps = {}) {
       }
       if (r.errors?.length) {
         // the script finished and reset its state, so another run cannot help: say what does not match
-        return finalize('failed', `The rollback finished, but ${r.errors.length} file(s) do not match the backup (first: ${r.errors.slice(0, 3).join(', ')}). The state before the rollback is saved${r.snapshot ? ` in ${r.snapshot}` : ''}. Nothing more was done; look at those files before anything else.`);
+        // Claude is NOT started: its first saves could rewrite exactly these files
+        return finalize('failed', `The rollback finished, but ${r.errors.length} file(s) do not match the backup (first: ${r.errors.slice(0, 3).join(', ')}). The state before the rollback is saved${r.snapshot ? ` in ${r.snapshot}` : ''}. Nothing more was done; look at those files before anything else. Claude was not started, so the files stay as they are.`, { noStart: true });
       }
       // a run that stopped part way keeps its state and a second run finishes it; once the state is reset it cannot
       if (!loadState(ctx).backupId) break;
     }
-    return finalize('failed', `The rollback did not finish. Quit Claude from the tray icon, then run: accounts rollback  (standalone copy: ${accPath(ctx, 'backup', gl.backupId, 'rollback.mjs')})`);
+    return finalize('failed', `The rollback did not finish. Claude was not started, so the store stays as the rollback left it. Run: accounts rollback  (standalone copy: ${accPath(ctx, 'backup', gl.backupId, 'rollback.mjs')})`, { noStart: true });
   }
 
   const steps = {
@@ -663,7 +744,7 @@ export async function runGoLive(ctx, deps = {}) {
         beat();
         if (r && !r.ok && !r.skipped) attention(`The rectify pass did not finish (${r.reason ?? 'unknown'}). Run: accounts rectify`);
         else log(`rectify: ${r ? (r.skipped ? `skipped (${r.skipped})` : 'ok') : 'not wired'}`);
-      } catch (e) { attention(`The rectify pass failed: ${e?.message ?? e}. Run: accounts rectify`); }
+      } catch (e) { if (e instanceof LostClaim) throw e; attention(`The rectify pass failed: ${e?.message ?? e}. Run: accounts rectify`); }
       return 'remote';
     },
 
@@ -691,13 +772,15 @@ export async function runGoLive(ctx, deps = {}) {
   };
 
   // a timer keeps the claim fresh while a long step awaits; it cannot fire during a synchronous step, hence the window above
-  const hbTimer = setInterval(beat, deps.heartbeatMs ?? HEARTBEAT_MS);
+  const hbTimer = setInterval(() => beatClaim(ctx), deps.heartbeatMs ?? HEARTBEAT_MS);
   hbTimer.unref?.();
   try {
     if (prev?.id === gl.id && prev.status === 'failed') { gl.deadlines = {}; gl.relaunch = null; log('resuming after a stopped run'); }
     log(`runner started (pid ${process.pid}), phase ${gl.phase}`);
+    gl.uiRun = null;   // this process has shown nothing yet: a helper left by an earlier runner leaves when it reads this
     writeResult(ctx, gl, 'waiting');
     for (;;) {
+      if (!ownsClaim(ctx)) throw new LostClaim();
       if (gl.phase === 'done') break;
       const fn = steps[gl.phase];
       if (!fn) { await finalize('failed', `Unknown phase "${gl.phase}" in the go-live state.`); break; }
@@ -707,15 +790,17 @@ export async function runGoLive(ctx, deps = {}) {
       const done = gl.phase;
       const next = await fn();
       if (next === END) break;
+      if (next === 'wait-stop') uiHide();   // S6: Claude was reopened mid-link: no icon while we only wait for the next quit
       gl.phase = next; save(); writeResult(ctx, gl, 'waiting');
       if (deps.haltAfter === done) return { exit: 'halted' };
     }
     return { exit: 'done', status: readGoLiveResult(ctx)?.status };
   } catch (e) {
+    if (e instanceof LostClaim) { log(`another runner holds the claim now; this runner (pid ${process.pid}) ends without changing anything`); return { exit: 'lost-claim' }; }
     try { await startAppAgain('runner error'); } catch { /* best effort */ }
     note(`The runner stopped on an error: ${e?.message ?? e}. Run: accounts go-live (it resumes).`);
     save(); writeResult(ctx, gl, 'failed');
-    uiEnd('failed');
+    await uiEnd('failed');
     return { exit: 'failed', status: 'failed' };
   } finally {
     clearInterval(hbTimer);

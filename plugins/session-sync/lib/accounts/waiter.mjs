@@ -24,6 +24,8 @@ import { pidAlive } from '../lock.mjs';
 import { accPath, readJson, writeJsonAtomic, loadState } from './state.mjs';
 import { createStopWatch } from './appstate.mjs';
 import { fullPass, link, unlink, owedWork } from './pass.mjs';
+import { PLUGIN_VERSION } from './version.mjs';
+import { verifyProcess, WAITER_MARKER } from './procid.mjs';
 
 export const HEARTBEAT_STALE_MS = 5 * 60 * 1000;
 export const MAX_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
@@ -71,6 +73,54 @@ export function ensureWaiter(ctx, reason, spawnWaiter) {
 
 const CLAIM_STARTING_MS = 60 * 1000;
 
+const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait */ } };
+
+/**
+ * A waiter left by an older copy of the plugin (a 0.5.0 waiter cannot see the app stop on Windows, and ensureWaiter only adds
+ * reasons to it) is ended so the caller can start one from this copy. For the interactive commands (`accounts go-live`,
+ * `accounts answer yes`) only: the check asks the OS about the process, which the SessionStart hook must not wait for.
+ *
+ * Nothing is ended unless it is proven to be a waiter and is not working:
+ *   - another version: the claim's version differs (no version is an older one); this copy must know its own version;
+ *   - identity (procid.verifyProcess): its command line holds `accounts wait` and it started no later than the claim. A pid that
+ *     fails this is not the waiter (pid reuse): the files are stale, they are dropped, nothing is ended. When the OS cannot be
+ *     asked nothing is touched (`unverified`);
+ *   - not mid-pass: accounts.lock is not held by it (checked again right before the kill). A waiter that waits holds no lock.
+ * The new waiter is started by the caller (armWaiter), or by the next session start for an owed pass.
+ * deps: { kill(pid), alive(pid), sleep(ms), verify(pid, want) } (tests).
+ * @returns {{replaced:boolean, reason?:string, stale?:boolean, pid?:number, version?:string|null, reasons?:string[]}}
+ */
+export function replaceOldWaiter(ctx, deps = {}) {
+  const st = waiterStatus(ctx);
+  if (!st.alive || !st.pid) return { replaced: false, reason: 'no-waiter' };
+  if (st.pid === process.pid) return { replaced: false, reason: 'no-waiter' };
+  const claim = readJson(claimFile(ctx), null);
+  const mine = claim?.pid === st.pid ? claim : null;
+  const version = mine?.version ?? null;
+  if (!PLUGIN_VERSION) return { replaced: false, reason: 'unknown-version' };
+  if (version === PLUGIN_VERSION) return { replaced: false, reason: 'current', version };
+  const lockHeld = () => { const h = readJson(accPath(ctx, 'accounts.lock'), null); return !!h && h.pid === st.pid && pidAlive(h.pid); };
+  if (lockHeld()) return { replaced: false, reason: 'busy', pid: st.pid };
+  const claimedAt = mine?.at ?? (Date.parse(st.armedAt ?? '') || NaN);
+  const v = (deps.verify ?? ((pid, want) => verifyProcess(pid, want)))(st.pid, { marker: WAITER_MARKER, claimedAt });
+  if (v.reason === 'unverified') return { replaced: false, reason: 'unverified', pid: st.pid };
+  const drop = () => {
+    const c = readJson(claimFile(ctx), null);
+    if (!c || c.pid === st.pid) { try { unlinkSync(claimFile(ctx)); } catch { /* none */ } }
+    const w = readJson(waiterFile(ctx), null);
+    if (!w || w.pid === st.pid) { try { unlinkSync(waiterFile(ctx)); } catch { /* none */ } try { unlinkSync(`${waiterFile(ctx)}.bak`); } catch { /* none */ } }
+  };
+  if (!v.ok) { drop(); return { replaced: true, stale: true, pid: st.pid, version, reasons: st.reasons }; }   // pid reuse: end nothing
+  if (lockHeld()) return { replaced: false, reason: 'busy', pid: st.pid };
+  const alive = deps.alive ?? pidAlive;
+  try { (deps.kill ?? ((pid) => process.kill(pid)))(st.pid); } catch { /* it may already be gone */ }
+  const nap = deps.sleep ?? sleepSync;
+  for (let i = 0; i < 50 && alive(st.pid); i++) nap(100);
+  if (alive(st.pid)) return { replaced: false, reason: 'kill-failed', pid: st.pid };
+  drop();
+  return { replaced: true, pid: st.pid, version, reasons: st.reasons };
+}
+
 /**
  * Is this claim held by a waiter that is really running? A live pid is not enough: after a reboot or a kill the pid
  * can belong to an unrelated process (S4). Past the 60 s start-up window the claim must be backed by waiter.json for
@@ -92,7 +142,7 @@ export function claimWaiter(ctx) {
   for (let i = 0; i < 2; i++) {
     try {
       const fd = openSync(file, 'wx');
-      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: ctx.now() })); } finally { closeSync(fd); }
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: ctx.now(), version: PLUGIN_VERSION })); } finally { closeSync(fd); }
       return true;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;

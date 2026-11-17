@@ -127,7 +127,7 @@ test('SessionStart hook: a final go-live result is added to the context once, in
   assert.match(text, /go-live finished/);
   assert.match(text, /4 conversation\(s\) in 2 folder\(s\)/);
   assert.match(text, /accounts answer yes/, 'the pending-pair ask rides along in the same object');
-  assert.match(text, /Restart Claude to sync your accounts/, 'the ask leads with the one line');
+  assert.match(text, /Restart Claude to sync your accounts/, 'the ask still carries the one line (after the question)');
   const b = w.run(['auto-pull', '--from-hook']);
   assert.equal(b.stdout, '', 'reported once; the ask is also once a day');
 });
@@ -152,7 +152,7 @@ test('hidden launch-detached (the helper the SessionStart hook starts) launches 
  *  like a real detached runner; a child of ours would stay a zombie that still answers kill(pid, 0) on Linux and macOS).
  *  Only it is ever ended by these tests. */
 const fakeRunner = () => {
-  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
+  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)','golive-run'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
   const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true });
   const pid = Number(String(r.stdout).trim());
   return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
@@ -251,7 +251,8 @@ test('scope: the restart prompt appears once per new unlinked account, never aft
   const ask = (r) => { assert.equal(r.status, 0, r.stderr); return r.stdout.trim() ? JSON.parse(r.stdout.trim()).hookSpecificOutput.additionalContext : ''; };
   // the first sign-in of a second account: asked once
   const first = ask(run(w, ['auto-pull', '--from-hook']));
-  assert.match(first, /^session-sync: Restart Claude to sync your accounts: quit Claude from the tray icon or app menu/);
+  assert.doesNotMatch(first, /^session-sync: Restart Claude/, 'the restart line does not open the question');
+  assert.match(first, /accounts answer yes[\s\S]*Only after a yes, tell them: Restart Claude to sync your accounts: quit Claude from the tray icon or app menu/);
   assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'not asked again');
   // yes, and the link is done
   w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; });
