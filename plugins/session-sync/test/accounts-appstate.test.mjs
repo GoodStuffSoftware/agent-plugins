@@ -9,9 +9,10 @@ import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import {
-  appState, evaluateRunning, readSignedIn, desktopProcesses, lockfilePresent, liveFolders, noteSignedIn,
-  makeS1Guard, AppRunningError,
+  appState, evaluateRunning, readSignedIn, desktopProcesses, probeDesktop, parseWinProbe, PROBE_MARK, WIN_PROBE_SCRIPT, createStopWatch,
+  lockfilePresent, liveFolders, noteSignedIn, makeS1Guard, AppRunningError,
 } from '../lib/accounts/appstate.mjs';
 import { emptyState } from '../lib/accounts/state.mjs';
 import { addFolder, putRecord, makeRoot, makeClock, setMtime, uuid } from './fixtures/store.mjs';
@@ -96,20 +97,100 @@ test('T2 lockfilePresent on the real marker: Windows lockfile, never opened', ()
   assert.equal(appState({ ctx, probeProcesses: false }).s2, null, 'no process probe on the hook path');
 });
 
-test('T2 desktopProcesses: bundled CLI is ignored, the app path counts, an error is unknown', () => {
+test('T2 desktopProcesses: bundled CLI is ignored, the app path counts, only a missing end marker is unknown', () => {
   const calls = [];
   const mk = (stdout, over = {}) => (cmd, args, opts) => { calls.push({ cmd, args, opts }); return { status: 0, stdout, ...over }; };
   const win = (stdout, over) => desktopProcesses({ platform: 'win32', spawnFn: mk(stdout, over) });
-  assert.equal(win('C:\\Program Files\\WindowsApps\\Claude_1.2.3_x64__abc\\app\\Claude.exe\r\n'), true);
-  assert.equal(win('C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\claude.exe\n'), true);
-  assert.equal(win('C:\\Users\\u\\AppData\\Roaming\\Claude\\claude-code\\2.1.321\\win32-x64\\claude.exe\n'), false);
-  assert.equal(win(''), false);
+  const M = `${PROBE_MARK}\r\n`;
+  assert.equal(win(`P|10|C:\\Program Files\\WindowsApps\\Claude_1.2.3_x64__abc\\app\\Claude.exe\r\n${M}`), true);
+  assert.equal(win(`P|10|C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\app-1.0.0\\claude.exe\n${M}`), true);
+  assert.equal(win(`P|11|C:\\Users\\u\\AppData\\Roaming\\Claude\\claude-code\\2.1.321\\win32-x64\\claude.exe\n${M}`), false);
+  // 0.5.1 bug: no claude process at all is the normal answer after the app quits, and it must read as "not running"
+  assert.equal(win(M), false);
+  assert.equal(win(`${PROBE_MARK}\n`, { status: 1 }), false, 'the marker decides, not the exit status');
+  // unknown: no marker (the script never finished), a timeout or spawn error, or a claude process whose path is unreadable
+  assert.equal(win(''), null);
   assert.equal(win('', { status: 1 }), null);
+  assert.equal(win('P|10|C:\\x\\claude.exe\n'), null, 'a list that never reached the marker is incomplete');
   assert.equal(win('', { error: new Error('timeout') }), null);
+  assert.equal(win(`P|12|\r\n${M}`), null, 'an unreadable path is unknown, never absent');
+  assert.equal(win(`P|11|C:\\Users\\u\\AppData\\Roaming\\Claude\\claude-code\\2.1.321\\win32-x64\\claude.exe\nP|12|\n${M}`), null);
+  assert.match(probeDesktop({ platform: 'win32', spawnFn: mk('', { status: 1, stderr: 'boom' }) }).detail, /marker is missing.*status 1.*boom/);
   assert.ok(calls.every((c) => c.cmd === 'powershell.exe' && c.opts.windowsHide === true && !c.opts.detached));
   const mac = (out) => desktopProcesses({ platform: 'darwin', spawnFn: () => ({ status: 0, stdout: out }) });
   assert.equal(mac('/Applications/Claude.app/Contents/MacOS/Claude\n/bin/zsh\n'), true);
   assert.equal(mac('/bin/zsh\n'), false);
+});
+
+const winOnly = { skip: process.platform !== 'win32' ? 'Windows PowerShell only' : false };
+
+test('T2 real PowerShell probe: a process name that does not exist reads as "not running" (the 0.5.1 bug)', winOnly, () => {
+  const ghost = `ss-absent-${Math.random().toString(36).slice(2, 10)}`;
+  assert.ok(WIN_PROBE_SCRIPT.includes('-Name claude'), 'the probe names the claude process');
+  const seen = [];
+  const spawnFn = (cmd, args, opts) => {
+    const r = spawnSync(cmd, args.map((a) => a.replace('-Name claude', `-Name ${ghost}`)), opts);
+    seen.push({ status: r.status, stdout: r.stdout, stderr: r.stderr });
+    return r;
+  };
+  const got = probeDesktop({ platform: 'win32', spawnFn });
+  assert.equal(got.value, false, `expected false, got ${JSON.stringify(got)} ${JSON.stringify(seen)}`);
+  assert.equal(seen[0].status, 0, 'the probe exits 0 even though Get-Process found nothing');
+  assert.equal(seen[0].stdout.trim(), PROBE_MARK);
+  // the shell's own behaviour that caused the bug, pinned: a bare Get-Process for an absent name exits 1
+  const bare = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Get-Process -Name ${ghost} -ErrorAction SilentlyContinue | ForEach-Object { $_.Path }`], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+  assert.equal(bare.status, 1, 'Get-Process exits 1 when no process has the name');
+});
+
+test('T2 real PowerShell probe: the unmodified command reports a present claude process and ends with the marker', winOnly, () => {
+  // probe this very node process instead of "claude" so a process whose path is readable is certainly there
+  // (other node.exe processes on the box can be elevated, with an unreadable path, which correctly reads as unknown)
+  const spawnFn = (cmd, args, opts) => spawnSync(cmd, args.map((a) => a.replace('-Name claude', `-Id ${process.pid}`)), opts);
+  const r = spawnFn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WIN_PROBE_SCRIPT], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
+  assert.equal(r.status, 0);
+  const lines = r.stdout.trim().split(/\r?\n/);
+  assert.equal(lines.at(-1), PROBE_MARK);
+  assert.ok(lines.some((l) => /^P\|\d+\|.*node(\.exe)?$/i.test(l)), `a P| line for a running process: ${r.stdout}`);
+  const p = parseWinProbe(r.stdout);
+  assert.equal(p.value, false, 'a node.exe is not the desktop app');
+});
+
+test('T2 stop watch: logs the marker going and coming, an unknown probe with its reason, a WARN after 10 s, and a restart', () => {
+  const r = makeRoot('watch');
+  const lines = [];
+  let t = 0;
+  let status = { s1: true, s2: null, startedAtMs: 1000, fullAllowed: false };
+  const w = createStopWatch(r.ctx, { log: (l) => lines.push(l), clock: () => t, status: () => status });
+  w.read();                                              // up
+  status = { s1: false, s2: null, s2Detail: 'the probe end marker is missing (status 1, stderr "")', startedAtMs: 0, fullAllowed: false };
+  t += 500; w.read({ probeProcesses: true });
+  assert.ok(lines.some((l) => /S1 true -> false/.test(l)));
+  assert.equal(lines.filter((l) => /S2 \(process probe\) is unknown/.test(l)).length, 1);
+  assert.match(lines.find((l) => /S2 \(process probe\) is unknown/.test(l)), /marker is missing/);
+  for (let i = 0; i < 5; i++) { t += 500; w.read({ probeProcesses: true }); }
+  assert.equal(lines.filter((l) => /S2 \(process probe\) is unknown/.test(l)).length, 1, 'one line, not one per poll');
+  assert.equal(lines.filter((l) => /WARN/.test(l)).length, 0, 'not yet 10 s');
+  t += 8000; w.read({ probeProcesses: true });
+  const warn = lines.filter((l) => /WARN/.test(l));
+  assert.equal(warn.length, 1);
+  assert.match(warn[0], /status 1/);
+  t += 500; w.read({ probeProcesses: true });
+  assert.equal(lines.filter((l) => /WARN/.test(l)).length, 1, 'the WARN is once');
+  // a new lock marker: the app restarted while the watch was waiting
+  status = { s1: true, s2: true, startedAtMs: 2000, fullAllowed: false };
+  t += 500; w.read();
+  assert.ok(lines.some((l) => /S1 false -> true/.test(l)));
+  assert.ok(lines.some((l) => /app restarted/.test(l) && /the stop lasted/.test(l)), lines.join('\n'));
+  // a restart between two readings (the marker never seen gone): the creation time alone gives it away
+  status = { s1: true, s2: true, startedAtMs: 3000, fullAllowed: false };
+  t += 500; w.read();
+  assert.ok(lines.filter((l) => /app restarted/.test(l)).length === 2);
+  assert.ok(lines.some((l) => /less than one reading/.test(l)));
+  // an injected status with no signals says nothing
+  const quiet = [];
+  const w2 = createStopWatch(r.ctx, { log: (l) => quiet.push(l), status: () => ({ fullAllowed: true }) });
+  assert.equal(w2.read().fullAllowed, true);
+  assert.deepEqual(quiet, []);
 });
 
 /* ---- readSignedIn ---- */

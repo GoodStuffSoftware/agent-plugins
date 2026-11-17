@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.2 (2026-11-16)
+
+### Fixed
+
+* **session-sync:** `accounts go-live` (and the waiter) now notice that you quit Claude on Windows. The process probe used to exit with code 1 when no `claude` process existed, which was read as "unknown", so the link never started after a real quit. The probe now prints an end marker and exits 0; an empty list means "not running", and only a missing marker means "unknown". The link starts about 1 to 1.5 seconds after the last Claude process ends, with the lock-file check held as before.
+* **session-sync:** a restart of Claude is noticed by the lock file's creation time (a latch), so a quit followed by a quick reopen is logged and does not corrupt anything: a reopen after the link has begun is caught by the existing guard, which aborts safely and lets the runner retry.
+* **session-sync:** when the process probe stays unknown for 10 seconds while the lock marker is gone, the go-live log and the waiter log say so, with the probe's exit status and error text.
+
+* **session-sync:** replacing a waiting runner (running `accounts go-live` again) now ends a process only when it is proven to be that runner: its command line holds `golive-run` and it started no later than the claim. A claim whose pid belongs to some other program (a pid reused after a crash or reboot) is dropped as stale and the other program is left alone. If the operating system cannot be asked, nothing is ended. The phase is read again right before the end, so a runner that has already begun the link is never ended.
+* **session-sync:** a runner that lost its claim to another runner ends by itself instead of carrying on beside it, and a claim file that vanished is taken back.
+* **session-sync:** `accounts go-live` and `accounts answer yes` replace a waiter left by an older version of session-sync (same identity check, never while it holds the accounts lock), so the old waiter's blind spot for a quit on Windows cannot keep a link waiting. The SessionStart hook still only joins a waiter and never asks the system about it.
+* **session-sync:** a rollback that did not finish, or whose files do not match the backup, no longer starts Claude again: the first saves of the app could rewrite the files you are told to look at. The message says so.
+* **session-sync:** while the process check cannot answer, the runner looks every 30 seconds instead of twice a second (after 20 quick tries) and says why in `accounts status`.
+* **session-sync:** the progress icon is started outside the runner, so it outlives it and the closing balloon is shown. If Claude is reopened while the link is under way the icon is taken away and a new one is shown for the next link. The question the agent asks about a restart now starts with the question.
+
+### Added
+
+* **session-sync:** a progress indicator while the go-live runs with Claude closed. On Windows a tray icon (a hidden PowerShell helper, no console window, no focus steal) shows the step ("Syncing accounts: backing up and linking", "checking", "reopening Claude", "finishing"), a balloon when the sync starts and one with the result (done, rolled back, needs attention) when it ends, then removes itself. Double-clicking the icon opens the go-live log. The helper reads the result file and exits by itself if the runner dies. macOS shows a notification at the start and at the end, Linux does the same with `notify-send` when it is installed. `config progressIcon false` turns it off; the go-live itself is unchanged.
+
+
 ## 0.5.1 (2026-11-16)
 
 ### Fixed

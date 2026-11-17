@@ -1,6 +1,6 @@
 /**
  * launcher.mjs - the ONE way this plugin starts a long-lived background process of its own
- * (the account waiter and the go-live runner).
+ * (the account waiter and the go-live runner), plus launchProgram for the progress tray helper.
  *
  * The process must outlive the desktop app's quit AND the launching session being archived or
  * the account being switched. The app ends a session's whole process job on archive, delete and
@@ -132,13 +132,46 @@ function launchCim(args, { ctx, env, execPath, cli, spawnSyncFn = spawnSync }) {
     tail.push('--ss-env-file', file);
   }
   const cmd = [q(execPath), '--import', q(pathToFileURL(PRELOAD).href), q(cli), ...args.map(q), ...tail.map(q)].join(' ');
+  const r = cimCreate(cmd, { env, spawnSyncFn });
+  if (!r.ok && envFile) { try { unlinkSync(envFile); } catch { /* gone */ } }
+  return r;
+}
+
+/** Win32_Process.Create of one command line, hidden, owned by the WMI provider host (outside every job). */
+function cimCreate(cmd, { env, spawnSyncFn = spawnSync }) {
   const r = spawnSyncFn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', CIM_SCRIPT], {
     windowsHide: true, encoding: 'utf8', timeout: 30000, env: { ...env, SS_LAUNCH_CMD: cmd },
   });
-  const fail = (error) => { if (envFile) { try { unlinkSync(envFile); } catch { /* gone */ } } return { ok: false, pid: null, method: 'cim', error }; };
+  const fail = (error) => ({ ok: false, pid: null, method: 'cim', error });
   if (!r || r.error || r.status !== 0) return fail(String(r?.error?.message ?? r?.stderr ?? 'powershell failed').trim().slice(0, 300));
   let out = null;
   try { out = JSON.parse(String(r.stdout).trim().split(/\r?\n/).pop()); } catch { /* unparsed */ }
   if (!out || out.rc !== 0) return fail(`Win32_Process.Create returned ${out?.rc ?? 'no result'}`);
   return { ok: true, pid: out.pid || null, method: 'cim' };
+}
+
+/**
+ * Windows only: start any program hidden and OUTSIDE the caller's job, so it outlives the caller (the progress tray helper must
+ * still be running to show the closing balloon after the runner exits: libuv puts a plain child in a kill-on-close job, and
+ * `detached` would show a console for powershell.exe). Never falls back to anything that could show a window.
+ * With the log seam set it records the request and starts nothing.
+ * @param {string} exe  full path or name of the program
+ * @param {string[]} args
+ * @param {object} o  { env, platform, spawnSyncFn }
+ * @returns {{ok:boolean, pid:number|null, method:string, error?:string}}  never throws
+ */
+export function launchProgram(exe, args, o = {}) {
+  const env = o.env ?? process.env;
+  const platform = o.platform ?? process.platform;
+  try {
+    if (env.SESSION_SYNC_TEST_LAUNCH_LOG) {
+      mkdirSync(dirname(env.SESSION_SYNC_TEST_LAUNCH_LOG), { recursive: true });
+      appendFileSync(env.SESSION_SYNC_TEST_LAUNCH_LOG, `${JSON.stringify({ program: exe, args })}\n`);
+      return { ok: true, pid: null, method: 'test-log' };
+    }
+    if (platform !== 'win32') return { ok: false, pid: null, method: 'none', error: 'only on Windows' };
+    return cimCreate([q(exe), ...args.map(q)].join(' '), { env, spawnSyncFn: o.spawnSyncFn });
+  } catch (e) {
+    return { ok: false, pid: null, method: 'none', error: String(e?.message ?? e) };
+  }
 }

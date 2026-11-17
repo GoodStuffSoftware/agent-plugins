@@ -81,31 +81,57 @@ export function lockStartedAtMs(ctx) {
 }
 
 /**
- * S2: desktop process present. true / false / null (unknown). Never detached,
- * always hidden (plan I5).
+ * The Windows S2 probe. It ends with a marker line and ALWAYS exits 0: Get-Process exits 1 when no process has the
+ * name, and "no claude process" is the normal answer once the app has quit, not a failure. Output: one `P|<id>|<path>`
+ * line per `claude` process, then the marker. A missing marker (error, timeout, a shell that never ran the script) is the
+ * only way S2 becomes unknown.
  */
-export function desktopProcesses(ctx = {}) {
+export const PROBE_MARK = 'SS-PROBE-OK';
+export const WIN_PROBE_SCRIPT = `$p = @(Get-Process -Name claude -ErrorAction SilentlyContinue); foreach ($x in $p) { 'P|' + $x.Id + '|' + $x.Path }; '${PROBE_MARK}'; exit 0`;
+
+/** Parse the probe output. {value: true|false|null, detail}; detail says why a null is unknown. */
+export function parseWinProbe(stdout) {
+  const lines = String(stdout ?? '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (!lines.includes(PROBE_MARK)) return { value: null, detail: 'the probe end marker is missing' };
+  const paths = [];
+  for (const l of lines) {
+    const m = /^P\|(\d+)\|(.*)$/.exec(l);
+    if (!m) continue;
+    // a claude process whose path cannot be read is unknown, never absent (a path miss must not make a running app look stopped)
+    if (!m[2].trim()) return { value: null, detail: `claude process ${m[1]} has no readable path` };
+    paths.push(m[2].trim());
+  }
+  return { value: paths.some((p) => !WIN_CLI_PATH.test(p) && WIN_APP_PATHS.some((re) => re.test(p))), detail: null };
+}
+
+/**
+ * S2: desktop process present, with the reason when unknown: {value: true|false|null, detail}.
+ * Never detached, always hidden (plan I5).
+ */
+export function probeDesktop(ctx = {}) {
   const platform = ctx.platform ?? process.platform;
   const spawnFn = ctx.spawnFn ?? spawnSync;
   try {
     if (platform === 'win32') {
-      const r = spawnFn('powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-Command',
-        'Get-Process -Name claude -ErrorAction SilentlyContinue | ForEach-Object { $_.Path }',
-      ], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
-      if (!r || r.error || r.status !== 0) return null;
-      const paths = String(r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-      return paths.some((p) => !WIN_CLI_PATH.test(p) && WIN_APP_PATHS.some((re) => re.test(p)));
+      const r = spawnFn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WIN_PROBE_SCRIPT],
+        { windowsHide: true, encoding: 'utf8', timeout: 15000 });
+      if (!r || r.error) return { value: null, detail: `the probe did not run: ${String(r?.error?.message ?? 'no result').slice(0, 120)}` };
+      const p = parseWinProbe(r.stdout);
+      if (p.value === null) p.detail = `${p.detail} (status ${r.status}, stderr ${JSON.stringify(String(r.stderr ?? '').trim().slice(0, 200))})`;
+      return p;
     }
     if (platform === 'darwin') {
       const r = spawnFn('ps', ['-axo', 'comm='], { windowsHide: true, encoding: 'utf8', timeout: 15000 });
-      if (!r || r.error || r.status !== 0) return null;
-      return String(r.stdout || '').split('\n').some((l) => /\/Claude\.app\/Contents\/MacOS\/Claude$/.test(l.trim()));
+      if (!r || r.error || r.status !== 0) return { value: null, detail: `ps failed (status ${r?.status ?? 'none'})` };
+      return { value: String(r.stdout || '').split('\n').some((l) => /\/Claude\.app\/Contents\/MacOS\/Claude$/.test(l.trim())), detail: null };
     }
     // Linux: the SingletonLock pid is the only signal.
-    return lockfilePresent(ctx);
-  } catch { return null; }
+    return { value: lockfilePresent(ctx), detail: null };
+  } catch (e) { return { value: null, detail: `the probe threw: ${String(e?.message ?? e).slice(0, 120)}` }; }
 }
+
+/** S2 as true / false / null (unknown). */
+export const desktopProcesses = (ctx = {}) => probeDesktop(ctx).value;
 
 /**
  * The signed-in account uuid from USERDATA/config.json, or null.
@@ -169,12 +195,13 @@ export function appState(opts = {}) {
   const { probeProcesses = false, ctx } = opts;
   const now = opts.now ?? ctx.now();
   const seam = testSeam();
-  let s1; let s2; let signedIn; let startedAtMs;
+  let s1; let s2; let signedIn; let startedAtMs; let s2Detail = null;
   if (seam) {
     ({ s1, s2, signedIn, startedAtMs } = seam);
   } else {
     s1 = lockfilePresent(ctx);
-    s2 = probeProcesses ? desktopProcesses(ctx) : null;
+    s2 = null;
+    if (probeProcesses) ({ value: s2, detail: s2Detail } = probeDesktop(ctx));
     signedIn = readSignedIn(ctx.userData);
     startedAtMs = s1 ? lockStartedAtMs(ctx) : 0;
   }
@@ -190,7 +217,61 @@ export function appState(opts = {}) {
   }
   return {
     running: ev.running, stale: ev.stale, fullAllowed: ev.fullAllowed,
-    s1: !!s1, s2, signedIn, startedAtMs: startedAtMs || 0,
+    s1: !!s1, s2, s2Detail, signedIn, startedAtMs: startedAtMs || 0,
+  };
+}
+
+/** After this long with the lock marker gone and S2 still unknown, the watch logs a WARN that names the probe's own words. */
+export const S2_WARN_AFTER_MS = 10 * 1000;
+
+/**
+ * One watcher for every "wait until the app has stopped" loop (the go-live runner's three waits and the waiter), so they
+ * read the app the same way and say what they see. `read()` returns the appState and, as a side effect, logs (once per
+ * change, never per poll):
+ *   - the lock marker going away and coming back (S1 true -> false -> true);
+ *   - S2 unknown while S1 is false: the first time, every 60th reading, and a WARN after S2_WARN_AFTER_MS that names the probe's
+ *     status and stderr (the line that would have exposed a probe that always fails);
+ *   - the restart latch: the lock marker's creation time changed (or the marker went away and came back) since the last
+ *     reading, so the app quit and started again. A stop too short to link in is no longer silent.
+ * It never decides anything: fullAllowed still comes from appState.
+ *
+ * o: { log(line), clock(), probeEveryMs, status(ctx) } - `status` replaces appState (the go-live tests' appStatus dependency).
+ */
+export function createStopWatch(ctx, o = {}) {
+  const log = o.log ?? (() => {});
+  const clock = o.clock ?? Date.now;
+  const probeEveryMs = o.probeEveryMs ?? 10 * 60 * 1000;
+  let lastProbe = -Infinity;
+  let prevS1 = null; let downAt = 0; let nulls = 0; let nullSince = 0; let warned = false;
+  let birth = 0;
+  return {
+    /** @param {{probeProcesses?: boolean, now?: number}} [opts] force a probe; a caller's own reading of the clock */
+    read(opts = {}) {
+      const now = opts.now ?? clock();
+      const probe = opts.probeProcesses ?? (!lockfilePresent(ctx) || now - lastProbe >= probeEveryMs);
+      if (probe) lastProbe = now;
+      const app = o.status ? o.status(ctx) : appState({ ctx, probeProcesses: probe, now: ctx.now() });
+      if (typeof app.s1 !== 'boolean') return app;   // an injected status with no signals: nothing to say
+      if (prevS1 === true && !app.s1) { downAt = now; log('app lock marker gone (S1 true -> false)'); }
+      if (prevS1 === false && app.s1) {
+        log(`app lock marker is back (S1 false -> true) after ${now - downAt} ms`);
+        nulls = 0; nullSince = 0; warned = false;
+      }
+      if (app.s1 && app.startedAtMs) {
+        if (birth && app.startedAtMs !== birth) log(`app restarted (lock marker created ${new Date(app.startedAtMs).toISOString()}); the stop lasted ${prevS1 === false ? `${now - downAt} ms` : 'less than one reading'}`);
+        birth = app.startedAtMs;
+      }
+      if (!app.s1 && probe) {
+        if (app.s2 === null) {
+          if (!nulls) nullSince = now;
+          nulls++;
+          if (nulls === 1 || nulls % 60 === 0) log(`S2 (process probe) is unknown while the lock marker is gone (${nulls} time(s)): ${app.s2Detail ?? 'no detail'}`);
+          if (!warned && now - nullSince >= S2_WARN_AFTER_MS) { warned = true; log(`WARN: the process probe has been unknown for ${now - nullSince} ms with the lock marker gone, so the stop cannot be confirmed: ${app.s2Detail ?? 'no detail'}`); }
+        } else { nulls = 0; nullSince = 0; warned = false; }
+      }
+      prevS1 = app.s1;
+      return app;
+    },
   };
 }
 

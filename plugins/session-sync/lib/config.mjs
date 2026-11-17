@@ -56,6 +56,9 @@ export const DEFAULTS = Object.freeze({
   //   'off'  — never ask, never touch the per-account folders.
   // Env CLAUDE_PLUGIN_OPTION_ACCOUNTLINK overrides the file when set to a valid value.
   accountLink: 'ask',
+  // While the account go-live runs with Claude closed, show progress: a tray icon with the current step and a start and end
+  // balloon on Windows, a start and end notification on macOS and Linux. false: nothing is shown (the go-live still runs).
+  progressIcon: true,
 });
 
 export const ACCOUNT_LINK_MODES = Object.freeze(['ask', 'auto', 'off']);
@@ -135,6 +138,7 @@ export function describeConfig(cfg = loadConfig()) {
     notifyMode: cfg.notifyMode || DEFAULTS.notifyMode,
     debounceMinutes: Number.isFinite(cfg.debounceMinutes) ? cfg.debounceMinutes : DEFAULTS.debounceMinutes,
     accountLink: cfg.accountLink || DEFAULTS.accountLink,
+    progressIcon: cfg.progressIcon !== false,
     extraExcludes: cfg.extraExcludes || [],
     configFile: CONFIG_FILE,
     configExists: existsSync(CONFIG_FILE),
