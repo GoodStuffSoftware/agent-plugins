@@ -126,7 +126,7 @@ test('plan: refuses one account, an already linked store, a rollback marker, an 
 
 test('plan: summary numbers, and desktop copies judged by capability, not version', () => {
   const w = world({ copies: [{ capable: true }, { capable: false }] });
-  const plan = planGoLive(w.ctx);
+  const plan = planGoLive(w.ctx, { copies: (c) => sessionSyncCopies(c, { home: join(w.r.root, 'home') }) });   // never the real terminal install
   assert.equal(plan.ok, true);
   assert.equal(plan.accounts, 2);
   assert.equal(plan.folders, 2);
@@ -182,6 +182,7 @@ test('runner: the whole path ok - waits for stop, links, verifies, relaunches, w
   assert.ok(r.backupId);
   assert.ok(existsSync(r.rollbackScript), 'the standalone rollback script is named in the result');
   assert.equal(r.resumable, false);
+  assert.doesNotMatch(r.messages.join('\n'), /Restart Claude to sync/, 'the finished result never asks for a restart again');
   assert.deepEqual(calls.push, []);
   assert.equal(calls.relaunch, 1);
   assert.equal(calls.rectify, 1);
@@ -1081,7 +1082,8 @@ test('0.5.1 wait-stop has no time limit by default: a very long wait ends when t
   const out = await runGoLive(w.ctx, d);
   assert.deepEqual(out, { exit: 'done', status: 'ok' });
   assert.equal(loadState(w.ctx).linked, true);
-  assert.match(readGoLive(w.ctx).messages.join('\n'), /^Restart Claude to sync your accounts: quit Claude from the tray icon or app menu[^\n]*no time limit/m);
+  assert.match(readFileSync(goLiveLogFile(w.ctx), 'utf8'), /Restart Claude to sync your accounts: quit Claude from the tray icon or app menu[^\n]*no time limit/);
+  assert.doesNotMatch(readGoLive(w.ctx).messages.join('\n'), /Restart Claude to sync/, 'once the app stopped, the ask is not kept in the result');
 });
 
 test('0.5.1 the verify-stop wait has no limit either: it ends only on a stopped app', async () => {

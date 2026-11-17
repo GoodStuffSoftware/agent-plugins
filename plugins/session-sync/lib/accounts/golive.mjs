@@ -517,6 +517,8 @@ export async function runGoLive(ctx, deps = {}) {
       if (r === 'timeout') {
         return finalize('failed', 'Timed out waiting for the app to stop. Your answer is still recorded. Quit Claude, then run: accounts go-live (it resumes).');
       }
+      // the ask is over once the app has stopped: the finished report never repeats it (the log keeps it)
+      gl.messages = gl.messages.filter((m) => !m.includes(WAIT_NOTE));
       return 'relist';
     },
 
