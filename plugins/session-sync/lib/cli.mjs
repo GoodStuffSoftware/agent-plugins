@@ -855,6 +855,24 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
+  if (key === 'artifactShare.enabled') {
+    const on = /^(true|1|yes|on)$/i.test(value);
+    saveConfig({ artifactShare: { enabled: on } });
+    log(`config: ${key} -> ${on}`);
+    console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
+  if (key === 'artifactShare.email') {   // config artifactShare.email <account id or its first 8+ characters> <email>
+    const [acct, mail] = value.split(/\s+/);
+    if (!/^[0-9a-f-]{8,36}$/i.test(acct ?? '') || !/^[^\s@]+@[^\s@]+$/.test(mail ?? '')) {
+      console.error('usage: config artifactShare.email <account id, or its first 8 or more characters> <email>');
+      process.exit(2);
+    }
+    saveConfig({ artifactShare: { emails: { [acct.toLowerCase()]: mail } } });
+    log(`config: artifactShare.email ${acct.slice(0, 8)} set`);
+    console.log(JSON.stringify({ ok: true, 'artifactShare.email': { [acct.toLowerCase()]: mail }, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
   if (key === 'rcRestore.wakeMax') {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 1 || n > 50) {
@@ -877,8 +895,64 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'rcRestore.days': n, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax');
+  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, artifactShare.enabled, artifactShare.email');
   process.exit(2);
+}
+
+// `artifacts ...`: the queue of new artifacts to invite to the other linked account (artifacts.mjs). Used by the share-artifacts skill.
+// Needs neither rclone nor `enabled`; prints plain lines, or one JSON object with --json.
+if (cmd === 'artifacts') {
+  const args = process.argv.slice(3).filter((a) => a !== '--json');
+  const sub = args[0] || 'list';
+  const flag = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
+  const positional = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--')));
+  const out = (obj, text) => { console.log(jsonOut ? JSON.stringify(obj, null, 2) : text); };
+  const idOf = (s) => { const m = /artifact\/([A-Za-z0-9_-]{6,64})/.exec(String(s ?? '')); return m ? m[1] : String(s ?? ''); };
+  const line = (e) => `${e.id}  ${e.status}${e.reason ? `(${e.reason})` : ''}  owner ${e.ownerAccount ? e.ownerAccount.slice(0, 8) : 'unknown'}  ${e.title ?? '(untitled)'}  ${e.url}${e.inviteLink ? `  invite ${e.inviteLink}` : ''}`;
+  try {
+    const A = await import('./artifacts.mjs');
+    const cfg = loadConfig();
+    const emails = cfg.artifactShare.emails;
+    if (sub === 'pending' || sub === 'list') {
+      const entries = A.readEntries(A.QUEUE_DIR);
+      const share = A.readShareState(A.QUEUE_DIR);
+      const shown = (sub === 'pending' ? A.pendingOf(entries) : entries).map((e) => ({
+        ...e, ownerEmail: A.emailOf(emails, e.ownerAccount), receiverEmail: A.receiverEmail(emails, e.ownerAccount),
+        driveable: A.driveableOwner(e.ownerAccount, emails, share),
+      }));
+      const active = sub === 'pending' ? await A.activeAccount() : null;
+      const head = { enabled: cfg.artifactShare.enabled, linked: A.featureOn({ artifactShare: { enabled: true } }), browsers: share.browsers, emails, activeAccount: active, activeEmail: A.emailOf(emails, active) };
+      out({ ok: true, ...head, entries: shown }, shown.length ? shown.map(line).join('\n') : (sub === 'pending' ? 'nothing pending' : 'the queue is empty'));
+      process.exit(0);
+    }
+    if (sub === 'mark') {
+      const [, rawId, status] = positional;
+      if (!rawId || !A.STATUSES.includes(status)) { console.error(`usage: artifacts mark <id> ${A.STATUSES.join('|')} [--link <invitation link>] [--reason <text>]`); process.exit(2); }
+      const r = A.markEntry(A.QUEUE_DIR, idOf(rawId), status, { link: flag('link'), reason: flag('reason') });
+      if (!r.ok) { console.error(r.reason); process.exit(1); }
+      log(`artifacts: ${r.entry.id} -> ${status}`);
+      out({ ok: true, entry: r.entry }, line(r.entry));
+      process.exit(0);
+    }
+    if (sub === 'forget') {
+      if (!positional[1]) { console.error('usage: artifacts forget <id>'); process.exit(2); }
+      const ok = A.forgetEntry(A.QUEUE_DIR, idOf(positional[1]));
+      out({ ok }, ok ? 'forgotten' : 'not in the queue');
+      process.exit(ok ? 0 : 1);
+    }
+    if (sub === 'pane') {   // record the account a driveable browser is signed in to: artifacts pane <email> [--browser <name>]
+      if (!positional[1]) { console.error('usage: artifacts pane <email> [--browser <name>]'); process.exit(2); }
+      const s = A.recordBrowser(A.QUEUE_DIR, flag('browser') ?? 'pane', positional[1]);
+      out({ ok: true, browsers: s.browsers }, `recorded ${positional[1]}`);
+      process.exit(0);
+    }
+    console.error('usage: artifacts pending|list [--json] | mark <id> <status> [--link L] [--reason R] | forget <id> | pane <email> [--browser name]');
+    process.exit(2);
+  } catch (e) {
+    log(`artifacts ${sub} failed: ${e?.message || e}`);
+    console.error(`artifacts ${sub} failed: ${e?.message || e}`);
+    process.exit(1);
+  }
 }
 
 // The UserPromptSubmit hook (0.5.4): the first real prompt of an interactive session after a restart of the Claude app gets a one-time
