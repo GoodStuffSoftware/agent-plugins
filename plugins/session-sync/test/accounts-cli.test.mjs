@@ -313,3 +313,39 @@ test('config progressIcon: on by default, saved as false and shown by `config`',
   assert.equal(JSON.parse(readFileSync(join(w.stateDir, 'config.json'), 'utf8')).progressIcon, false);
   assert.equal(JSON.parse(w.run(['config', 'progressIcon', 'true']).stdout).progressIcon, true);
 });
+
+test('config rcRestore.*: defaults on / 3 days / wake on, each key validated and saved without touching the others, shown by `config`', () => {
+  const w = cworld();
+  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: true, days: 3, wake: true });
+  assert.equal(w.run(['config', 'rcRestore.days', '0']).status, 2);
+  assert.equal(w.run(['config', 'rcRestore.days', '91']).status, 2);
+  assert.equal(w.run(['config', 'rcRestore.days', 'soon']).status, 2);
+  assert.equal(w.run(['config', 'rcRestore.days', '2.5']).status, 2);
+  const days = w.run(['config', 'rcRestore.days', '7']);
+  assert.equal(days.status, 0, days.stderr);
+  const wake = w.run(['config', 'rcRestore.wake', 'false']);
+  assert.equal(wake.status, 0, wake.stderr);
+  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: true, days: 7, wake: false });
+  assert.deepEqual(JSON.parse(readFileSync(join(w.stateDir, 'config.json'), 'utf8')).rcRestore, { days: 7, wake: false }, 'only what was set is stored');
+  assert.equal(w.run(['config', 'rcRestore.enabled', 'off']).status, 0);
+  assert.deepEqual(JSON.parse(w.run(['config']).stdout).rcRestore, { enabled: false, days: 7, wake: false });
+  assert.equal(w.run(['config', 'rcRestore.enabled', 'true']).status, 0);
+  assert.equal(JSON.parse(w.run(['config']).stdout).rcRestore.enabled, true);
+  assert.equal(w.run(['config', 'rcRestore.bogus', 'true']).status, 2);
+});
+
+test('rc restore: a session start with the app running arms the watcher even with one account; with rcRestore off it does not', { skip: process.platform !== 'win32' }, () => {
+  const w = cworld({ accounts: 1 });
+  w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  const r = w.run(['auto-pull', '--from-hook']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '', 'nothing is said to the session');
+  assert.equal(waitFor(() => existsSync(join(w.acc, 'waiter.json'))), true, 'a watcher is armed for the Remote Control restore');
+  assert.equal(waitFor(() => (readJson(join(w.acc, 'waiter.json'))?.reasons ?? []).includes('watch')), true);
+  assert.equal(w.state()?.linked ?? false, false, 'no link was made');
+
+  const off = cworld({ accounts: 1, config: { rcRestore: { enabled: false } } });
+  off.setApp({ running: true, signedIn: A, startedAtMs: 1 });
+  assert.equal(off.run(['auto-pull', '--from-hook']).status, 0);
+  assert.equal(existsSync(join(off.acc, 'waiter.json')), false, 'switched off: no watcher');
+});

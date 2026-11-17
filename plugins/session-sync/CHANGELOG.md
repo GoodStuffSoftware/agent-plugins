@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.4 (2026-11-17)
+
+### Added
+
+* **session-sync:** Remote Control comes back by itself after you restart the Claude desktop app (Windows; macOS and Linux do nothing). After any restart, Remote Control is off for every Code session, and after an account switch the CLI can reattach to links that were minted in a cross-account fallback (random names, and renames never reach them). Three steps now run on their own:
+  * **Relink** (Claude closed): for the current account's conversations active in the last 3 days, a saved link whose last `bridge-session` entry is a fallback link (`noHistoryBackfill`) or belongs to another account is cleared with the CLI's own clearing line, after a backup, once. The next connect makes a fresh link named after the session. Only `bridge-session` lines of a transcript are read.
+  * **Free restore** (Claude closed): up to 4 of the most recent conversations that had Remote Control on get the markers the app's own launch pass reads (`remoteControlLiveAtUpdateQuit` and `remoteControlAutoEligible`), so the app reconnects them when it starts, with no model turn. The marker is kept fresh while Claude stays closed (it must be younger than an hour when the app starts). `interruptedByQuitAt` is never written. Records are edited in place, so linked-account hard links survive. After the next start the watcher logs what the app did (its `outcome`: ran, gate_off, flags_not_fetched), because the server decides whether the launch restore runs.
+  * **Wake the rest** (Claude running): the first real prompt of an interactive session after a restart (a `UserPromptSubmit` hook, claimed once per restart so exactly one session acts) tells that session's agent to list the sessions and send each active one that is still off a one-line no-op message, then report "Remote Control: N sessions reconnected, M still off". Scheduled and unattended sessions never take that role.
+* **session-sync:** you are told: a tray balloon at the start and at the end of the quit-time relink and restore, with counts.
+* **session-sync:** new settings `rcRestore.enabled` (default on), `rcRestore.days` (default 3, 1 to 90) and `rcRestore.wake` (default on; off keeps relink and the free restore and drops the wake step). Cost, stated plainly: every wake-up is one short model turn in the session that is woken (a reply of one word, no tools); the relink and the free restore cost nothing.
+* **session-sync:** the watcher now also runs for a single, never-linked account when `rcRestore.enabled` is on, so the restore works without linking accounts.
+
 ## 0.5.3 (2026-11-17)
 
 ### Added

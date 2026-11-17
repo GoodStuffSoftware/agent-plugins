@@ -310,7 +310,7 @@ export function rcDoneText(res) {
 
 /* ------------------------------------------------------------------ what the app did at the next launch */
 
-const LAUNCH_LINE = /Remote Control restore after update|launch_remote_control_restore|\[rcAutoEnable\]/i;
+const LAUNCH_LINE = /Remote Control restore after update|trigger=launch_remote_control_restore/i;
 const LOG_TS = /^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})/;
 
 /**

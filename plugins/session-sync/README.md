@@ -79,6 +79,9 @@ everything else.
 | `notifications false` | silence EVERYTHING, including failures — a full opt-out |
 | `notifyMode` | how chatty routine (non-failure) toasts are: `first-run` (default — one toast ever, to confirm it's alive, then quiet), `all` (a toast every time), `failures` (never, only failures/conflicts show) |
 | `debounceMinutes` | hook-triggered pushes only: **defer** (never discard) if the last one succeeded within this many minutes (default `5`; `0` disables the wait). Several conversations ending together coalesce into one background push that runs when the window lapses — the request is recorded on disk, so even a machine shut down mid-wait retries it next session. Never applies to a manual `push`/`pull` — the sync skill's "push before switching machines" always runs immediately. |
+| `rcRestore.enabled` | Remote Control restore after a restart of Claude (Windows; default `true`): relinks stale links and marks recent sessions so the app reconnects them at its next start. See "Remote Control after a restart" below |
+| `rcRestore.days` | only conversations active within this many days are looked at (default `3`, 1 to 90) |
+| `rcRestore.wake` | after the restart, the first prompt of one session wakes the rest, costing one short turn in each (default `true`; `false` keeps the relink and the free restore only) |
 | `progressIcon false` | no progress indicator during the account go-live (default on: a tray icon with the current step plus a start and an end balloon on Windows, a start and an end notification on macOS and Linux). The go-live itself is unchanged |
 
 `CLAUDE_SESSION_SYNC_REMOTE` overrides the file when set — handy for CI, and `config` reports
@@ -165,6 +168,16 @@ Exit codes: `0` ok, `1` failed, `2` bad arguments, `3` refused (the app is runni
 - **Never downgrade to 0.3.0 while linked.** 0.3.0 has no push filter and would upload every mirrored copy. Run `accounts unlink` (or `accounts rollback`) first.
 
 Windows needs no administrator rights and the plugin opens no windows. The macOS and Linux paths follow the app's standard data folders and are untested.
+
+## Remote Control after a restart
+
+After any restart of the Claude desktop app, Remote Control is off for every Code session, and after an account switch the CLI can reattach to a link that was made in a cross-account fallback (a random name that a rename never reaches). From 0.5.4 (Windows; macOS and Linux do nothing) the plugin repairs both, with the same background watcher that follows account switches. It also runs with one account that was never linked, and it never writes while Claude runs.
+
+1. **Relink, when you quit Claude.** For the current account's conversations active in the last `rcRestore.days` days, a saved link whose last `bridge-session` entry is a fallback link (`noHistoryBackfill`) or belongs to another account is cleared with the CLI's own clearing line, after a backup under `accounts/rc-restore/backup/`. The next connect makes a fresh link named after the session. Idempotent; only `bridge-session` lines of a transcript are read.
+2. **Free restore, while Claude is closed.** Up to 4 of the most recent local, non-archived, non-scheduled conversations that had Remote Control on get the two markers the app's own launch pass reads (`remoteControlLiveAtUpdateQuit` and `remoteControlAutoEligible`). When Claude starts, the app reconnects them with no model turn and no cost. The marker is refreshed every 20 minutes while Claude stays closed (the app ignores one older than an hour), records are edited in place so linked-account hard links survive, and `interruptedByQuitAt` is never set. Whether the app's launch restore runs is decided by flags on Anthropic's servers; after the next start the watcher logs the app's own outcome (`ran`, `gate_off`, `flags_not_fetched`) in `sync.log`.
+3. **Wake the rest, once Claude runs.** The first real prompt of an interactive session after a restart (a `UserPromptSubmit` hook; one session per restart, claimed with an exclusive file create; scheduled and unattended sessions never take it) gets a one-time instruction: say one line to you, list the sessions, send each non-archived interactive session active in the last `rcRestore.days` days that is still off the message "Remote Control reconnect after the Claude app restart. No action needed: reply with the single word ok. Do not run any tools or resume any work.", then say "Remote Control: N sessions reconnected, M still off". **Cost: each wake-up is one short model turn in the session that is woken.** A send the session tool refuses is skipped and counted as still off. `config rcRestore.wake false` drops this step and keeps the first two.
+
+A tray balloon says when the quit-time relink and restore start and end, with counts (`config progressIcon false` silences it). `config rcRestore.enabled false` turns the whole feature off.
 
 ## Notes from actually running this on Windows
 

@@ -333,14 +333,15 @@ const spawnWaiter = (reason) => {
   if (!r.ok) throw new Error(r.error ?? 'could not start the waiter');
   return r.pid;
 };
-const armWaiter = (ctx, reason) => ensureWaiter(ctx, reason, spawnWaiter);
+let waiterArmedHere = false;   // this process already armed (or joined) the waiter: a second arm right behind it would race the first one's start
+const armWaiter = (ctx, reason) => { waiterArmedHere = true; return ensureWaiter(ctx, reason, spawnWaiter); };
 
 /** The Remote Control restore settings (config rcRestore.*), read afresh. Windows only: elsewhere the whole feature is off. */
 const rcRestoreNow = () => (platform() === 'win32' ? rcSettings(loadConfig()) : { enabled: false, days: 3, wake: false });
 
 /** The watcher also prepares Remote Control at the quit, with one account or several: a session start with the app running makes sure it is there. */
 function rcHookArm() {
-  if (!rcRestoreNow().enabled) return;
+  if (waiterArmedHere || !rcRestoreNow().enabled) return;
   const ctx = makeCtx();
   if (ctx.store && lockfilePresent(ctx)) armWaiter(ctx, 'watch');
 }
@@ -483,8 +484,8 @@ async function accountsHookStep() {
   try {
     // a go-live result no session has been told about yet (once), or a mid-run notice
     try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
-    try { rcHookArm(); } catch { /* never block a session */ }
     await accountsHookStepInner(parts);
+    try { rcHookArm(); } catch { /* never block a session */ }   // after the account step: that one may have armed the waiter with a reason of its own
   } finally {
     if (parts.length) writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: parts.join('\n\n') } })}\n`);
   }
