@@ -92,8 +92,8 @@ export const nullUi = Object.freeze({ start() {}, end() {} });
  *   launchFn(exe, args, {env}) starts the Windows helper outside the runner's job (default: launcher.launchProgram). With only
  *   spawnFn given (tests) the helper is started as a plain child of the runner, like the fallback when the launch fails.
  * @returns {{start(info), end(result)}}  never throws
- *   start(info): { resultFile, logFile, runnerPid, noRelaunch, run }
- *   end(result): { status, headline }; on Windows with the fallback child it returns a promise that settles when the helper has
+ *   start(info): { resultFile, logFile, runnerPid, noRelaunch, run, startText }
+ *   end(result): { status, headline, quiet }; on Windows with the fallback child it returns a promise that settles when the helper has
  *   shown the closing balloon and exited (or after END_WAIT_MS), so the runner does not exit under it.
  */
 export function createProgressUi(o = {}) {
@@ -110,10 +110,11 @@ export function createProgressUi(o = {}) {
   return {
     start(info = {}) {
       try {
+        const text = info.startText ?? startText(info);   // the waiter's quit-time pass words its own start line
         if (platform === 'win32') {
           const args = ['-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', script,
             '-Result', String(info.resultFile), '-RunnerPid', String(info.runnerPid ?? process.pid),
-            '-Log', String(info.logFile ?? ''), '-Title', TITLE, '-StartText', startText(info)];
+            '-Log', String(info.logFile ?? ''), '-Title', TITLE, '-StartText', text];
           if (info.run) args.push('-Run', String(info.run));
           if (existsSync(icon)) args.push('-Icon', icon);
           // Started through the launcher (CIM Win32_Process.Create): the helper must outlive the runner, which exits right after
@@ -130,7 +131,7 @@ export function createProgressUi(o = {}) {
           fallbackChild = child;
           return;
         }
-        notifyFn(TITLE, startText(info), { tag: 'accounts-progress' });
+        notifyFn(TITLE, text, { tag: 'accounts-progress' });
       } catch { /* the indicator is never worth failing the go-live over */ }
     },
     end(result = {}) {
@@ -143,6 +144,7 @@ export function createProgressUi(o = {}) {
           // the timer is NOT unref'd: it is what keeps the runner alive while the child (which is unref'd) shows the balloon
           return new Promise((resolve) => { const t = setTimeout(resolve, o.endWaitMs ?? END_WAIT_MS); child.once('exit', () => { clearTimeout(t); resolve(); }); });
         }
+        if (result.quiet) return undefined;   // the pass never ran (the app came back): the start notice is withdrawn by saying nothing more
         notifyFn(TITLE, result.headline ?? endText(result.status), { tag: 'accounts-progress', persist: result.status !== 'ok' });
       } catch { /* best effort */ }
     },

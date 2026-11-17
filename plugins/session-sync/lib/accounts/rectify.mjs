@@ -9,23 +9,27 @@
  *   classify(...)     -> a pure per-record decision (no mode, no writes)
  *   rectify(...)      -> applies the decision under the live/full rules
  *
- * Live pass (the app runs): only ADD new names, re-link losers in non-live
- * folders. Full pass (app stopped): everything, including deletes. Nothing is
- * ever erased: a displaced file is COPIED to a rectify backup first, and a
- * propagated delete writes tombstones as regular files, never links.
+ * Targeted pass (the app runs): the app holds the folders of the signed-in account
+ * (loaded) and, for a few seconds after a switch, the previous one (cooling) in
+ * memory, so those get ADD only. Every other folder of the group is free and is
+ * kept fully current: re-links, deletes, tombstones. A name a parked session still
+ * writes (held) is left alone. Live pass (older mode): only ADD new names, re-link
+ * losers in non-live folders. Full pass (app stopped): everything, including
+ * deletes. Nothing is ever erased: a displaced file is COPIED to a rectify backup
+ * first, and a propagated delete writes tombstones as regular files, never links.
  *
  * rectify() mutates `state.records` but does not save it; the caller saves.
  */
 
 import {
-  readdirSync, lstatSync, statSync, readFileSync, writeFileSync, linkSync, renameSync, unlinkSync,
+  readdirSync, lstatSync, statSync, readFileSync, writeFileSync, linkSync, renameSync, unlinkSync, existsSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { RECORD, TOMB, OURTMP, homeOf } from './folders.mjs';
 import { backupCopy, resetBackupCache, sha256File } from './backup.mjs';
 import { accPath, readJson, tickMutation, sleepSync, LOCK_TTL_MS } from './state.mjs';
-import { AppRunningError } from './appstate.mjs';
+import { AppRunningError, nameIsHeld } from './appstate.mjs';
 import { acquireLock, pidAlive } from '../lock.mjs';
 
 const TEN_MIB = 10 * 1024 * 1024;
@@ -102,12 +106,20 @@ function toMs(v) {
   return -Infinity;
 }
 
+/**
+ * S2: a record's summary only changes when the file does, so it is cached across passes (the watcher process runs one every 30 s and
+ * about 2 s after each save) under path, inode, mtime and size; only a file that changed is read and parsed again.
+ */
+const SUMMARIES = new Map();
+const SUMMARY_CACHE_MAX = 20000;
+export const summaryStats = { parsed: 0, hits: 0 };
+
 function makeSummarizer() {
-  const cache = new Map();
   return (e) => {
-    const k = `${e.path}|${e.mtimeNs}`;
-    let r = cache.get(k);
-    if (r) return r;
+    const k = `${e.path}|${e.inoKey}|${e.mtimeNs}|${e.size}`;
+    let r = SUMMARIES.get(k);
+    if (r) { summaryStats.hits++; return r; }
+    summaryStats.parsed++;
     try {
       const o = JSON.parse(readFileSync(e.path, 'utf8'));
       if (!o || typeof o !== 'object' || Array.isArray(o)) throw new Error('not an object');
@@ -119,7 +131,8 @@ function makeSummarizer() {
           ...Object.keys(o).some((x) => x.startsWith('remoteControl')) ? ['remoteControl*'] : []],
       };
     } catch { r = { ok: false, la: -Infinity, cli: null, bound: [] }; }
-    cache.set(k, r);
+    if (SUMMARIES.size >= SUMMARY_CACHE_MAX) SUMMARIES.clear();
+    SUMMARIES.set(k, r);
     return r;
   };
 }
@@ -229,8 +242,10 @@ function newReport(mode) {
  *
  * @param {Array}  group     folder objects {acct, org, key, path}
  * @param {object} opts
- * @param {'live'|'full'} opts.mode
+ * @param {'live'|'targeted'|'full'} opts.mode
  * @param {Set|string[]}  [opts.live]   live folder keys (live pass)
+ * @param {{loaded:Set, cooling:Set}} [opts.roles]  targeted pass: folders that get ADD only (every other folder is free)
+ * @param {Function}      [opts.testHook]  (stage, entry) => void, called right before a re-link or delete acts (tests mutate the target here)
  * @param {Function}      [opts.guard]  (op, folderKey) => void; throws AppRunningError to abort
  * @param {object}        opts.ctx
  * @param {object}        opts.state    mutated, not saved
@@ -250,24 +265,69 @@ export function rectify(group, opts) {
     lock = acquireLock(accPath(ctx, 'accounts.lock'), { ttlMs: LOCK_TTL_MS });
     if (!lock.acquired) { rep.skipped = 'locked'; return rep; }
   }
-  try { return run(group, { mode, ctx, state, guard, remoteList, live, accountFields: opts.accountFields ?? mode === 'full' }, rep); }
+  const roles = mode === 'targeted' ? { loaded: new Set(opts.roles?.loaded ?? []), cooling: new Set(opts.roles?.cooling ?? []) } : null;
+  try { return run(group, { mode, ctx, state, guard, remoteList, live, roles, testHook: opts.testHook, appStartedAtMs: opts.appStartedAtMs ?? 0, accountFields: opts.accountFields ?? mode === 'full' }, rep); }
   finally { lock?.release(); }
 }
 
 function run(group, o, rep) {
-  const { mode, ctx, state, guard, remoteList, live } = o;
+  const { mode, ctx, state, guard, remoteList, live, roles } = o;
   resetBackupCache();
   const groupKeys = group.map((f) => f.key);
   const folderPath = Object.fromEntries(group.map((f) => [f.key, f.path]));
   const inv = inventory(group);
-  const plans = classify(inv, state, { groupKeys, remoteList });
+  const summarize = makeSummarizer();
+  const plans = classify(inv, state, { groupKeys, remoteList, summarize });
   state.records ||= {};
 
-  const check = (op, F) => {
+  // targeted: why a mutation other than ADD may not touch this name now (null = it may)
+  // A name that is not the inode a pass of ours left there, alone, and written since the folder stopped being loaded (an unload seen
+  // in this app run) is a parked session's: its next save would replace whatever we put there. It is remembered in `state.held`
+  // (folder + inode) so the hold survives another folder being linked to it (S3: nlink is no longer the test once it is recorded).
+  // An unknown unload time holds nothing (B1: every earlier write of the run is drift and converges to the newest).
+  const held = (state.held ||= {});
+  if (mode === 'targeted') {
+    if (state.heldRun !== (o.appStartedAtMs ?? 0)) { for (const k of Object.keys(held)) delete held[k]; state.heldRun = o.appStartedAtMs ?? 0; }   // a restart ends every parked session
+    for (const id of Object.keys(held)) {
+      if (!inv.byId.has(id)) { delete held[id]; continue; }
+      for (const F of Object.keys(held[id])) if (roles.loaded.has(F) || !inv.byId.get(id).has(F)) delete held[id][F];   // loaded again, or the name is gone
+      if (!Object.keys(held[id]).length) delete held[id];
+    }
+    for (const P of inv.byId.values()) {
+      for (const e of P.values()) {
+        if (roles.loaded.has(e.folder) || roles.cooling.has(e.folder)) continue;
+        if (nameIsHeld(state, e, o.appStartedAtMs ?? 0)) (held[e.id] ||= {})[e.folder] = e.inoKey;
+      }
+    }
+  }
+  const isHeld = (e) => held[e.id]?.[e.folder] === e.inoKey;
+  const blockedWhy = (e) => {
+    if (mode !== 'targeted') return null;
+    if (roles.loaded.has(e.folder)) return `${e.folder} is loaded by the app`;
+    if (roles.cooling.has(e.folder)) return `${e.folder} was just switched away from`;
+    if (isHeld(e)) return `${e.id} is held in ${e.folder}`;
+    return null;
+  };
+  const check = (op, F, e) => {
     tickMutation();
     if (mode === 'live' && op !== 'add' && live.has(F)) throw new DeferredError(`${F} is live`);
+    if (mode === 'targeted' && op !== 'add') {
+      const why = e ? blockedWhy(e) : (roles.loaded.has(F) ? `${F} is loaded by the app` : roles.cooling.has(F) ? `${F} was just switched away from` : null);
+      if (why) throw new DeferredError(why);
+    }
     guard?.(op, F);
   };
+  // S3: right before a re-link or a delete, look at the target again. A changed inode or mtime, or a `.tmp` sibling, means the app
+  // (or a parked session) wrote it since the inventory: leave it, it is owed to the next pass.
+  const restat = (e) => {
+    try {
+      const st = lstatSync(e.path, { bigint: true });
+      if (`${st.dev}:${st.ino}` !== e.inoKey || st.mtimeNs !== e.mtimeNs) return 'changed since it was read';
+      if (existsSync(`${e.path}.tmp`)) return 'being saved (a .tmp sibling exists)';
+    } catch { return 'gone since it was read'; }
+    return null;
+  };
+  const changedSince = (e) => { o.testHook?.('before-act', e); return restat(e); };
   const owe = (id, why, folder) => { rep.counts.deferred++; rep.owed.push({ id, why, ...(folder ? { folder } : {}) }); };
   const note = (id, msg) => rep.notes.push({ id, msg });
 
@@ -302,6 +362,7 @@ function run(group, o, rep) {
     } else throw e;
   }
 
+  if (mode === 'full' && !rep.aborted) { state.held = {}; state.heldRun = 0; }   // the app is stopped: no parked session is left
   state.lastRectify = new Date(ctx.now()).toISOString();
   return rep;
 
@@ -316,44 +377,99 @@ function run(group, o, rep) {
 
     if (plan.delete) {
       if (mode === 'live') { owe(plan.id, 'delete'); return; }
-      doDelete(plan);
-      rep.counts.delete++;
+      const done = doDelete(plan);
+      if (done) rep.counts.delete++;
       return;
     }
     if (plan.resurrect) {
       if (mode === 'live') { owe(plan.id, 'resurrect'); return; }
+      if (mode === 'targeted') {
+        const pinned = [...plan.del.keys()].find((F) => roles.loaded.has(F) || roles.cooling.has(F));
+        if (pinned) { owe(plan.id, 'resurrect', pinned); return; }
+      }
       doResurrect(plan);
       rep.counts.resurrect++;
     }
 
+    if (mode === 'targeted') noteConflict(plan);
+
     const folders = new Set(plan.P);
     let acted = false;
+    // S1: the version a pass of ours left in the other folders, replaced by the next save of the same folder's session (the loaded app,
+    // or a parked session), is an ancestor of that save: it needs no backup. Only a copy from another history (a stale continuation,
+    // a switch flush, field drift) is backed up.
+    const prevWin = state.records?.[plan.id]?.win;
+    const supersedes = (loser) => mode === 'targeted' && !!prevWin && prevWin.ino === loser.inoKey && prevWin.f === plan.W.folder
+      && (roles.loaded.has(plan.W.folder) || isHeld(plan.W));
     for (const loser of plan.losers) {
       if (mode === 'live' && live.has(loser.folder)) { owe(plan.id, 'split-loser-live', loser.folder); continue; }
-      if (relink(plan.W, loser)) { acted = true; rep.counts.split++; } else owe(plan.id, 'relink-busy', loser.folder);
+      const why = blockedWhy(loser);
+      if (why) { owe(plan.id, roles.loaded.has(loser.folder) ? 'split-loser-loaded' : 'split-loser-pinned', loser.folder); continue; }
+      const r = relink(plan.W, loser, supersedes(loser));
+      if (r === true) { acted = true; rep.counts.split++; } else owe(plan.id, r === false ? 'relink-busy' : 'relink-changed', loser.folder);
     }
     for (const F of plan.add) {
       if (addLink(plan.W, F, plan.id)) { folders.add(F); acted = true; rep.counts.add++; }
     }
     if (!acted && !plan.losers.length && !plan.add.length) rep.counts.ok++;
 
+    // the inode of "our" copy: a winner that is a parked session's file (held, in a free folder) is not ours to remember, or the next pass
+    // would stop seeing it as held
+    const heldWinner = mode === 'targeted' && !roles.loaded.has(plan.W.folder) && !roles.cooling.has(plan.W.folder) && !!blockedWhy(plan.W);
     state.records[plan.id] = {
-      home: plan.home, folders: [...folders].sort(), ino: plan.W.inoKey, mtimeMs: plan.W.mtimeMs, keys: plan.keys,
+      home: plan.home, folders: [...folders].sort(), ino: heldWinner ? (state.records[plan.id]?.ino ?? null) : plan.W.inoKey, mtimeMs: plan.W.mtimeMs, keys: plan.keys,
+      win: { f: plan.W.folder, ino: plan.W.inoKey },   // the last winner, for the ancestor test above
     };
+  }
+
+  /**
+   * The app continued a copy it loaded stale: the winner is in a loaded folder under an inode the app made after it loaded the folder,
+   * and another folder holds a DIFFERENT newer version than the one the app loaded. Still the newest wins (the user's last action is
+   * there and the shared transcript holds every turn); the loser is backed up when it is replaced, and the case is recorded for
+   * `accounts status`. `cliChanged`: the loser points at another transcript (a /clear), the one case worth a toast.
+   */
+  function noteConflict(plan) {
+    if (!plan.losers.length || !plan.W) return;
+    for (const L of roles.loaded) {
+      const snap = state.loadedSnapshot?.[L]?.[plan.id.toLowerCase()];
+      const mine = plan.entries.get(L);
+      if (!snap || !mine || mine.inoKey === snap || mine.inoKey !== plan.W.inoKey) continue;
+      const displaced = plan.losers.filter((loser) => loser.folder !== L && loser.inoKey !== snap);
+      if (!displaced.length) continue;
+      state.conflicts ||= {};
+      const prev = state.conflicts[plan.id];
+      if (prev && prev.winnerIno === plan.W.inoKey && displaced.every((l) => prev.loserInos?.includes(l.inoKey) || prev.loserIno === l.inoKey)) continue;
+      // N1: one entry names every displaced copy (the first is `loser`, all are in `losers`), not only the last one met
+      const c = {
+        at: new Date(ctx.now()).toISOString(), winner: L, loser: displaced[0].folder, losers: displaced.map((l) => l.folder),
+        winnerIno: plan.W.inoKey, loserIno: displaced[0].inoKey, loserInos: displaced.map((l) => l.inoKey),
+        cliChanged: displaced.some((l) => summarize(l).cli !== (plan.summary?.cli ?? null)), notified: false,
+      };
+      state.conflicts[plan.id] = c;
+      (rep.conflicts ||= []).push({ id: plan.id, ...c });
+    }
   }
 
   /* ---------------- operations ---------------- */
 
-  function relink(W, loser) {
-    check('relink', loser.folder);
+  /** true: re-linked. false: busy (EPERM and the like). A string: the target changed since the inventory, left as it is. */
+  function relink(W, loser, superseded = false) {
+    check('relink', loser.folder, loser);
     const dst = loser.path;
-    if (sha256File(dst) !== sha256File(W.path)) backupCopy(ctx, dst, { reason: 'split-loser', folder: loser.folder, name: loser.name });
+    const ch = changedSince(loser);
+    if (ch) { note(loser.id, `${loser.folder}: ${ch}; next pass`); return ch; }
+    if (!superseded && sha256File(dst) !== sha256File(W.path)) backupCopy(ctx, dst, { reason: 'split-loser', folder: loser.folder, name: loser.name });
     const tmp = join(dirname(dst), `.session-sync-link-${randomBytes(6).toString('hex')}`);
     let err = null;
     for (let i = 0; i < 3; i++) {
+      // N8: look at the target once more right before it is replaced (the backup of a big record takes a while)
+      const late = restat(loser);
+      if (late) { note(loser.id, `${loser.folder}: ${late}; next pass`); return late; }
       try { linkSync(W.path, tmp); renameSync(tmp, dst); err = null; break; } catch (e) {
         err = e;
         try { unlinkSync(tmp); } catch { /* not created */ }
+        // N9: the winner went away between the plan and the link: owed, not a failed pass
+        if (e.code === 'ENOENT') { note(loser.id, `${loser.folder}: the winner is gone; next pass`); return 'the winner changed since it was read'; }
         if (!['EPERM', 'EBUSY', 'EACCES'].includes(e.code)) throw e;
         sleepSync(200);
       }
@@ -378,25 +494,43 @@ function run(group, o, rep) {
     try { writeFileSync(join(folderPath[F], name), content, { flag: 'wx' }); } catch (e) { if (e.code !== 'EEXIST') throw e; }
   }
 
+  /** Every name that may go is removed (after one backup copy per inode); returns false when some name was left (targeted pass: owed). */
   function doDelete(plan) {
-    // every distinct inode is COPIED once, then every name goes
-    const seen = new Set();
-    for (const e of plan.entries.values()) {
-      if (seen.has(e.inoKey)) continue;
-      seen.add(e.inoKey);
-      backupCopy(ctx, e.path, { reason: 'delete', folder: e.folder, name: e.name });
-    }
     const all = [...plan.del.values()].flat();
     const top = all.reduce((a, b) => (b.ms > a.ms ? b : a));
     const content = String(Math.round(top.ms));
     const names = new Set([top.name, `deleted_${plan.uuid}`]);
+    const left = [];
+    const goers = [];
     for (const e of plan.entries.values()) {
-      check('delete', e.folder);
+      const why = blockedWhy(e);
+      if (why) { left.push(e); owe(plan.id, 'delete', e.folder); } else goers.push(e);
+    }
+    // every distinct inode that goes is COPIED once, then its names go
+    const seen = new Set();
+    for (const e of goers) {
+      if (seen.has(e.inoKey)) continue;
+      seen.add(e.inoKey);
+      backupCopy(ctx, e.path, { reason: 'delete', folder: e.folder, name: e.name });
+    }
+    for (const e of goers) {
+      check('delete', e.folder, e);
+      const ch = changedSince(e);
+      if (ch) { left.push(e); owe(plan.id, 'delete-changed', e.folder); note(plan.id, `${e.folder}: ${ch}; next pass`); continue; }
       unlinkSync(e.path);
     }
     const holders = new Set([...plan.P, ...(state.records[plan.id]?.folders ?? []).filter((k) => groupKeys.includes(k))]);
-    for (const F of holders) for (const n of names) writeTombstone(F, n, content);
+    let tombsLeft = false;
+    for (const F of holders) {
+      if (mode === 'targeted' && (roles.loaded.has(F) || roles.cooling.has(F))) {
+        if (![...names].every((n) => existsSync(join(folderPath[F], n)))) tombsLeft = true;
+        continue;
+      }
+      for (const n of names) writeTombstone(F, n, content);
+    }
+    if (left.length || tombsLeft) { if (tombsLeft && !left.length) owe(plan.id, 'delete-tombstone'); return false; }
     delete state.records[plan.id];
+    return true;
   }
 
   function doResurrect(plan) {

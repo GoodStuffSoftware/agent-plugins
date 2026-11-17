@@ -245,12 +245,14 @@ export function createStopWatch(ctx, o = {}) {
   let prevS1 = null; let downAt = 0; let nulls = 0; let nullSince = 0; let warned = false;
   let birth = 0;
   return {
-    /** @param {{probeProcesses?: boolean, now?: number}} [opts] force a probe; a caller's own reading of the clock */
+    /** @param {{probeProcesses?: boolean, now?: number}} [opts] force a probe (true) or none (false); a caller's own reading of the clock */
     read(opts = {}) {
       const now = opts.now ?? clock();
+      // By default a reading with the lock marker gone probes (a hidden PowerShell on Windows), because the stop is being
+      // confirmed. A loop that has already settled on "closed" passes probeProcesses:false and probes only now and then (S4).
       const probe = opts.probeProcesses ?? (!lockfilePresent(ctx) || now - lastProbe >= probeEveryMs);
       if (probe) lastProbe = now;
-      const app = o.status ? o.status(ctx) : appState({ ctx, probeProcesses: probe, now: ctx.now() });
+      const app = o.status ? o.status(ctx, { probeProcesses: probe }) : appState({ ctx, probeProcesses: probe, now: ctx.now() });
       if (typeof app.s1 !== 'boolean') return app;   // an injected status with no signals: nothing to say
       if (prevS1 === true && !app.s1) { downAt = now; log('app lock marker gone (S1 true -> false)'); }
       if (prevS1 === false && app.s1) {
@@ -311,6 +313,98 @@ export function liveFolders(app, folders, state) {
   }
   state.live.folders = [...live].sort();
   return live;
+}
+
+/* ------------------------------------------------------------------ folder roles (account switches) */
+
+/**
+ * The app reads an account's folder when it LOADS it (that account signs in) and holds every record in memory from then on,
+ * so what may be written depends on what the app has loaded, not on what it ever wrote:
+ *   loaded   the signed-in account's folders (all its orgs; the current org is not visible): ADD only
+ *   cooling  the account that was signed in a moment ago: its sessions still flush and tear down into its folder for a few
+ *            seconds after the switch, so it is ADD only until `G_SWITCH_MS` has passed
+ *   free     every other folder of the group: the app does not hold it, so it can be kept fully current
+ * An unknown signed-in account makes every folder loaded (the old rule). A stopped app loads nothing.
+ */
+export const G_SWITCH_MS = 15 * 1000;
+
+/** The record names in a folder as `{id: dev:ino}`: what the app most likely loads when it opens the folder. */
+export function snapshotFolder(path) {
+  const out = {};
+  let names;
+  try { names = readdirSync(path); } catch { return out; }
+  for (const n of names) {
+    const m = /^(local_[0-9a-f-]{36})\.json$/i.exec(n);
+    if (!m) continue;
+    try { const s = statSync(join(path, n), { bigint: true }); out[m[1].toLowerCase()] = `${s.dev}:${s.ino}`; } catch { /* vanished */ }
+  }
+  return out;
+}
+
+/**
+ * Note the signed-in account in `state.signed` = {acct, at, prev, cooling: {acct: untilMs}, unloadedAt: {acct: ms}}.
+ * Returns {changed, prev}. An unknown account changes nothing; the first sight of an account is not a switch.
+ */
+export function noteSwitch(state, signedIn, now) {
+  if (!signedIn) return { changed: false, prev: null };
+  const cur = state.signed;
+  if (!cur?.acct) { state.signed = { acct: signedIn, at: now, prev: null, cooling: {}, unloadedAt: {} }; return { changed: false, prev: null }; }
+  if (cur.acct === signedIn) return { changed: false, prev: cur.prev ?? null };
+  const cooling = {};
+  for (const [a, until] of Object.entries(cur.cooling ?? {})) if (until > now && a !== signedIn) cooling[a] = until;
+  cooling[cur.acct] = now + G_SWITCH_MS;
+  const unloadedAt = { ...(cur.unloadedAt ?? {}), [cur.acct]: now };
+  delete unloadedAt[signedIn];
+  state.signed = { acct: signedIn, at: now, prev: cur.acct, cooling, unloadedAt };
+  return { changed: true, prev: cur.acct };
+}
+
+/**
+ * Roles of the group's folders for a pass (call noteSwitch first). `gainedKeys` are group folders that no full pass has
+ * covered yet (a newly linked account): they stay ADD only until the full pass has taken its safety backup.
+ * @returns {{loaded:Set<string>, cooling:Set<string>}} folder keys; a key in neither set is free
+ */
+export function folderRoles(app, folders, state, now, gainedKeys = []) {
+  const loaded = new Set(); const cooling = new Set();
+  if (!app.running) return { loaded, cooling };
+  if (!app.signedIn) { for (const f of folders) loaded.add(f.key); return { loaded, cooling }; }
+  for (const f of folders) {
+    if (f.acct === app.signedIn) loaded.add(f.key);
+    else if ((state.signed?.cooling?.[f.acct] ?? 0) > now) cooling.add(f.key);
+  }
+  for (const k of gainedKeys) if (!loaded.has(k)) cooling.add(k);
+  return { loaded, cooling };
+}
+
+/**
+ * From when a name in an unloaded folder counts as written by a PARKED session (a session of that account that is still running):
+ * only from an unload this watcher saw during THIS app run (`state.signed.unloadedAt`). An unknown unload time means nothing is held:
+ * every write the app made earlier in the run is then field drift, which must converge to the newest copy (B1). A parked session only
+ * exists after a switch away from its account, and a restart of the app ends every parked session.
+ * @returns {number} ms, or Infinity (never held)
+ */
+export function heldSinceOf(state, acct, appStartedAtMs = 0) {
+  const t = state.signed?.unloadedAt?.[acct];
+  return typeof t === 'number' && t >= appStartedAtMs ? t : Infinity;
+}
+
+/**
+ * Is this record name (in a folder that is neither loaded nor cooling) a parked session's file? Pure.
+ *   - `state.held[id][folder] === ino`: seen as held before (S3: a link another folder took to it does not end the hold, nlink is not used);
+ *   - else not an inode a pass of ours left there (`state.records[id].ino`), alone (nlink 1) and written after the folder was unloaded.
+ * @param {{id:string, folder:string, inoKey:string, nlink:number, mtimeMs:number}} e
+ */
+export function nameIsHeld(state, e, appStartedAtMs = 0) {
+  if (state.held?.[e.id]?.[e.folder] === e.inoKey) return true;
+  const ours = state.records?.[e.id]?.ino;
+  return ours !== e.inoKey && e.nlink === 1 && e.mtimeMs > heldSinceOf(state, String(e.folder).split('/')[0], appStartedAtMs);
+}
+
+/** When the next cooling period ends (ms), or 0 when none is running. */
+export function coolingEndsAt(state, now) {
+  let t = 0;
+  for (const until of Object.values(state.signed?.cooling ?? {})) if (until > now && (!t || until < t)) t = until;
+  return t;
 }
 
 function folderLooksLive(f, startedAtMs, tasksSha) {

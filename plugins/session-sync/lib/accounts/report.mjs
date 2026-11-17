@@ -13,7 +13,7 @@ import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadState, accPath, readJson, rollbackActive } from './state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, RECORD } from './folders.mjs';
-import { appState } from './appstate.mjs';
+import { appState, nameIsHeld } from './appstate.mjs';
 import { owedWork } from './pass.mjs';
 import { waiterStatus } from './waiter.mjs';
 import { accountLists, tasksDueCatchUp } from './lists.mjs';
@@ -130,6 +130,39 @@ export function groupHealth(group) {
 }
 
 /**
+ * Conversations a PARKED session of an account that is no longer loaded still writes (a direct switch between two signed-in
+ * accounts with a conversation running): the name in the other folder is not one a pass of ours made, and is newer than the
+ * switch. When the loaded account holds an idle copy of the same id it is listed as such. Read-only.
+ */
+export function heldConversations(group, state, app) {
+  if (!app.running || !app.signedIn) return [];
+  const loaded = new Set(group.filter((f) => f.acct === app.signedIn).map((f) => f.key));
+  const stat = (p) => { try { return statSync(p, { bigint: true }); } catch { return null; } };
+  const inLoaded = new Set();
+  for (const f of group) {
+    if (!loaded.has(f.key)) continue;
+    let names = []; try { names = readdirSync(f.path); } catch { /* unreadable */ }
+    for (const n of names) { const m = RECORD.exec(n); if (m) inLoaded.add(`local_${m[1].toLowerCase()}`); }
+  }
+  const out = [];
+  for (const f of group) {
+    if (loaded.has(f.key)) continue;
+    let names = []; try { names = readdirSync(f.path); } catch { /* unreadable */ }
+    for (const n of names) {
+      const m = RECORD.exec(n);
+      if (!m) continue;
+      const id = `local_${m[1].toLowerCase()}`;
+      const st = stat(join(f.path, n));
+      if (!st) continue;
+      // the same rule the engine uses (appstate.nameIsHeld): recorded as held, or alone and written after an unload seen in this app run
+      if (!nameIsHeld(state, { id, folder: f.key, inoKey: `${st.dev}:${st.ino}`, nlink: Number(st.nlink), mtimeMs: Number(st.mtimeNs / 1000000n) }, app.startedAtMs ?? 0)) continue;
+      out.push({ id: id8(id.slice(6)), runningIn: id8(f.acct), idleCopyIn: inLoaded.has(id) ? id8(app.signedIn) : null });
+    }
+  }
+  return out;
+}
+
+/**
  * Read-only facts for `accounts status`. `o.probe` (default true) allows the
  * PowerShell process probe; `o.lists` (default true) includes the claude.ai lists.
  */
@@ -172,14 +205,24 @@ export function collectStatus(ctx, o = {}) {
     lists,
     tasksDue,
     unknownKeys: unknown,
+    // a restart of Claude is asked for only by an account that is not linked yet: not linked at all, or joined a linked group later
+    gainedAccounts: state.linked ? [...new Set(group.filter((f) => !new Set((state.group ?? []).map((k) => String(k).split('/')[0])).has(f.acct)).map((f) => id8(f.acct)))] : [],
+    switchState: state.signed?.acct ? {
+      signedIn: id8(state.signed.acct), previous: id8(state.signed.prev),
+      cooling: Object.entries(state.signed.cooling ?? {}).filter(([, t]) => t > ctx.now()).map(([a]) => id8(a)),
+    } : null,
+    conflicts: Object.entries(state.conflicts ?? {}).map(([id, c]) => ({ id: id8(id.slice(6)), at: c.at, winner: id8(String(c.winner).split('/')[0]), loser: id8(String(c.loser).split('/')[0]), cliChanged: !!c.cliChanged })),
+    held: group.length >= 2 ? heldConversations(group, state, app) : [],
   };
 }
 
 export function formatStatus(st, { all = false } = {}) {
   const out = [];
   // the one line the user needs when a link is waiting for them to quit Claude
-  if (st.goLive?.status === 'waiting' && st.goLive.phase === 'wait-stop') out.push(WAIT_NOTE);
-  else if (!st.linked && st.app?.running && st.waiter?.alive && (st.waiter.reasons ?? []).includes('link')) out.push(RESTART_LEAD_WAITER);
+  // only while an account is NOT linked yet (never linked, or a new account joined later): once linked nothing asks for a restart
+  const unlinked = !st.linked || (st.gainedAccounts ?? []).length > 0;
+  if (!st.linked && st.goLive?.status === 'waiting' && st.goLive.phase === 'wait-stop') out.push(WAIT_NOTE);
+  else if (unlinked && st.app?.running && st.waiter?.alive && (st.waiter.reasons ?? []).includes('link')) out.push(RESTART_LEAD_WAITER);
   const signed = st.accounts.find((a) => a.signedIn);
   out.push(`Accounts: ${st.accounts.map((a) => `${a.id}${a.signedIn ? '*' : ''}`).join(', ') || 'none'}${signed ? ' (* signed in)' : ''}; ${plural(st.folders.length, 'folder')}.`);
   if (st.accounts.length < 2) { out.push('Only one account on this machine: nothing to link.'); return out; }
@@ -190,6 +233,9 @@ export function formatStatus(st, { all = false } = {}) {
   out.push(`App: ${st.app.running ? 'running' : st.app.stopped ? 'stopped' : 'unknown'}${st.app.signedIn ? `, signed in ${st.app.signedIn}` : ''}. Owed: ${st.owed ? 'yes' : 'no'}.`);
   if (st.app.staleLock) out.push('A Claude lock marker is left behind with no Claude process running (a crash or power loss). Start Claude once and quit it from the tray icon; the marker is then removed and the link can run.');
   out.push(`Waiter: ${st.waiter.alive ? `armed (pid ${st.waiter.pid}; ${st.waiter.reasons.join(', ') || 'no reason'})` : 'none'}.`);
+  if (st.linked && st.switchState) out.push(`Account switch: signed in ${st.switchState.signedIn}${st.switchState.previous ? `, previous ${st.switchState.previous}` : ''}${st.switchState.cooling.length ? `; just switched away from ${st.switchState.cooling.join(', ')} (kept as it is for a few seconds)` : ''}.`);
+  for (const c of st.conflicts ?? []) out.push(`Conversation ${c.id} was continued from an older copy in ${c.winner}; the other version (from ${c.loser}) is kept in the session-sync backups${c.cliChanged ? ' (it pointed at a different transcript)' : ''}.`);
+  for (const h of st.held ?? []) out.push(`Conversation ${h.id} is still running in ${h.runningIn}${h.idleCopyIn ? `; an idle copy shows in ${h.idleCopyIn}` : ''}. Finish or stop it before switching straight between two signed-in accounts.`);
   if (st.rollbackActive) out.push('A rollback is running or was interrupted: no pass runs until it finishes (run: accounts rollback again).');
   if (st.lastPass) out.push(`Last pass: ${st.lastPass.op} ${st.lastPass.ok ? 'ok' : `failed (${st.lastPass.reason ?? st.lastPass.error ?? 'unknown'})`} at ${st.lastPass.at}.`);
   if (st.goLive) out.push(formatGoLive(st.goLive));

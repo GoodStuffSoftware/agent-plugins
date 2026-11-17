@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased (0.5.3)
+
+### Added
+
+* **session-sync:** switching accounts in the Claude desktop app after the link is seamless. Sign out, sign in to the other account, switch back, sign out with conversations running, or sign in with a never-linked account: the account you just signed in to shows every conversation, current and resumable, with no restart and no quit prompt. The waiter process is now also a watcher (`accounts wait`, started by the session hooks with Claude's first Code session through the hidden launcher): it follows the app's config (which account is signed in) and the folders, and about 2 seconds after a save every folder the app has not loaded is current. The folder the app has loaded only gains new names; the account you just left is left alone for 15 seconds after a switch; a conversation a parked session still writes in the account you left is never re-linked or deleted there. Events are only hints: a 30-second poll does the same work.
+* **session-sync:** a conversation saved at the very moment of a switch and then continued from the older copy is resolved without a prompt: the newest version wins everywhere, the displaced one is copied to `rectify-backups`, and `accounts status` lists the case. A notification appears only when the older copy pointed at a different transcript. A conversation still running in the account that was left is listed in `accounts status` (an idle copy in the signed-in account is reported, not prompted).
+* **session-sync:** the loaded folder is never rewritten, and every re-link or delete re-checks its target right before acting (changed inode or modified time, or a `.tmp` sibling, leaves it for the next pass).
+* **session-sync:** test coverage for the switch cases (fixtures, a seeded random sweep of switch/save/delete/quit sequences, the watcher loop with injected events, and the session-start hook), and a rehearsal in `scripts/verify-accounts-scratch.mjs` that runs every switch case over a scratch copy of a store.
+
+### Fixed (review round)
+
+* **session-sync:** a write the app made after the last time a folder was unloaded is only "held" (kept, never overwritten) when the unload time is known. With no known unload (an upgrade from 0.5.2, a switch before the first Code session, a watcher that was not running) the copies that drifted apart in the live store now converge on the newest write, and the quit pass no longer overwrites it. A held name is recorded when it is seen, so a later link to it from another folder does not release it.
+* **session-sync:** a conversation that saves every turn no longer fills `rectify-backups`: the previous version of the same lineage, which the app itself replaced, is not backed up each time. A version from another history, and every displaced copy of a conflict, is still backed up.
+* **session-sync:** a pass reads and parses only the records that changed since the last one (a cache keyed by file, inode, modified time and size); an idle pass parses none.
+* **session-sync:** whatever the waiter runs while Claude is closing or closed (the link, an unlink, the full pass at the quit) is announced with the progress icon and balloons (a notification on macOS and Linux; `config progressIcon false` turns it off), and a settled, closed watcher asks the system about Claude only every 10 minutes instead of every 30 seconds.
+* **session-sync:** a waiter left by another build is replaced: the waiter claim records a hash of the plugin code, and `accounts rectify`, push and pull end (never mid-pass, only when proven to be a waiter) a watcher whose version or code differs. The SessionStart hook still only joins a waiter.
+* **session-sync:** a rewrite of `config.json` that does not change the signed-in account no longer triggers an immediate pass, and a watcher that cannot read its claim once (an antivirus scan) looks again before it gives up.
+
+### Changed
+
+* **session-sync:** once the accounts are linked nothing asks you to restart or quit Claude, including `accounts status` (its first line no longer reads "Restart Claude to sync your accounts"). The only such prompt is the one-time notice for an account that is not linked yet; it is shown once per account.
+* **session-sync:** the waiter no longer exits after the link or a full pass while Claude runs: it stays as the watcher and runs one full pass per quit, only when one is owed.
+
 ## 0.5.2 (2026-11-16)
 
 ### Fixed

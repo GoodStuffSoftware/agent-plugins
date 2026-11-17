@@ -11,6 +11,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { PLUGIN_VERSION, codeHash } from '../lib/accounts/version.mjs';
 import { readJson } from '../lib/accounts/state.mjs';
 import { pairKey } from '../lib/accounts/folders.mjs';
 import { recordName, nlinkOf } from './fixtures/store.mjs';
@@ -110,8 +112,10 @@ test('T20 auto with the app running: arms the waiter, the link runs after the ap
   assert.equal(w.state()?.linked ?? false, false, 'nothing is linked while the app runs');
   w.setApp({ running: false });
   assert.equal(waitFor(() => w.state()?.linked === true), true, 'the waiter linked after the app exited');
-  assert.equal(waitFor(() => !existsSync(join(w.acc, 'waiter.claim'))), true, 'and exited');
-  assert.equal(readJson(join(w.acc, 'last-pass.json'))?.ok, true);
+  assert.equal(waitFor(() => readJson(join(w.acc, 'last-pass.json'))?.ok === true), true, 'and said so');
+  // the waiter stays on as the account-switch watcher, with no reason left but "watch"
+  assert.equal(waitFor(() => (readJson(join(w.acc, 'waiter.json'))?.reasons ?? []).join() === 'watch'), true, 'it keeps watching');
+  assert.equal(existsSync(join(w.acc, 'waiter.claim')), true);
 });
 
 /* ------------------------------------------------------------------ accounts commands */
@@ -237,6 +241,30 @@ test('accounts rectify: a manual run reports the pass and the remote check; not 
   const j = JSON.parse(r.stdout);
   assert.equal(j.ok, true);
   assert.ok('remoteCheck' in j);
+});
+
+test('S5 accounts rectify ends a watcher that runs other code (same version, another code hash) so a new one can take its place; a watcher with the same code is left alone', () => {
+  const w = cworld();
+  assert.equal(w.run(['accounts', 'answer', 'yes']).status, 0);
+  assert.equal(w.state().linked, true);
+  const spawned = spawnSync(process.execPath, ['-e', `const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)','accounts','wait'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)`], { encoding: 'utf8', windowsHide: true });
+  const pid = Number(String(spawned.stdout).trim());
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    const put = (hash) => {
+      const iso = new Date().toISOString();
+      writeFileSync(join(w.acc, 'waiter.json'), JSON.stringify({ pid, armedAt: iso, heartbeatAt: iso, reasons: ['watch'] }));
+      writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid, at: Date.now(), version: PLUGIN_VERSION, hash }));
+    };
+    put(codeHash());
+    assert.equal(w.run(['accounts', 'rectify']).status, 0);
+    assert.equal(alive(), true, 'same version and same code: left alone');
+    put('0123456789abcdef');
+    const r = w.run(['accounts', 'rectify']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(waitFor(() => !alive(), { timeoutMs: 5000 }), true, 'the stale watcher was ended');
+    assert.notEqual(readJson(join(w.acc, 'waiter.claim'), null)?.pid, pid, 'its claim is dropped (a fresh watcher may already hold it)');
+  } finally { try { process.kill(pid); } catch { /* gone */ } }
 });
 
 test('accounts rollback: no backup is exit 3; --dry-run after a link changes nothing', () => {

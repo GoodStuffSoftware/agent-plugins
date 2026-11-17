@@ -41,6 +41,7 @@ export function emptyState(store = null) {
     v: 1, store, linked: false, group: [], pairs: {}, backupId: null, backups: [], records: {},
     live: { startedAtMs: 0, folders: [] }, tasksWritten: {}, lastSignedIn: {},
     lastRectify: null, lastFullPass: null, fullPassOwed: false, lastRemoteCheck: null,
+    signed: null, loadedSnapshot: {}, conflicts: {}, held: {}, heldRun: 0,
   };
 }
 

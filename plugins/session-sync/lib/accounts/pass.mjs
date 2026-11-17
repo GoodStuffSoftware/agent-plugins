@@ -1,8 +1,9 @@
 /**
  * pass.mjs - the passes that tie the engine and the merges together (plan 5.13, 5.15).
  *
- *   livePass()   the app runs: only non-live writes, no deletes, no global settings.
- *                Anything deferred sets state.fullPassOwed (the caller arms the waiter).
+ *   livePass()   the app runs: a TARGETED pass. The folders the app has loaded (the signed-in account's, and for a few seconds
+ *                the one just switched away from) get ADD only; every other folder of the group is kept fully current, deletes
+ *                included. No global settings. Anything deferred sets state.fullPassOwed (the caller arms the waiter).
  *   fullPass()   the app is stopped (S1 and S2 false), under accounts.lock. The first
  *                one for a group is the LINK: the one-time backup comes first and is
  *                verified; a failed verification aborts the link before any change.
@@ -22,7 +23,7 @@ import {
   loadState, saveState, withAccountsLock, accPath, journalStart, journalRead, journalClear, tickMutation, rollbackActive,
 } from './state.mjs';
 import { listFolders, groupOf, answerPairs, homeOf } from './folders.mjs';
-import { appState, liveFolders, makeS1Guard, noteSignedIn, AppRunningError } from './appstate.mjs';
+import { appState, makeS1Guard, noteSignedIn, AppRunningError, noteSwitch, folderRoles, snapshotFolder } from './appstate.mjs';
 import { rectify, inventory } from './rectify.mjs';
 import { takeBackup, backupCopy } from './backup.mjs';
 import { mergeTasks, mergeBacklog, splitByOrigin } from './tasks.mjs';
@@ -143,20 +144,29 @@ export async function livePass(ctx, o = {}) {
     if (!cur) return { ...rep, skipped: 'rollback-active' };
     if (!cur.state.linked) return { ...rep, skipped: 'not-linked' };
     if (cur.group.length < 2) return { ...rep, skipped: 'no-group' };
-    const { state, folders, group } = cur;
+    const { state, group } = cur;
     try {
-      noteSignedIn(state, app.signedIn, ctx.now());
-      const live = liveFolders(app, folders, state);
-      rep.live = [...live];
-      const rec = rectify(group, { mode: 'live', live, ctx, state, locked: true, remoteList: o.remoteList });
+      const now = ctx.now();
+      noteSignedIn(state, app.signedIn, now);
+      const sw = noteSwitch(state, app.signedIn, now);
+      const roles = folderRoles(app, group, state, now, group.filter((f) => !(state.group ?? []).includes(f.key)).map((f) => f.key));
+      // what the app most likely loaded when it opened the signed-in account's folders: a switch, or a new app run
+      if (app.signedIn && (sw.changed || state.signed.snapRun !== app.startedAtMs)) {
+        state.loadedSnapshot = {};
+        for (const f of group) if (f.acct === app.signedIn) state.loadedSnapshot[f.key] = snapshotFolder(f.path);
+        state.signed.snapRun = app.startedAtMs;
+      }
+      const pinned = new Set([...roles.loaded, ...roles.cooling]);
+      rep.live = [...roles.loaded]; rep.cooling = [...roles.cooling]; rep.switched = sw.changed;
+      const rec = rectify(group, { mode: 'targeted', roles, ctx, state, locked: true, remoteList: o.remoteList, appStartedAtMs: app.startedAtMs, testHook: o.testHook });
       rep.rectify = rec;
       if (rec.skipped) return { ...rep, skipped: rec.skipped };
-      // The scheduler holds ONE task file (the signed-in account's) and drops it on a switch, so for
-      // scheduled-tasks.json only the signed-in account's folders are live. The sticky set (parked sessions that keep
-      // writing records) must not keep a switched-away account's task file stale (S5: a catch-up would fire twice).
-      const taskLive = app.signedIn ? new Set(group.filter((f) => f.acct === app.signedIn).map((f) => f.key)) : live;
-      rep.tasks = mergeTasks(group, { mode: 'live', ctx, state, live: taskLive });
-      rep.backlog = mergeBacklog(group, { mode: 'live', ctx, state, live });
+      // a group that gained a folder (an account linked later) needs a full pass: it takes the safety backup and finishes the new folders
+      if (group.some((f) => !(state.group ?? []).includes(f.key))) state.fullPassOwed = true;
+      // The scheduler holds ONE task file and drops it on a switch, so scheduled-tasks.json of a loaded or just-left folder is not
+      // written; every other folder gets it at once (so a switch back does not re-fire a catch-up, S5).
+      rep.tasks = mergeTasks(group, { mode: 'live', ctx, state, live: pinned });
+      rep.backlog = mergeBacklog(group, { mode: 'live', ctx, state, live: pinned });
       rep.settings = mergeSettings(group, { mode: 'live', ctx, state, signedIn: app.signedIn });
       rep.memory = mergeCoworkMemory(group, { mode: 'live', ctx, state });
       const owed = rec.owed.length > 0 || rep.tasks.owed.length > 0 || rep.backlog.owed.length > 0
@@ -235,7 +245,7 @@ export async function unlink(ctx, o = {}) {
       const yes = Object.entries(state.pairs ?? {}).filter(([, v]) => v?.answer === 'yes').map(([k]) => k);
       answerPairs(state, yes, 'no', 'unlink', ctx.now());
       state.linked = false; state.group = []; state.records = {}; state.tasksWritten = {};
-      state.live = { startedAtMs: 0, folders: [] };
+      state.live = { startedAtMs: 0, folders: [] }; state.loadedSnapshot = {}; state.conflicts = {};
       state.fullPassOwed = false; state.lastUnlink = iso(ctx);
       journalClear(ctx);
       return { ...rep, ok: true };
