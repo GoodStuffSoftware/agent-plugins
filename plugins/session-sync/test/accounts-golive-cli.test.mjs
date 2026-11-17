@@ -232,7 +232,7 @@ test('SessionStart hook: a failed go-live is not restarted', () => {
 test('scope: once the accounts are linked nothing asks the user to restart or quit; owed work waits silently', () => {
   const w = cworld();
   w.setApp({ running: true, signedIn: A, startedAtMs: 1 });
-  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; s.fullPassOwed = true; });
+  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; s.group = [w.fA.key, w.fB.key]; s.fullPassOwed = true; });
   mkdirSync(w.acc, { recursive: true });
   writeFileSync(join(w.acc, 'hook-rectify.stamp'), String(Date.now()));   // the hook does not start a rectify of its own here
   const hook = run(w, ['auto-pull', '--from-hook']);
@@ -255,7 +255,7 @@ test('scope: the restart prompt appears once per new unlinked account, never aft
   assert.match(first, /accounts answer yes[\s\S]*Only after a yes, tell them: Restart Claude to sync your accounts: quit Claude from the tray icon or app menu/);
   assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'not asked again');
   // yes, and the link is done
-  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; });
+  w.putState((s) => { answerPairs(s, [pairKey(A, B)], 'yes', 'cli', Date.now()); s.linked = true; s.group = [w.fA.key, w.fB.key]; });
   writeFileSync(join(w.acc, 'hook-rectify.stamp'), String(Date.now()));
   assert.equal(ask(run(w, ['auto-pull', '--from-hook'])), '', 'no prompt once linked');
   // a third account appears later: it is asked once
