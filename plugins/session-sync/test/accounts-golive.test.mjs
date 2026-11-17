@@ -1535,6 +1535,15 @@ function trayRun(dir, { runnerPid, extra = [] }) {
   return { child, exited, read, until, resultFile };
 }
 
+test('the tray helper never reuses a parameter name as a local variable (PowerShell names are case-insensitive: $icon would overwrite [string]$Icon) and is ASCII only', () => {
+  const src = readFileSync(TRAY_SCRIPT, 'utf8');
+  const params = [...src.match(/param\(([\s\S]*?)\n\)/)[1].matchAll(/\$([A-Za-z]+)\b/g)].map((m) => m[1].toLowerCase());
+  assert.ok(params.includes('icon') && params.includes('log'));
+  const assigned = [...src.matchAll(/^\s*\$([A-Za-z]+)\s*=/gm)].map((m) => m[1]);
+  assert.deepEqual(assigned.filter((a) => params.includes(a.toLowerCase())), [], 'a local assignment shadows a parameter');
+  assert.ok(/^[\x00-\x7F]*$/.test(src), 'ASCII only');
+});
+
 test('progress helper (real PowerShell, dry run): it exits on its own when the runner dies, without a final result', onWin, async () => {
   const dir = join(tmpdir(), `ss-tray-${Date.now()}-a`); mkdirSync(dir, { recursive: true });
   const dead = spawnSync(process.execPath, ['-e', ''], { windowsHide: true });   // a pid that has just ended

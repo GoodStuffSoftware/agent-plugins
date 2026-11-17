@@ -143,8 +143,9 @@ test('T2 real PowerShell probe: a process name that does not exist reads as "not
 });
 
 test('T2 real PowerShell probe: the unmodified command reports a present claude process and ends with the marker', winOnly, () => {
-  // the node test process is renamed in the probe's eyes: probe "node" instead of "claude" so a process is certainly there
-  const spawnFn = (cmd, args, opts) => spawnSync(cmd, args.map((a) => a.replace('-Name claude', '-Name node')), opts);
+  // probe this very node process instead of "claude" so a process whose path is readable is certainly there
+  // (other node.exe processes on the box can be elevated, with an unreadable path, which correctly reads as unknown)
+  const spawnFn = (cmd, args, opts) => spawnSync(cmd, args.map((a) => a.replace('-Name claude', `-Id ${process.pid}`)), opts);
   const r = spawnFn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', WIN_PROBE_SCRIPT], { windowsHide: true, encoding: 'utf8', timeout: 30000 });
   assert.equal(r.status, 0);
   const lines = r.stdout.trim().split(/\r?\n/);

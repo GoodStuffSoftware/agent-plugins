@@ -118,10 +118,11 @@ try {
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
   $script:ni = New-Object System.Windows.Forms.NotifyIcon
-  $icon = $null
-  if ($Icon -and (Test-Path -LiteralPath $Icon)) { try { $icon = New-Object System.Drawing.Icon($Icon) } catch { $icon = $null } }
-  if (-not $icon) { $icon = [System.Drawing.SystemIcons]::Information }
-  $script:ni.Icon = $icon
+  # not named $icon: PowerShell variables are case-insensitive and that would overwrite the [string]$Icon parameter
+  $trayIcon = $null
+  if ($Icon -and (Test-Path -LiteralPath $Icon)) { try { $trayIcon = New-Object System.Drawing.Icon($Icon) } catch { $trayIcon = $null } }
+  if (-not $trayIcon) { $trayIcon = [System.Drawing.SystemIcons]::Information }
+  $script:ni.Icon = $trayIcon
   $script:ni.Text = 'Syncing Claude accounts'
   $script:ni.add_DoubleClick({ Open-Log })
   $script:ni.add_BalloonTipClicked({ Open-Log })
