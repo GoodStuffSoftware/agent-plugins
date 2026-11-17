@@ -59,6 +59,9 @@ async function runSequence(seed) {
   };
   const versions = () => { const s = new Set(); for (const f of [fA, fB]) for (const n of names(f)) s.add(sha(join(f.path, n))); return s; };
   const inoMap = (f) => new Map(names(f).map((n) => [n, inoOf(join(f.path, n))]));
+  const superseded = new Set();
+  /** The app overwrites `id` in the folder of `acct` (a save or a switch flush): what it held there until now is an ancestor of the new version. */
+  const willOverwrite = (a, rid) => { const p = join(folders[a].path, `${rid}.json`); if (existsSync(p)) superseded.add(sha(p)); };
 
   /** A targeted pass with the invariants checked around it. */
   const pass = async (label) => {
@@ -79,7 +82,9 @@ async function runSequence(seed) {
       }
     }
     const vAfter = versions(); const bk = backupShas();
-    for (const v of vBefore) if (!vAfter.has(v)) assert.ok(bk.has(v), `I1 ${label}: a version left the folders without a backup (${v.slice(0, 8)})`);
+    // (S1: a version the app itself overwrote in the folder it saves into is an ancestor of the new one, and the engine does not back up
+    // the other folders' links to it; every other version that leaves still needs its backup)
+    for (const v of vBefore) if (!vAfter.has(v)) assert.ok(bk.has(v) || superseded.has(v), `I1 ${label}: a version left the folders without a backup (${v.slice(0, 8)})`);
     for (const [rid, rec] of Object.entries(loadState(r.ctx).records ?? {})) {
       if (homes.has(rid)) assert.equal(rec.home, homes.get(rid), `S5 ${label}: the home of ${rid} changed`);
       else if (rec.home) homes.set(rid, rec.home);
@@ -95,14 +100,15 @@ async function runSequence(seed) {
     const ids = [...sim.memory.keys()].filter((i) => existsSync(join(f.path, `${i}.json`)));
     const act = rnd();
     let label;
-    if (act < 0.28 && ids.length) { const i = pick(ids); sim.saveFromMemory(i, { title: `s${seed}.${step}` }); label = `save ${i.slice(6, 14)}`; }
+    if (act < 0.28 && ids.length) { const i = pick(ids); willOverwrite(acct, i); sim.saveFromMemory(i, { title: `s${seed}.${step}` }); label = `save ${i.slice(6, 14)}`; }
     else if (act < 0.38) { putRecord(f.path, nextN, { title: `new ${nextN}` }, clock.tick()); sim.load(f); label = `new ${nextN++}`; }
     else if (act < 0.46 && ids.length > 2) { const i = pick(ids); sim.del(f, i); sim.memory.delete(i); label = `delete ${i.slice(6, 14)}`; }
-    else if (act < 0.52 && ids.length) { const i = pick(ids); sim.saveFromMemory(i, { isArchived: rnd() < 0.5 }); label = 'archive'; }
+    else if (act < 0.52 && ids.length) { const i = pick(ids); willOverwrite(acct, i); sim.saveFromMemory(i, { isArchived: rnd() < 0.5 }); label = 'archive'; }
     else if (act < 0.78) {
       const to = acct === A ? B : A;
       const flush = ids.length && rnd() < 0.6 ? [{ id: pick(ids), patch: { title: `flush${step}` } }] : [];
       if (rnd() < 0.3) { sim.signOut(); await pass('signout'); clock.tick(60 * 1000); }
+      for (const fl of flush) willOverwrite(acct, fl.id);
       sim.signIn(to, folders[to], { userData: r.userData, flush });
       acct = to; label = `switch to ${to.slice(0, 1)}`;
     } else if (act < 0.86) { clock.tick(Math.floor(rnd() * 1.5 * G_SWITCH_MS)); label = 'wait'; }

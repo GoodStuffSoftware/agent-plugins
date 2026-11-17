@@ -1526,6 +1526,21 @@ test('progress: macOS and Linux get a notification at the start and one at the e
   assert.equal(n, 1);
 });
 
+test('progress (S4): the waiter words its own start line, and a quiet end (the pass never ran) says nothing on macOS and Linux and nothing extra on Windows', () => {
+  const wins = [];
+  const spawnFn = (cmd, args) => { wins.push(args); return { on() {}, unref() {} }; };
+  createProgressUi({ platform: 'win32', spawnFn, env: {} }).start({ resultFile: 'r.json', runnerPid: 1, run: '9-1', startText: 'Syncing while Claude is closed.' });
+  assert.equal(wins[0][wins[0].indexOf('-StartText') + 1], 'Syncing while Claude is closed.');
+  assert.equal(wins[0][wins[0].indexOf('-Run') + 1], '9-1');
+  const sent = [];
+  const ui = createProgressUi({ platform: 'linux', notifyFn: (t, b) => sent.push(b), env: {} });
+  ui.start({ startText: 'Syncing while Claude is closed.' });
+  ui.end({ status: 'retry', quiet: true });
+  assert.deepEqual(sent, ['Syncing while Claude is closed.']);
+  ui.end({ status: 'ok', headline: 'Your Claude accounts are in sync.' });
+  assert.deepEqual(sent, ['Syncing while Claude is closed.', 'Your Claude accounts are in sync.']);
+});
+
 test('progress: config progressIcon defaults to on and is described', () => {
   assert.equal(DEFAULTS.progressIcon, true);
   assert.equal(describeConfig({ ...DEFAULTS, remoteFrom: 'default' }).progressIcon, true);

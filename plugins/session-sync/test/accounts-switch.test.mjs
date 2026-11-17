@@ -460,6 +460,29 @@ test('S7 a second watcher is refused; a watcher whose claim is gone ends', async
   assert.equal(out.exit, 'lost-claim');
 });
 
+test('N4 a config.json write that leaves the signed-in account alone is not urgent; a change of account is (real timers, the poll is a minute away)', async () => {
+  const w = await world3();
+  w.sim.start(A, w.fA, w.r.userData);
+  const listeners = new Map();
+  const nap = (ms) => new Promise((res) => setTimeout(res, ms));
+  const run = runWaiter(w.ctx, {
+    reason: 'watch', watch: true, pollMs: 60 * 1000, gapMs: 100, debounceMs: 20, probeEveryMs: 60 * 1000, maxLifetimeMs: 3600 * 1000, notify: () => {},
+    watchFn: (path, _o, fn) => { listeners.set(path, fn); return { close() {}, on() {} }; },
+  });
+  await nap(400);                                          // the first pass (a poll tick) is done; the next poll is a minute away
+  w.sim.save(w.fA, id(1), { title: 'saved in A' });
+  listeners.get(w.r.userData)('change', 'config.json');    // the app rewrote config.json: same account
+  await nap(500);
+  assert.equal(w.title(w.fC, 1), 'A 1', 'no pass ran for a config.json write that changed nothing about the account');
+  w.sim.signIn(B, w.fB, { userData: w.r.userData });
+  listeners.get(w.r.userData)('change', 'config.json');    // the account changed
+  await nap(500);
+  assert.equal(w.title(w.fC, 1), 'saved in A', 'the account change ran the pass at once');
+  try { unlinkSync(join(w.r.acc, 'waiter.claim')); } catch { /* gone */ }
+  listeners.get(w.r.userData)('rename', 'lockfile');       // wake the loop so it sees the claim is gone
+  assert.equal((await run).exit, 'lost-claim');
+});
+
 test('every pass leaves no group conflicts that were not recorded: a quiet run has an empty conflicts table', async () => {
   const w = await world();
   w.sim.start(A, w.fA, w.r.userData);

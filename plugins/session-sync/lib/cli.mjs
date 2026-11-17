@@ -341,7 +341,7 @@ const armWaiter = (ctx, reason) => ensureWaiter(ctx, reason, spawnWaiter);
 function replaceStaleWaiter(ctx) {
   try {
     const r = replaceOldWaiter(ctx);
-    if (r.replaced) log(`accounts: waiter (pid ${r.pid}, version ${r.version ?? 'older'}) ${r.stale ? 'was stale and was dropped' : 'ended'} for the version ${PLUGIN_VERSION}`);
+    if (r.replaced) log(`accounts: waiter (pid ${r.pid}, version ${r.version ?? 'older'}${r.version === PLUGIN_VERSION ? `, code ${r.hash}` : ''}) ${r.stale ? 'was stale and was dropped' : 'ended'} for the version ${PLUGIN_VERSION}`);
     else if (r.reason === 'unverified' || r.reason === 'busy') log(`accounts: an older waiter (pid ${r.pid}) was left alone (${r.reason})`);
     return r;
   } catch (e) { log(`accounts: replacing the old waiter failed: ${e?.message ?? e}`); return { replaced: false, reason: 'error' }; }
@@ -391,6 +391,10 @@ async function accountsRemoteCheck(ctx) {
 async function accountsPass(ctx, reason) {
   const state = loadState(ctx);
   if (!state.linked) return { ok: false, kind: 'pass', skipped: 'not-linked' };
+  // S5: a watcher still running the code of an older copy (another version, or the same version with other code) is ended and
+  // replaced below by armWaiter. Never from the SessionStart hook (the hook only arms): this runs in the detached rectify and in
+  // push and pull, and the OS is asked only when the claim already differs from this copy.
+  replaceStaleWaiter(ctx);
   const app = appState({ ctx, probeProcesses: true });
   const remoteList = readJson(accPath(ctx, 'remote-list.json'), null);
   const res = app.fullAllowed
@@ -760,7 +764,9 @@ async function accountsCommand(sub, args) {
 
   if (sub === 'wait') {
     const i = args.indexOf('--reason');
-    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', watch: true, notify: accountsToast, log });
+    // ui (S4): every pass that runs with Claude closed shows a tray icon and balloons (a notification on macOS and Linux); config progressIcon turns it off
+    const ui = createProgressUi({ enabled: loadConfig().progressIcon !== false });
+    const out = await runWaiter(ctx, { reason: i >= 0 ? args[i + 1] : 'deferred', watch: true, notify: accountsToast, log, ui, logFile: LOG });
     log(`accounts waiter: ${out.exit}${out.report ? ` (${out.report.op} ${out.report.ok ? 'ok' : out.report.error ?? out.report.reason ?? 'not ok'})` : ''}`);
     return 0;
   }

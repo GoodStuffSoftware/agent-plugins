@@ -10,11 +10,13 @@ import assert from 'node:assert/strict';
 import { writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { runWaiter, ensureWaiter, waiterStatus, claimWaiter, replaceOldWaiter } from '../lib/accounts/waiter.mjs';
-import { PLUGIN_VERSION } from '../lib/accounts/version.mjs';
+import { PLUGIN_VERSION, codeHash } from '../lib/accounts/version.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey } from '../lib/accounts/folders.mjs';
-import { AppRunningError } from '../lib/accounts/appstate.mjs';
+import { AppRunningError, appState } from '../lib/accounts/appstate.mjs';
 import { fullPass } from '../lib/accounts/pass.mjs';
 import { makeRoot, makeClock, addFolder, putRecord, uuid, nlinkOf, recordName } from './fixtures/store.mjs';
 import { makeProbeApp } from './fixtures/probe-app.mjs';
@@ -359,4 +361,173 @@ test('S7 waiter: a waiter that claims its single-instance slot records its plugi
   assert.equal(claimWaiter(w.ctx), true);
   assert.equal(JSON.parse(readFileSync(join(w.acc, 'waiter.claim'), 'utf8')).version, PLUGIN_VERSION);
   assert.ok(PLUGIN_VERSION);
+});
+
+/* ---------------------------------------------------------------- 0.5.3 review round: S4 (the user is told) and S5 (a stale watcher is replaced) */
+
+/** A progress UI that records what the waiter asks of it, and the result file the tray helper would read at that moment. */
+function recUi(w) {
+  const calls = [];
+  const peek = () => readJson(join(w.acc, 'waiter-pass-result.json'));
+  return {
+    calls,
+    start(info) { calls.push({ what: 'start', run: info.run, text: info.startText, file: info.resultFile, at: peek() }); },
+    end(res) { calls.push({ what: 'end', status: res.status, quiet: !!res.quiet, headline: res.headline, at: peek() }); },
+  };
+}
+
+/** A stepper whose sleep ends the watcher (removes its claim) at the given sleep, so a watching waiter can be run to a stop. */
+function stopAt(w, n, onSleep = () => {}) {
+  return stepper((i) => { onSleep(i); if (i >= n) { try { unlinkSync(join(w.acc, 'waiter.claim')); } catch { /* gone */ } } });
+}
+
+test('S4 the quit-time full pass is announced: ui.start when it begins, ui.end with the result, and the result file names the run', async () => {
+  const w = world();
+  const first = await runWaiter(w.ctx, { ...common, reason: 'link', clock: stepper().clock, sleep: stepper().sleep, notify: () => {} });
+  assert.equal(first.exit, 'done');
+  const st = loadState(w.ctx); st.fullPassOwed = true; saveState(w.ctx, st);
+  const ui = recUi(w); const toasts = [];
+  const s = stopAt(w, 4);
+  const out = await runWaiter(w.ctx, { ...common, gapMs: 50, reason: 'owed', watch: true, clock: s.clock, sleep: s.sleep, notify: (t) => toasts.push(t), ui, logFile: 'waiter.log' });
+  assert.equal(out.exit, 'lost-claim', 'the watcher goes on waiting after the pass');
+  assert.deepEqual(ui.calls.map((c) => c.what), ['start', 'end']);
+  const [start, end] = ui.calls;
+  assert.match(start.text, /while Claude is closed/);
+  assert.equal(start.at.status, 'running');
+  assert.equal(start.at.progress.run, start.run, 'the helper started for this run reads its own run id');
+  assert.equal(end.status, 'ok');
+  assert.match(end.headline, /in sync/);
+  assert.equal(end.at.status, 'ok');
+  assert.equal(end.at.progress.run, start.run);
+  assert.match(end.at.progress.headline, /in sync/);
+  assert.equal(toasts.length, 0, 'the indicator replaces the toast');
+  assert.equal(loadState(w.ctx).fullPassOwed, false);
+});
+
+test('S4 a link and an unlink are announced through the ui too (no separate toast); without a ui the toast stays and a full pass is silent', async () => {
+  const w = world();
+  const ui = recUi(w); const toasts = [];
+  const s = stepper();
+  const out = await runWaiter(w.ctx, { ...common, reason: 'link', clock: s.clock, sleep: s.sleep, notify: (t) => toasts.push(t), ui });
+  assert.equal(out.exit, 'done');
+  assert.deepEqual(ui.calls.map((c) => [c.what, c.status ?? null]), [['start', null], ['end', 'ok']]);
+  assert.match(ui.calls[1].headline, /linked/);
+  assert.equal(toasts.length, 0);
+  const s2 = stepper(); const quiet = [];
+  const un = await runWaiter(w.ctx, { ...common, reason: 'unlink', clock: s2.clock, sleep: s2.sleep, notify: (t) => quiet.push(t) });   // no ui: the old toast
+  assert.equal(un.exit, 'done');
+  assert.equal(quiet.length, 1);
+  assert.match(quiet[0], /unlinked/);
+});
+
+test('S4 a pass cut short by the app coming back withdraws the notice quietly and the retry announces itself again', async () => {
+  const w = world();
+  const ui = recUi(w); let calls = 0;
+  const s = stepper();
+  const out = await runWaiter(w.ctx, {
+    ...common, reason: 'link', clock: s.clock, sleep: s.sleep, notify: () => {}, ui,
+    passOpts: () => ({ guard: () => { calls++; if (calls === 1) throw new AppRunningError(); } }),
+  });
+  assert.equal(out.exit, 'done');
+  assert.deepEqual(ui.calls.map((c) => [c.what, c.status ?? null, c.quiet ?? null]), [['start', null, null], ['end', 'retry', true], ['start', null, null], ['end', 'ok', false]]);
+  assert.equal(ui.calls[1].at.status, 'waiting');
+  assert.equal(ui.calls[1].at.progress.run ?? null, null, 'no run in the result: the Windows helper removes its icon');
+  assert.notEqual(ui.calls[0].run, ui.calls[2].run);
+});
+
+test('S4 a pass that did nothing because another command holds the lock does not announce itself again at every poll', async () => {
+  const w = world();
+  writeFileSync(join(w.acc, 'accounts.lock'), JSON.stringify({ pid: process.ppid, at: Date.now() }));
+  const ui = recUi(w);
+  const s = stepper((n) => { if (n === 5) unlinkSync(join(w.acc, 'accounts.lock')); });
+  const out = await runWaiter(w.ctx, { ...common, reason: 'link', clock: s.clock, sleep: s.sleep, notify: () => {}, ui });
+  assert.equal(out.exit, 'done');
+  assert.deepEqual(ui.calls.map((c) => [c.what, c.status ?? null]), [['start', null], ['end', 'retry'], ['start', null], ['end', 'ok']],
+    'one notice for the first try, then silence until the pass really runs; the user is told when it does');
+});
+
+test('S4 a closed, settled watcher does not start the process probe at every poll', async () => {
+  const w = world();
+  const first = await runWaiter(w.ctx, { ...common, reason: 'link', clock: stepper().clock, sleep: stepper().sleep, notify: () => {} });
+  assert.equal(first.exit, 'done');
+  let probes = 0; let reads = 0;
+  const status = (ctx, { probeProcesses }) => { reads++; if (probeProcesses) probes++; return appState({ ctx, probeProcesses, now: ctx.now() }); };
+  const s = stopAt(w, 40);
+  const out = await runWaiter(w.ctx, { ...common, gapMs: 50, pollMs: 1000, probeEveryMs: 60 * 1000, reason: 'watch', watch: true, clock: s.clock, sleep: s.sleep, notify: () => {}, status });
+  assert.equal(out.exit, 'lost-claim');
+  assert.ok(reads >= 30, `the loop ran ${reads} readings`);
+  assert.ok(probes <= 4, `the probe ran ${probes} times in ${reads} readings while Claude was closed and nothing was owed`);
+});
+
+test('S4 a settled watcher still acts at once when work is asked (a joined unlink), across an app run in between', async () => {
+  const w = world();
+  const first = await runWaiter(w.ctx, { ...common, reason: 'link', clock: stepper().clock, sleep: stepper().sleep, notify: () => {} });
+  assert.equal(first.exit, 'done');
+  const s = stopAt(w, 40, (n) => {
+    if (n === 15) w.setApp(true);
+    if (n === 18) w.setApp(false);
+    if (n === 24) { const j = readJson(join(w.acc, 'waiter.json')); writeFileSync(join(w.acc, 'waiter.json'), JSON.stringify({ ...j, reasons: [...j.reasons, 'unlink'] })); }
+  });
+  const out = await runWaiter(w.ctx, { ...common, gapMs: 50, pollMs: 1000, probeEveryMs: 3600 * 1000, reason: 'watch', watch: true, clock: s.clock, sleep: s.sleep, notify: () => {} });
+  assert.equal(out.exit, 'done', 'an unlink ends the watcher once it has run');
+  assert.equal(loadState(w.ctx).linked, false, 'the unlink that was asked while settled ran at once, not after the next probe window');
+});
+
+test('S5 a waiter claim records the code hash next to the version', () => {
+  const w = world();
+  assert.equal(claimWaiter(w.ctx), true);
+  const c = JSON.parse(readFileSync(join(w.acc, 'waiter.claim'), 'utf8'));
+  assert.match(c.hash, /^[0-9a-f]{16}$/);
+  assert.equal(c.hash, codeHash());
+});
+
+test('S5 codeHash: stable for the same code, different when a source file changes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ss-hash-'));
+  try {
+    mkdirSync(join(dir, 'accounts'));
+    writeFileSync(join(dir, 'a.mjs'), 'export const a = 1;\n');
+    writeFileSync(join(dir, 'accounts', 'b.mjs'), 'export const b = 2;\n');
+    writeFileSync(join(dir, 'notes.txt'), 'not code');
+    const h1 = codeHash(dir);
+    assert.equal(codeHash(dir), h1);
+    writeFileSync(join(dir, 'notes.txt'), 'still not code');
+    assert.equal(codeHash(dir), h1, 'a non-source file does not count');
+    writeFileSync(join(dir, 'accounts', 'b.mjs'), 'export const b = 3;\n');
+    assert.notEqual(codeHash(dir), h1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('S5 a waiter of the same version but other code is replaced; the same code, and a claim with no hash, are left alone', () => {
+  const w = world();
+  const p = fakeProc(['accounts', 'wait']);
+  try {
+    const claim = (hash) => writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: p.pid, at: w.ctx.now(), version: PLUGIN_VERSION, ...(hash ? { hash } : {}) }));
+    putWaiter(w, p.pid, { version: PLUGIN_VERSION });
+    claim(codeHash());
+    assert.deepEqual(replaceOldWaiter(w.ctx, { kill: noKill }), { replaced: false, reason: 'current', version: PLUGIN_VERSION }, 'same code');
+    claim(null);
+    assert.equal(replaceOldWaiter(w.ctx, { kill: noKill }).reason, 'current', 'a claim with a version and no hash cannot be told apart: left alone');
+    claim('0123456789abcdef');
+    const r = replaceOldWaiter(w.ctx);
+    assert.deepEqual([r.replaced, r.pid, r.version, r.hash], [true, p.pid, PLUGIN_VERSION, '0123456789abcdef']);
+    assert.equal(p.alive(), false, 'the stale watcher is ended');
+    assert.equal(claimGone(w), true, 'the singleton is free for the new one');
+  } finally { p.kill(); }
+});
+
+test('S5 a stale watcher is never ended while it is mid-pass, and a pid that is not a waiter is left alone', () => {
+  const w = world();
+  putWaiter(w, process.ppid, { version: PLUGIN_VERSION });
+  writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: process.ppid, at: w.ctx.now(), version: PLUGIN_VERSION, hash: 'ffffffffffffffff' }));
+  writeFileSync(join(w.acc, 'accounts.lock'), JSON.stringify({ pid: process.ppid, at: Date.now() }));
+  assert.equal(replaceOldWaiter(w.ctx, { kill: noKill }).reason, 'busy');
+  unlinkSync(join(w.acc, 'accounts.lock'));
+  const other = fakeProc(['something-else']);
+  try {
+    putWaiter(w, other.pid, { version: PLUGIN_VERSION });
+    writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: other.pid, at: w.ctx.now(), version: PLUGIN_VERSION, hash: 'ffffffffffffffff' }));
+    const r = replaceOldWaiter(w.ctx, { kill: noKill });
+    assert.deepEqual([r.replaced, r.stale], [true, true]);
+    assert.equal(other.alive(), true);
+  } finally { other.kill(); }
 });

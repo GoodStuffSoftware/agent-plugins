@@ -245,12 +245,14 @@ export function createStopWatch(ctx, o = {}) {
   let prevS1 = null; let downAt = 0; let nulls = 0; let nullSince = 0; let warned = false;
   let birth = 0;
   return {
-    /** @param {{probeProcesses?: boolean, now?: number}} [opts] force a probe; a caller's own reading of the clock */
+    /** @param {{probeProcesses?: boolean, now?: number}} [opts] force a probe (true) or none (false); a caller's own reading of the clock */
     read(opts = {}) {
       const now = opts.now ?? clock();
+      // By default a reading with the lock marker gone probes (a hidden PowerShell on Windows), because the stop is being
+      // confirmed. A loop that has already settled on "closed" passes probeProcesses:false and probes only now and then (S4).
       const probe = opts.probeProcesses ?? (!lockfilePresent(ctx) || now - lastProbe >= probeEveryMs);
       if (probe) lastProbe = now;
-      const app = o.status ? o.status(ctx) : appState({ ctx, probeProcesses: probe, now: ctx.now() });
+      const app = o.status ? o.status(ctx, { probeProcesses: probe }) : appState({ ctx, probeProcesses: probe, now: ctx.now() });
       if (typeof app.s1 !== 'boolean') return app;   // an injected status with no signals: nothing to say
       if (prevS1 === true && !app.s1) { downAt = now; log('app lock marker gone (S1 true -> false)'); }
       if (prevS1 === false && app.s1) {
