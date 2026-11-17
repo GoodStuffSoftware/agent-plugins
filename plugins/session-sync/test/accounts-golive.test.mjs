@@ -11,7 +11,7 @@ import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync, rmSync,
 import { EventEmitter } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { spawnSync, spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import {
   planGoLive, beginGoLive, runGoLive, resumeIfDead, takeGoLiveReport, goLiveInProgress, runnerAlive, readGoLive, readGoLiveResult,
   goLiveFile, goLiveResultFile, goLiveLogFile, verifyLinked, expectedSet, readListing, defaultRollback, copyWords,
@@ -1067,8 +1067,15 @@ test('S5 hook launch: the helper is a tiny detached hidden node, never PowerShel
 
 const claimPath = (w) => join(w.acc, 'go-live.claim');
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-/** A stand-in for a runner: a real, idle, hidden node process that only the test (and the code under test) may end. */
-const fakeRunner = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
+/** A stand-in for a runner: a real, idle, hidden node process that only the test (and the code under test) may end.
+ *  It is NOT our child (its parent exits at once, so init reaps it like a real detached runner; a child of ours would stay
+ *  a zombie that still answers kill(pid, 0) on Linux and macOS). */
+const fakeRunner = () => {
+  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
+  const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true });
+  const pid = Number(String(r.stdout).trim());
+  return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
+};
 const writeClaim = (w, pid, extra = {}) => writeFileSync(claimPath(w), JSON.stringify({ pid, at: w.ctx.now(), beatAt: w.ctx.now(), ...extra }));
 
 test('0.5.1 wait-stop has no time limit by default: a very long wait ends when the app stops, and a stored 30 minute limit is ignored', async () => {

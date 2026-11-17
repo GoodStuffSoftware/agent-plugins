@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { readJson } from '../lib/accounts/state.mjs';
 import { pairKey, answerPairs } from '../lib/accounts/folders.mjs';
 import { PLUGIN_VERSION } from '../lib/accounts/golive.mjs';
@@ -148,8 +148,15 @@ test('hidden launch-detached (the helper the SessionStart hook starts) launches 
 
 /* ------------------------------------------------------------------ 0.5.1 */
 
-/** A stand-in for a runner: an idle, hidden node process. Only it is ever ended by these tests. */
-const fakeRunner = () => spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { windowsHide: true, stdio: 'ignore' });
+/** A stand-in for a runner: an idle, hidden node process that is NOT our child (its parent exits at once, so init reaps it
+ *  like a real detached runner; a child of ours would stay a zombie that still answers kill(pid, 0) on Linux and macOS).
+ *  Only it is ever ended by these tests. */
+const fakeRunner = () => {
+  const code = "const c=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});c.unref();console.log(c.pid)";
+  const r = spawnSync(process.execPath, ['-e', code], { encoding: 'utf8', windowsHide: true });
+  const pid = Number(String(r.stdout).trim());
+  return { pid, kill: () => { try { process.kill(pid); } catch { /* gone */ } } };
+};
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const runners = (w) => launched(w).filter((a) => a[1] === 'golive-run').length;
 const claimOf = (w, pid, extra = {}) => writeFileSync(join(w.acc, 'go-live.claim'), JSON.stringify({ pid, at: Date.now(), beatAt: Date.now(), ...extra }));
