@@ -12,7 +12,7 @@
 import { readFileSync, appendFileSync, mkdirSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { STATE_DIR, loadConfig } from './config.mjs';
-import { QUEUE_DIR, entryFromHook, isNewArtifact, enqueue, wake, featureOn, activeAccount } from './artifacts.mjs';
+import { QUEUE_DIR, entryFromHook, isNewArtifact, enqueue, wake, featureOn, activeAccount, interactiveSessionFor } from './artifacts.mjs';
 
 const mode = process.argv[2];
 
@@ -40,8 +40,9 @@ try {
     }
   } else if (mode === 'wake') {
     const prompt = String(input.prompt ?? '').trim();
-    if (prompt && !prompt.startsWith('/')) {
-      const d = await wake({ cfg: loadConfig() });
+    const sid = typeof input.session_id === 'string' ? input.session_id : '';
+    if (prompt && sid && !prompt.startsWith('/')) {
+      const d = await wake({ cfg: loadConfig(), sessionCheck: (active) => interactiveSessionFor(active, sid) });
       if (d.act) {
         log(`artifact-share: instruction given to session ${String(input.session_id ?? '').slice(0, 8)} for ${d.due.length} artifact(s)`);
         try { writeSync(1, `${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`); } catch { /* no stdout */ }

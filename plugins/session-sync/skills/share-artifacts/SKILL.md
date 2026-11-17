@@ -83,7 +83,7 @@ Invite emails are unreliable, so get the link itself. Patch the clipboard with `
 window.__copied=[]; navigator.clipboard.writeText=(t)=>{window.__copied.push(String(t)); return Promise.resolve();}; 'patched'
 ```
 
-Then evaluate `window.__copied`. The first click sometimes captures nothing: patch again and click again. The link looks like `https://claude.ai/artifact/invite/<inviteId>` (`https://claude.ai/invitation/<inviteId>` also works). Record it:
+Then evaluate `window.__copied`. The first click sometimes captures nothing: patch again and click again. The link looks like `https://claude.ai/artifacts/invite/<inviteId>` (`https://claude.ai/invitation/<inviteId>` also works). Record it:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts mark <id> invited --link <link>
@@ -108,5 +108,6 @@ If it does not say writer, leave the entry `invited` and tell the user the invit
 ## 9. Housekeeping
 
 - `artifacts list` shows every entry with its status; `artifacts forget <id>` drops one the user does not want shared; `artifacts mark <id> pending` retries a failed one.
+- The notice is given once per account switch (it is not repeated while you work through the queue). If a run died, the entries stay pending: running this skill again by hand retries them.
 - `config artifactShare.enabled false` turns the whole feature off (nothing is queued and nothing is triggered).
 - Say plainly what is not done: pending, failed and invited-but-not-accepted entries.

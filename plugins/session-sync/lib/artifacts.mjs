@@ -19,7 +19,7 @@
  */
 
 import {
-  mkdirSync, readdirSync, readFileSync, writeFileSync, linkSync, unlinkSync, renameSync, openSync, closeSync, writeSync,
+  mkdirSync, readdirSync, readFileSync, writeFileSync, linkSync, unlinkSync, renameSync, openSync, closeSync, writeSync, statSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
@@ -44,8 +44,21 @@ export function isNewArtifact(input) {
   if (!input || typeof input !== 'object') return false;
   const action = input.action === undefined || input.action === null || input.action === '' ? 'publish' : String(input.action).toLowerCase();
   if (action !== 'publish') return false;
-  if (input.url || input.asset || input.from_url || input.asset_ids) return false;
+  if (input.url || input.asset || input.asset_ids) return false;
   return true;
+}
+
+/**
+ * The real tool republishes an existing artifact WITHOUT a `url` in the input (just the file and a label); only the response says so:
+ * "Published <path> at <url> (Version N, ...)". N above 1 is a republish, never a new artifact. A create from a `type_url` is always
+ * new ("Created a new Artifact at <url> (version ...)"). A response without that marker is taken as new (dedupe by id still applies).
+ */
+export function isRepublishResponse(input, response) {
+  if (input?.type_url) return false;
+  let text;
+  try { text = typeof response === 'string' ? response : JSON.stringify(response ?? ''); } catch { return false; }
+  const m = /\(Version (\d+)\b/.exec(text);
+  return !!m && Number(m[1]) > 1;
 }
 
 /**
@@ -73,9 +86,14 @@ export function extractArtifact(input, response) {
   return pick(text);
 }
 
+/** A title for the notice: the input title, the response title, the one-sentence description, then the file name. One line, no control characters. */
 function titleOf(input, response) {
-  const t = input?.title ?? (response && typeof response === 'object' ? response.title : null);
-  return typeof t === 'string' && t.trim() ? t.trim().slice(0, 200) : null;
+  const file = typeof input?.file_path === 'string' ? input.file_path.split(/[\\/]/).pop() : null;
+  for (const t of [input?.title, response && typeof response === 'object' ? response.title : null, input?.description, file]) {
+    const s = typeof t === 'string' ? t.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim() : '';
+    if (s) return s.slice(0, 120);
+  }
+  return null;
 }
 
 /** Build a queue entry from a PostToolUse payload, or null when the call did not create an artifact. */
@@ -83,7 +101,9 @@ export function entryFromHook(payload, { ownerAccount = null, now = Date.now() }
   if (!payload || payload.tool_name !== 'Artifact') return null;
   const input = payload.tool_input;
   if (!isNewArtifact(input)) return null;
-  const found = extractArtifact(input, payload.tool_response ?? payload.tool_output);
+  const response = payload.tool_response ?? payload.tool_output;
+  if (isRepublishResponse(input, response)) return null;
+  const found = extractArtifact(input, response);
   if (!found) return null;
   return {
     id: found.id, url: found.url, title: titleOf(input, payload.tool_response),
@@ -96,7 +116,11 @@ export function entryFromHook(payload, { ownerAccount = null, now = Date.now() }
 
 /* ----------------------------------- queue ----------------------------------- */
 
-const entryFile = (dir, id) => join(dir, `a-${id}.json`);
+/** An id is only ever a claude.ai artifact id: anything else (a path, "..") never reaches the file system. */
+const entryFile = (dir, id) => {
+  if (!ID_RE.test(String(id))) throw new Error(`"${id}" is not an artifact id`);
+  return join(dir, `a-${id}.json`);
+};
 
 function sleepMs(ms) { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* ignore */ } }
 
@@ -254,12 +278,23 @@ export async function activeAccount() {
   } catch { return null; }
 }
 
+/** Is this a session the app lists as an interactive one (local, not archived, not a scheduled task) in the account the app is on? The same test rc-wake uses. */
+export async function interactiveSessionFor(active, sessionId) {
+  try {
+    const { makeCtx } = await import('./accounts/state.mjs');
+    const { recordForCliSession, interactiveSession } = await import('./accounts/rcrestore.mjs');
+    const found = recordForCliSession(makeCtx(), String(active).toLowerCase(), sessionId);
+    return !!found && interactiveSession(found.rec);
+  } catch { return false; }
+}
+
 const CLAIM_RE = /^claim-[0-9a-f]{16}$/;
 
 /**
  * Decide whether this prompt's session should be told to share, and take the claim if so. Cheap on purpose: nothing queued is one
- * failed readdir; nothing pending is one readdir and a few small reads; the app's account is only read when something is pending.
- * o: { dir, cfg, stateDir, active, share }. `active` (the app's account) is looked up with activeAccount() when not given.
+ * failed readdir; nothing pending is a readdir and a few small reads; the app's account is only read when something is pending.
+ * o: { dir, cfg, stateDir, active, share, sessionCheck }. `active` (the app's account) is looked up with activeAccount() when not given;
+ * `sessionCheck(active)` (async, optional) says whether the prompting session may take the claim.
  * @returns {Promise<{act:boolean, reason:string, due?:object[], text?:string}>}
  */
 export async function wake(o = {}) {
@@ -278,11 +313,19 @@ export async function wake(o = {}) {
   const active = o.active !== undefined ? o.active : await activeAccount();
   if (!active) return { act: false, reason: 'no-active-account' };
   const emails = o.cfg?.artifactShare?.emails ?? {};
+  if (new Set(Object.values(emails).map((v) => String(v).toLowerCase())).size < 2) return { act: false, reason: 'no-emails' };   // nothing the skill could send to: set artifactShare.email for both accounts
   const share = o.share ?? readShareState(dir);
   const due = pending.filter((e) => !sameAccount(e.ownerAccount, active) && driveableOwner(e.ownerAccount, emails, share));
   if (!due.length) { clearClaims(dir, names); return { act: false, reason: 'none-due' }; }
-  const key = createHash('sha256').update(`${String(active).toLowerCase()}|${due.map((e) => e.id).sort().join(',')}`).digest('hex').slice(0, 16);
-  try { closeSync(openSync(join(dir, `claim-${key}`), 'wx')); } catch { return { act: false, reason: 'claimed' }; }
+  // The claim is per switch: it is keyed by the account the app is on only, NOT by what is due, because the skill shrinks the due set as it
+  // works and a changed key would hand the instruction to the next prompt again. It goes when nothing is due (back on the owner's account, or
+  // everything handled). A run that dies leaves the entries pending: asking for the skill by hand retries them.
+  const key = createHash('sha256').update(String(active).toLowerCase()).digest('hex').slice(0, 16);
+  const claim = join(dir, `claim-${key}`);
+  try { if (statSync(claim)) return { act: false, reason: 'claimed' }; } catch { /* not taken yet */ }
+  // Only a session the app knows as an interactive one (the browser tools live there) may take it: not a terminal run, a headless or a scheduled session.
+  if (o.sessionCheck && !(await o.sessionCheck(active))) return { act: false, reason: 'not-interactive' };
+  try { closeSync(openSync(claim, 'wx')); } catch { return { act: false, reason: 'claimed' }; }
   return { act: true, reason: 'claimed-now', due, text: wakeInstruction({ due, active, emails }) };
 }
 

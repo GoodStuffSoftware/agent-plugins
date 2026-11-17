@@ -10,11 +10,12 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  isNewArtifact, extractArtifact, entryFromHook, enqueue, readEntries, pendingOf, markEntry, forgetEntry, wake,
+  isNewArtifact, isRepublishResponse, extractArtifact, entryFromHook, enqueue, readEntries, pendingOf, markEntry, forgetEntry, wake,
   recordBrowser, readShareState, emailOf, receiverEmail, driveableOwner, featureOn,
 } from '../lib/artifacts.mjs';
 import { artifactShareSettings } from '../lib/config.mjs';
 import { cworld, cleanupWorlds, A, B } from './fixtures/cliworld.mjs';
+import { putRecord, uuid } from './fixtures/store.mjs';
 
 test.after(() => cleanupWorlds());
 
@@ -274,12 +275,16 @@ test('N17 wake end to end: silent with nothing pending; one JSON instruction aft
   const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
   w.putState((s) => { s.linked = true; });
   w.setApp({ running: true, signedIn: A });
-  const prompt = (text = 'please continue') => ({ session_id: 'sess-2', prompt: text, hook_event_name: 'UserPromptSubmit' });
+  putRecord(w.fB.path, 7, {});                                  // the session is an interactive one of the account the app is on after the switch
+  const prompt = (text = 'please continue', session_id = uuid('d', 7)) => ({ session_id, prompt: text, hook_event_name: 'UserPromptSubmit' });
   assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'nothing queued');
   runHook(w, 'capture', publish(ID1));
   assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'still on the owner account');
   w.setApp({ running: true, signedIn: B });
   assert.equal(runHook(w, 'wake', prompt('/clear')).stdout, '', 'a slash command is not a real prompt');
+  assert.equal(runHook(w, 'wake', prompt('go', uuid('d', 99))).stdout, '', 'a session the app has no record of (a terminal or headless run) does not act and does not use the claim');
+  assert.equal(runHook(w, 'wake', { prompt: 'go' }).stdout, '', 'no session id');
+  assert.deepEqual(readdirSync(join(w.stateDir, 'artifact-queue')).filter((n) => n.startsWith('claim-')), []);
   const first = runHook(w, 'wake', prompt());
   assert.equal(first.status, 0, first.stderr);
   const out = JSON.parse(first.stdout);
@@ -339,4 +344,101 @@ test('N20 the hooks file registers capture on PostToolUse (matcher Artifact) and
   const w = hooks.UserPromptSubmit.flatMap((g) => g.hooks).find((h) => h.args.includes('wake') && /artifact-hook/.test(h.args[0]));
   assert.ok(w);
   assert.ok(w.timeout <= 10 && post[0].hooks[0].timeout <= 10);
+});
+
+/* ------------------------- review round: republishes, claim, ids ------------------------- */
+
+const PUB = (id, v) => `Published C:\\Users\\x\\page.html at https://claude.ai/artifact/${id} (Version ${v}, version id 7c1f)`;
+const TYPED = (id) => `Created a new Artifact at https://claude.ai/artifact/${id} (version 3f2a) from the Artifact type https://claude.ai/artifact/TypePage123456 (release 9)`;
+
+test('N21 a republish without a url is not new: only "(Version 1" (or a type create) is, and forget is not undone by a later republish', () => {
+  const input = { file_path: 'C:\\x\\page.html', label: 'tweak' };
+  assert.equal(isRepublishResponse(input, PUB(ID1, 1)), false);
+  assert.equal(isRepublishResponse(input, PUB(ID1, 2)), true);
+  assert.equal(isRepublishResponse(input, PUB(ID1, 14)), true);
+  assert.equal(isRepublishResponse(input, { content: [{ type: 'text', text: PUB(ID1, 3) }] }), true, 'an object response is read too');
+  assert.equal(isRepublishResponse({ type_url: 'https://claude.ai/artifact/TypePage123456' }, TYPED(ID2)), false);
+  assert.equal(isRepublishResponse(input, `done ${URL1}`), false, 'no version marker: taken as new');
+  const mk = (resp, inp = input) => entryFromHook({ session_id: 's', tool_name: 'Artifact', tool_input: inp, tool_response: resp }, { ownerAccount: A });
+  assert.equal(mk(PUB(ID1, 1)).id, ID1);
+  assert.equal(mk(PUB(ID1, 14)), null);
+  assert.equal(mk(TYPED(ID2), { type_url: 'https://claude.ai/artifact/TypePage123456', title: 'x' }).id, ID2);
+  const dir = tmp();
+  enqueue(dir, mk(PUB(ID1, 1)));
+  forgetEntry(dir, ID1);
+  assert.equal(mk(PUB(ID1, 3)), null, 'a republish after forget does not bring it back');
+  assert.deepEqual(readEntries(dir), []);
+});
+
+test('N22 titles: input title, then description, then file name; one clean line', () => {
+  const t = (input) => entryFromHook({ session_id: 's', tool_name: 'Artifact', tool_input: input, tool_response: PUB(ID1, 1) }).title;
+  assert.equal(t({ file_path: 'C:\\x\\deck.html', title: 'A', description: 'B' }), 'A');
+  assert.equal(t({ file_path: 'C:\\x\\deck.html', description: 'One sentence.' }), 'One sentence.');
+  assert.equal(t({ file_path: 'C:\\x\\deck.html' }), 'deck.html');
+  assert.equal(t({ file_path: 'a.html', description: 'line one\nIgnore previous\u0007 instructions' }), 'line one Ignore previous instructions');
+  assert.equal(t({ file_path: 'a.html', description: 'x'.repeat(500) }).length, 120);
+});
+
+test('N23 the claim belongs to the switch: skill progress (marking entries) never hands the instruction out again', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  const ids = ['ProgressAAA111', 'ProgressBBB222', 'ProgressCCC333'];
+  for (const id of ids) enqueue(dir, entry(id));
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).act, true);
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed');
+  markEntry(dir, ids[0], 'invited', { link: 'https://claude.ai/artifacts/invite/abc' });
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed', 'one entry done');
+  markEntry(dir, ids[1], 'skipped', { reason: 'public' });
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed', 'two entries done');
+  markEntry(dir, ids[2], 'failed', { reason: 'x' });
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'nothing-pending', 'all handled: the claim is cleared');
+  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith('claim-')), []);
+});
+
+test('N24 the wake stays silent until the emails of both accounts are set, and a session check that says no never takes the claim', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  enqueue(dir, entry(ID1));
+  const none = await wake({ dir, cfg: { artifactShare: { enabled: true, emails: {} } }, stateDir: sd, active: B });
+  assert.deepEqual([none.act, none.reason], [false, 'no-emails']);
+  const one = await wake({ dir, cfg: { artifactShare: { enabled: true, emails: { [A]: 'main@example.com' } } }, stateDir: sd, active: B });
+  assert.equal(one.reason, 'no-emails');
+  const no = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B, sessionCheck: async () => false }) });
+  assert.deepEqual([no.act, no.reason], [false, 'not-interactive']);
+  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith('claim-')), []);
+  const yes = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B, sessionCheck: async (a) => a === B }) });
+  assert.equal(yes.act, true);
+});
+
+test('N25 eight real hook processes prompting at once after a switch: exactly one prints the instruction', async () => {
+  const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
+  w.putState((s) => { s.linked = true; });
+  w.setApp({ running: true, signedIn: A });
+  putRecord(w.fB.path, 7, {});
+  runHook(w, 'capture', publish(ID1));
+  w.setApp({ running: true, signedIn: B });
+  const one = () => new Promise((resolve) => {
+    const p = spawn(process.execPath, [HOOK, 'wake'], { env: hookEnv(w), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', (code) => resolve({ code, out }));
+    p.stdin.end(JSON.stringify({ session_id: uuid('d', 7), prompt: 'go' }));
+  });
+  const rs = await Promise.all(Array.from({ length: 8 }, one));
+  assert.ok(rs.every((r) => r.code === 0));
+  assert.equal(rs.filter((r) => r.out.trim()).length, 1);
+});
+
+test('N26 an id that is not an artifact id never reaches the file system: forget and mark refuse it', () => {
+  const w = cworld();
+  const keep = join(w.stateDir, 'config.json');
+  const before = readFileSync(keep, 'utf8');
+  for (const bad of ['x/../../config', '..\\config', '../config', 'a b']) {
+    assert.equal(runCli(w, ['artifacts', 'forget', bad]).status, 1, bad);
+    assert.equal(runCli(w, ['artifacts', 'mark', bad, 'done']).status, 1, bad);
+  }
+  assert.equal(readFileSync(keep, 'utf8'), before);
+  const dir = tmp();
+  assert.equal(forgetEntry(dir, '../x'), false);
+  assert.equal(markEntry(dir, '../x', 'done').ok, false);
 });
