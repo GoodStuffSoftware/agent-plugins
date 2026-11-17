@@ -38,9 +38,9 @@ import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter } from './accounts/waiter.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
-import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
+import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
-import { collectStatus, summarizePass, formatPass, formatStatus } from './accounts/report.mjs';
+import { collectStatus, summarizePass, formatPass, formatStatus, RESTART_LEAD, RESTART_LEAD_WAITER, WAIT_NOTE } from './accounts/report.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, writeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
@@ -410,8 +410,9 @@ async function accountsDailyRemoteCheck() {
   } catch (e) { log(`accounts remote check failed: ${e?.message || e}`); }
 }
 
-const askText = (n, ids) => `session-sync: the Claude desktop app on this machine has been signed into ${n} claude.ai accounts (${ids.join(', ')}). `
-  + 'session-sync can show every Code-tab conversation, local scheduled task and app setting in all of them. '
+const askText = (n, ids) => `session-sync: ${RESTART_LEAD_WAITER} `
+  + `(The Claude desktop app on this machine has been signed into ${n} claude.ai accounts (${ids.join(', ')}). `
+  + 'session-sync can show every Code-tab conversation, local scheduled task and app setting in all of them.) '
   + 'If you are talking with the user, ask them once whether to share these across the accounts, and point them to /session-sync:accounts for details. '
   + `Record the answer with: node "${resolve(process.argv[1])}" accounts answer yes   (or: no). `
   + 'If this session runs unattended (no user to ask), do nothing.';
@@ -514,7 +515,19 @@ async function goLiveCommand(ctx, args) {
   const prog = goLiveInProgress(ctx);
   if (prog) {
     const where = `phase ${prog.result.phase}, ${prog.result.status}`;
-    if (runnerAlive(ctx)) { emit({ ok: true, command: 'go-live', alreadyRunning: true, phase: prog.result.phase }, [`A go-live is already running (${where}).`, ...tail]); return 0; }
+    if (runnerAlive(ctx)) {
+      // a runner waiting for the app to stop (no lock, no change made) is swapped for one from this copy of the plugin
+      const rep = replaceWaitingRunner(ctx);
+      if (!rep.replaced) {
+        emit({ ok: true, command: 'go-live', alreadyRunning: true, phase: prog.result.phase, reason: rep.reason }, [`A go-live is already running (${where}).`, ...(prog.result.phase === 'wait-stop' ? [WAIT_NOTE] : []), ...tail]);
+        return 0;
+      }
+      const r = launchRunner();
+      if (!r.ok) return refuse('launch-failed', `The old runner was ended but the new one could not start: ${r.error}. Run: accounts go-live again (the go-live state is kept).`, 1);
+      emit({ ok: true, command: 'go-live', replaced: true, fromVersion: rep.version, toVersion: PLUGIN_VERSION, runner: { pid: r.pid, method: r.method } },
+        [WAIT_NOTE, `Replaced the waiting runner (${rep.version ?? 'older version'}) with one from version ${PLUGIN_VERSION}. It is the same go-live; nothing was changed.`, ...weak(r), ...tail]);
+      return 0;
+    }
     if (!yes) {
       const a = await confirmYes(`A go-live is in progress (${where}). Resume it?`);
       if (a === null) return refuse('needs-yes', 'Run again with --yes to resume.', 2);
@@ -529,14 +542,17 @@ async function goLiveCommand(ctx, args) {
   const plan = planGoLive(ctx, deps);
   if (!plan.ok) return refuse(plan.reason, plan.text);
   const app = appState({ ctx, probeProcesses: true });
+  const lead = opts.noRelaunch ? RESTART_LEAD_WAITER : RESTART_LEAD;
+  const waitNote = `${lead} There is no time limit and nothing needs to be run again. Closing the window only hides it.`;
   const lines = [
+    ...(app.fullAllowed ? [] : [waitNote]),
     `Accounts: ${plan.accounts}; folders: ${plan.folders}; conversations: ${plan.conversations}.`,
     `After the link every folder holds all ${plan.expected} conversations (plus any that arrive before you quit Claude).`,
     plan.copies.length
       ? (plan.stale.length ? `${copyWords(plan.stale)} of session-sync cannot filter mirrored records (${plan.copies.length} copy(ies) found). Push will be paused until every copy can.` : `All ${plan.copies.length} copy(ies) of session-sync (desktop and terminal) can link.`)
       : 'No copy of session-sync was found to check.',
     `What happens: a backup is taken and checked, the accounts are linked and every folder is verified, Claude starts again${opts.noRelaunch ? ' (not with --no-relaunch: you start it)' : ''}, then a pass and the remote duplicate check run. A failed check rolls back by itself.`,
-    app.fullAllowed ? 'Claude does not look like it is running, so the link starts at once.' : 'Claude is running: finish or stop running sessions first. The link starts when it is fully stopped.',
+    app.fullAllowed ? 'Claude does not look like it is running, so the link starts at once.' : 'Claude is running: finish or stop running sessions first. The link starts as soon as it is fully stopped.',
   ];
   if (!jsonOut) console.log(lines.join('\n'));
   if (!yes) {
@@ -547,15 +563,15 @@ async function goLiveCommand(ctx, args) {
   beginGoLive(ctx, plan, opts, deps);
   const r = launchRunner();
   if (!r.ok) return refuse('launch-failed', `Your answer is recorded, but the background runner could not start: ${r.error}. Run: accounts go-live again.`, 1);
-  let quitNote = app.fullAllowed ? null : 'Quit Claude from the tray icon or the app menu. Closing the window only hides it.';
+  let quitNote = app.fullAllowed ? null : waitNote;
   if (opts.quitApp && !app.fullAllowed) {
     const q = quitSupport();
     quitNote = q.supported
       ? 'The background runner asks Claude to quit in a few seconds. This session ends when it does. If Claude asks about running sessions, answer it in the app.'
-      : `Claude cannot be quit from here (${q.reason}). Quit it from the tray icon or the app menu. Closing the window only hides it.`;
+      : `Claude cannot be quit from here (${q.reason}).`;
   }
   emit({ ok: true, command: 'go-live', started: true, expected: plan.expected, runner: { pid: r.pid, method: r.method }, paused: plan.stale.length > 0, quit: quitNote },
-    [...(jsonOut ? [] : [`Recorded: sharing. The background runner is started${r.method === 'spawn-fallback' ? '.' : ' and survives the app quit.'}`]), ...weak(r), ...(quitNote ? [quitNote] : []), ...tail]);
+    [...(jsonOut ? [] : [`Recorded: sharing. The background runner is started${r.method === 'spawn-fallback' ? '.' : ' and survives the app quit.'}`]), ...weak(r), ...(quitNote && quitNote !== waitNote ? [quitNote] : []), ...tail]);
   return 0;
 }
 
@@ -605,7 +621,7 @@ async function accountsCommand(sub, args) {
     }
     const w = armWaiter(ctx, 'link');
     emit({ ok: true, command: 'answer', answered: pend.length, answer, waiter: w.action },
-      [`Recorded: sharing (${pend.length} pair(s)).`, 'Claude is running. Quit it from the tray icon: the first link takes a backup, then links, and a notice says when it is done.']);
+      [RESTART_LEAD_WAITER, `Recorded: sharing (${pend.length} pair(s)). Claude is running. The first link takes a backup, then links, and a notice says when it is done.`]);
     return 0;
   }
 
@@ -616,7 +632,7 @@ async function accountsCommand(sub, args) {
     if (!app.fullAllowed) {
       if (has('--now')) return refused('app-running', 'Quit Claude from the tray icon first (closing the window only hides it).');
       const w = armWaiter(ctx, 'link');
-      if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, ['Claude is running. The link runs when you quit it from the tray icon.']);
+      if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, [RESTART_LEAD_WAITER, 'Claude is running; closing the window only hides it.']);
       return 0;
     }
     const res = await link(ctx, { app });
@@ -648,7 +664,7 @@ async function accountsCommand(sub, args) {
     if (!app.fullAllowed) {
       if (!has('--when-app-exits')) return refused('app-running', 'Quit Claude from the tray icon first, or run: accounts unlink --when-app-exits');
       const w = armWaiter(ctx, 'unlink');
-      emit({ ok: true, command: 'unlink', waiter: w.action }, ['Claude is running. The unlink runs when you quit it from the tray icon.']);
+      emit({ ok: true, command: 'unlink', waiter: w.action }, ['Claude is running. The unlink runs as soon as you quit it from the tray icon or app menu; closing the window only hides it.']);
       return 0;
     }
     const res = await unlink(ctx, { app });

@@ -59,7 +59,7 @@ test('go-live while the app runs: tells the user to quit from the tray icon; --q
   const rq = run(q, ['accounts', 'go-live', '--yes', '--quit-app']);
   assert.equal(rq.status, 0, rq.stderr);
   // Windows and Linux: cannot quit from here, use the tray icon. macOS: the runner asks in a few seconds.
-  assert.match(rq.stdout, process.platform === 'darwin' ? /asks Claude to quit in a few seconds/ : /cannot be quit from here[\s\S]*tray icon/);
+  assert.match(rq.stdout, process.platform === 'darwin' ? /asks Claude to quit in a few seconds/ : /Restart Claude to sync your accounts[\s\S]*cannot be quit from here/);
 });
 
 test('go-live refuses an already linked store and a single account', () => {

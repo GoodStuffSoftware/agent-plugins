@@ -207,7 +207,7 @@ test('accounts link --now refuses while the app runs (exit 3); without --now it 
   assert.equal(existsSync(join(w.acc, 'waiter.json')), false);
   const armed = w.run(['accounts', 'link']);
   assert.equal(armed.status, 0, armed.stderr);
-  assert.match(armed.stdout, /runs when you quit/);
+  assert.match(armed.stdout, /Restart Claude to sync your accounts: quit Claude from the tray icon or app menu/);
   w.setApp({ running: false });
   assert.equal(waitFor(() => w.state()?.linked === true), true);
 });

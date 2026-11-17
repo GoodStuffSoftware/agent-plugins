@@ -196,7 +196,7 @@ export async function runWaiter(ctx, o = {}) {
         if (!res.ok && (res.aborted || RETRY_REASONS.has(res.reason))) { negatives = 0; await sleep(pollMs); continue; }
         const report = lastPassOf(op.name, res, ctx);
         writeJsonAtomic(accPath(ctx, 'last-pass.json'), report);
-        if (res.ok) {
+        if (res.ok && op.name !== 'full') {   // a routine full pass after the link says nothing
           const n = report.ids;
           o.notify?.(op.name === 'unlink' ? 'Claude accounts unlinked' : 'Claude accounts linked',
             op.name === 'unlink' ? 'Each conversation is back in its own account.' : `${n ?? 'All'} conversations in every account`);

@@ -19,7 +19,7 @@
  *   link, fullPass, rollback, relaunch, rectify, remoteCheck, copies, getPush, setPush, appStatus, sleep, clock.
  */
 
-import { appendFileSync, mkdirSync, readdirSync, unlinkSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { spawn } from 'node:child_process';
 import { pidAlive } from '../lock.mjs';
@@ -29,7 +29,7 @@ import {
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs, RECORD, TOMB } from './folders.mjs';
 import { appState, lockfilePresent } from './appstate.mjs';
 import { link, fullPass } from './pass.mjs';
-import { groupHealth } from './report.mjs';
+import { groupHealth, WAIT_NOTE } from './report.mjs';
 import { sessionSyncCopies, relaunchApp } from './desktop.mjs';
 import { requestAppQuit } from './appquit.mjs';
 
@@ -45,8 +45,16 @@ const claimFile = (ctx) => accPath(ctx, 'go-live.claim');
 // hold the beat back; the stale window is longer than any of those.
 const CLAIM_STALE_MS = 15 * 60 * 1000;
 const HEARTBEAT_MS = 20 * 1000;
+/** Waiting for the app to stop: look every half second; stopped means two readings this far apart. */
+export const STOP_POLL_MS = 500;
+export const STOP_GAP_MS = 500;
 const MIN = 60 * 1000;
-export const DEFAULT_TIMEOUTS = Object.freeze({ stopMs: 30 * MIN, startMs: 10 * MIN, startNoRelaunchMs: 30 * MIN, capabilityMs: 20 * MIN, lockMs: 15 * MIN });
+/** The plugin version of this copy (written into the claim so a newer copy can replace an older waiting runner). */
+export const PLUGIN_VERSION = (() => { try { return String(JSON.parse(readFileSync(new URL('../../.claude-plugin/plugin.json', import.meta.url), 'utf8')).version ?? '') || null; } catch { return null; } })();
+// stopMs limits every wait for the app to stop (wait-stop, verify-stop, rollback-stop). It is Infinity: the user quits Claude
+// whenever they like, and giving up would make them run go-live again. A limit on the verify or rollback wait would leave a
+// linked but unchecked store, or a failed link not undone, for the user to sort out. A finite value is the test seam.
+export const DEFAULT_TIMEOUTS = Object.freeze({ stopMs: Infinity, startMs: 10 * MIN, startNoRelaunchMs: 30 * MIN, capabilityMs: 20 * MIN, lockMs: 15 * MIN });
 
 const id8 = (s) => String(s).slice(0, 8);
 
@@ -166,7 +174,7 @@ function claimRunner(ctx) {
   for (let i = 0; i < 2; i++) {
     try {
       const fd = openSync(file, 'wx');
-      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: ctx.now(), beatAt: ctx.now() })); } finally { closeSync(fd); }
+      try { writeSync(fd, JSON.stringify({ pid: process.pid, at: ctx.now(), beatAt: ctx.now(), version: PLUGIN_VERSION })); } finally { closeSync(fd); }
       return true;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
@@ -181,7 +189,7 @@ const beatClaim = (ctx) => {
   try {
     const c = readJson(claimFile(ctx), null);
     if (!c || c.pid !== process.pid) return;
-    writeFileSync(claimFile(ctx), JSON.stringify({ pid: process.pid, at: c.at ?? ctx.now(), beatAt: ctx.now() }));
+    writeFileSync(claimFile(ctx), JSON.stringify({ pid: process.pid, at: c.at ?? ctx.now(), beatAt: ctx.now(), version: c.version ?? PLUGIN_VERSION }));
   } catch { /* best effort */ }
 };
 const releaseClaim = (ctx) => { const c = readJson(claimFile(ctx), null); if (!c || c.pid === process.pid) { try { unlinkSync(claimFile(ctx)); } catch { /* none */ } } };
@@ -251,13 +259,60 @@ export function goLiveInProgress(ctx) {
   return null;
 }
 
-/** For the SessionStart step: an unfinished go-live with no live runner gets one launched. */
+const RESUME_MIN_GAP_MS = 2 * MIN;       // a launch takes seconds to claim; two hooks that start together launch once
+const RESUME_MAX_TRIES = 5;              // restarts in a row that never produced a live runner (reset by a live one, or after a day)
+const resumeStampFile = (ctx) => accPath(ctx, 'go-live-resume.json');
+
+/**
+ * For the SessionStart step: a go-live that is waiting (status `waiting`, in any phase) with no live runner (dead pid or a
+ * stale heartbeat, e.g. after a reboot) gets ONE runner launched. Never while a runner lives, never for a failed or finished
+ * go-live, never twice within RESUME_MIN_GAP_MS, and never more than RESUME_MAX_TRIES times without a runner being seen alive.
+ */
 export function resumeIfDead(ctx, launch) {
   const p = goLiveInProgress(ctx);
-  if (!p || runnerAlive(ctx) || p.result.status !== 'waiting') return { resumed: false };
+  if (!p || p.result.status !== 'waiting') return { resumed: false };
+  const stampFile = resumeStampFile(ctx);
+  if (runnerAlive(ctx)) { try { unlinkSync(stampFile); } catch { /* none */ } return { resumed: false }; }
+  const now = ctx.now();
+  const s = readJson(stampFile, null);
+  const mine = s?.id === p.gl.id && now - (s.at ?? 0) < 24 * 60 * MIN ? s : { id: p.gl.id, at: 0, tries: 0 };
+  if (now - mine.at < RESUME_MIN_GAP_MS) return { resumed: false, reason: 'recent' };
+  if (mine.tries >= RESUME_MAX_TRIES) return { resumed: false, reason: 'gave-up' };
+  try { writeJsonAtomic(stampFile, { id: p.gl.id, at: now, tries: mine.tries + 1 }); } catch { /* best effort */ }
   const r = launch(['accounts', 'golive-run']);
   glog(ctx, `runner was not alive; relaunched (${r?.method ?? 'unknown'}, ok ${!!r?.ok})`);
   return { resumed: !!r?.ok, launch: r };
+}
+
+const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait */ } };
+
+/**
+ * `accounts go-live` run again while a runner waits for the app to stop (phase wait-stop): that runner is ended so the caller
+ * can start one from this copy of the plugin. Safe because the wait holds no lock and changes nothing; the go-live id and
+ * state stay. Replaces only a runner of another version (a claim with no version is an older one), and only while the app is
+ * still running (a stopped app means the link is starting: it is not interrupted). Any other phase is not touched.
+ * deps: { kill(pid), alive(pid), appRunning(), sleep(ms) } (tests). @returns {{replaced:boolean, reason?:string, pid?:number, version?:string|null}}
+ */
+export function replaceWaitingRunner(ctx, deps = {}) {
+  const p = goLiveInProgress(ctx);
+  if (!p || p.result.status !== 'waiting' || !runnerAlive(ctx)) return { replaced: false, reason: 'no-waiting-runner' };
+  if (p.gl.phase !== 'wait-stop') return { replaced: false, reason: 'busy', phase: p.gl.phase };
+  const claim = readJson(claimFile(ctx), null);
+  if (!claim?.pid || claim.pid === process.pid) return { replaced: false, reason: 'no-waiting-runner' };
+  if (PLUGIN_VERSION && claim.version === PLUGIN_VERSION) return { replaced: false, reason: 'current', version: claim.version };
+  const appRunning = deps.appRunning ?? (() => !!appState({ ctx, probeProcesses: true, now: ctx.now() }).running);
+  if (!appRunning()) return { replaced: false, reason: 'app-stopped' };
+  const alive = deps.alive ?? pidAlive;
+  try { (deps.kill ?? ((pid) => process.kill(pid)))(claim.pid); } catch { /* it may already be gone */ }
+  const nap = deps.sleep ?? sleepSync;
+  for (let i = 0; i < 50 && alive(claim.pid); i++) nap(100);
+  if (alive(claim.pid)) return { replaced: false, reason: 'kill-failed', pid: claim.pid };
+  // the old runner is gone: drop its claim and the time limit it stored (a 0.5.0 runner kept a 30 minute one); the state is kept
+  try { unlinkSync(claimFile(ctx)); } catch { /* none */ }
+  const gl = readGoLive(ctx);
+  if (gl?.id === p.gl.id) { gl.deadlines = {}; saveGoLive(ctx, gl); }
+  glog(ctx, `waiting runner (pid ${claim.pid}, version ${claim.version ?? 'older'}) replaced by version ${PLUGIN_VERSION}`);
+  return { replaced: true, pid: claim.pid, version: claim.version ?? null };
 }
 
 /* ------------------------------------------------------------------ the SessionStart report */
@@ -284,6 +339,7 @@ export function goLiveReportText(res) {
     return `session-sync: the account go-live stopped at phase "${res.phase}". ${first((res.messages ?? []).slice(-1), 1)} Run: accounts go-live (it resumes). ${log}`.replace(/\s+/g, ' ');
   }
   if (!FINAL_STATUSES.includes(res.status)) {
+    if (res.phase === 'wait-stop') return `session-sync: ${WAIT_NOTE} (The account go-live is waiting for Claude to stop.) ${log}`;
     return `session-sync: the account go-live is still running (phase "${res.phase}", after the restart). Its result is shown at the next session start. Follow it with: accounts status. ${log}`;
   }
   if (res.status === 'ok') return `session-sync: the account go-live finished. The accounts are linked${facts ? ` (${facts})` : ''}. No action needed here; the after-go-live checklist in /session-sync:accounts lists what is left to do by hand. ${log}`;
@@ -323,7 +379,8 @@ export async function runGoLive(ctx, deps = {}) {
   const T = { ...DEFAULT_TIMEOUTS, ...(deps.timeouts ?? {}) };
   const testPoll = Number(process.env.SESSION_SYNC_TEST_POLL_MS) || 0;
   const pollMs = deps.pollMs ?? (testPoll || 30 * 1000);
-  const gapMs = deps.gapMs ?? (testPoll || 10 * 1000);
+  const stopPollMs = deps.stopPollMs ?? deps.pollMs ?? (testPoll || STOP_POLL_MS);   // the stop waits look often: the link starts when the app stops
+  const gapMs = deps.gapMs ?? (testPoll || STOP_GAP_MS);
   const probeEveryMs = deps.probeEveryMs ?? (testPoll || 10 * MIN);
   const clock = deps.clock ?? Date.now;
   const realSleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
@@ -358,8 +415,28 @@ export async function runGoLive(ctx, deps = {}) {
     return !!appState({ ctx, probeProcesses: probe, now: ctx.now() }).fullAllowed;
   };
   const running = () => (deps.appStatus ? !!deps.appStatus(ctx).running : !!appState({ ctx, probeProcesses: true, now: ctx.now() }).running);
-  const deadline = (name, ms) => { gl.deadlines[name] ??= clock() + ms; return gl.deadlines[name]; };
-  const finalize = (status, msg) => {
+  // no limit (Infinity): nothing is stored, and a limit an older runner stored for this name is dropped
+  const deadline = (name, ms) => {
+    if (!Number.isFinite(ms)) { delete gl.deadlines[name]; return Infinity; }
+    gl.deadlines[name] ??= clock() + ms;
+    return gl.deadlines[name];
+  };
+  /**
+   * Start Claude again after it was quit for the go-live. Runs as soon as the link or the rollback is done, and in every end
+   * state reached after the app was stopped. Not with --no-relaunch, not when this go-live already started it since the last
+   * stop, not when the app is running (it never stopped, or the user started it).
+   */
+  async function startAppAgain(why) {
+    if (gl.opts.noRelaunch || gl.relaunch) return;
+    if (running()) return;
+    const rl = await doRelaunch(ctx);
+    gl.relaunch = rl ?? { ok: false, error: 'unknown' };
+    if (rl?.ok) { log(`relaunch (${why}): ${rl.method}${rl.aumid ? ` ${rl.aumid}` : ''}`); note('Claude was started again.'); }
+    else note(`Could not start Claude (${rl?.error ?? 'unknown'}). Open it yourself.`);
+    save();
+  }
+  const finalize = async (status, msg) => {
+    try { await startAppAgain(`end: ${status}`); } catch (e) { log(`relaunch failed: ${e?.message ?? e}`); }   // before the failure text, which stays the last message
     if (msg) note(msg);
     if (status === 'ok' && gl.flags.attention) status = 'attention';
     gl.phase = status === 'failed' ? gl.phase : 'done';
@@ -373,14 +450,14 @@ export async function runGoLive(ctx, deps = {}) {
   /** Wait until the app is stopped on two readings a gap apart. 'ok' | 'timeout'. */
   async function waitStopped(name, ms) {
     const dl = deadline(name, ms);
-    let neg = 0; let firstNeg = 0;
+    let neg = 0; let firstNeg = 0; let lastBeat = 0;
     for (;;) {
-      beat();
+      if (Date.now() - lastBeat >= 10 * 1000) { beat(); lastBeat = Date.now(); }   // looking twice a second: the timer and this keep the claim fresh
       const now = clock();
       if (now >= dl) { delete gl.deadlines[name]; save(); return 'timeout'; }
       if (stopped()) { if (!neg) firstNeg = now; neg++; } else neg = 0;
-      if (neg >= 2 && now - firstNeg >= gapMs) { delete gl.deadlines[name]; save(); return 'ok'; }
-      await sleep(pollMs);
+      if (neg >= 2 && now - firstNeg >= gapMs) { delete gl.deadlines[name]; gl.relaunch = null; save(); return 'ok'; }   // the app is down: a new relaunch is owed
+      await sleep(stopPollMs);
     }
   }
 
@@ -411,11 +488,8 @@ export async function runGoLive(ctx, deps = {}) {
       log(`rollback attempt ${attempt}: ${r.ok ? 'ok' : `failed (${r.code ?? r.error ?? 'unknown'})`}`);
       if (r.ok) {
         note('Rollback finished. The store is back to its pre-link state; nothing is linked.');
+        await startAppAgain('rollback');   // first: the user gets Claude back as soon as the store is restored
         if (gl.pausedPush) { try { setPush(true); gl.pushReEnabled = true; note('Push is back on (nothing is linked).'); } catch (e) { attention(`Could not switch push back on: ${e?.message ?? e}. Run: config enabled true`); } }
-        if (!gl.opts.noRelaunch) {
-          const rl = await doRelaunch(ctx);
-          gl.relaunch = rl; note(rl?.ok ? 'Claude was started again.' : `Could not start Claude (${rl?.error ?? 'unknown'}). Open it yourself.`);
-        }
         return finalize('rolled_back', null);
       }
       if (r.errors?.length) {
@@ -437,8 +511,8 @@ export async function runGoLive(ctx, deps = {}) {
         try { q = await (deps.requestQuit ?? requestAppQuit)(); } catch (e) { q = { supported: true, requested: false, reason: String(e?.message ?? e) }; }
         gl.quitRequested = true; save();
         if (q?.requested) note(q.slow ? 'Asked Claude to quit; it is still closing down.' : 'Asked Claude to quit.');
-        else note(`Claude could not be asked to quit (${q?.reason ?? 'unknown'}). Quit it from the tray icon or the app menu. Closing the window only hides it.`);
-      } else note('Waiting for the Claude app to stop. Quit it from the tray icon or the app menu.');
+        else note(`Claude could not be asked to quit (${q?.reason ?? 'unknown'}). ${WAIT_NOTE}`);
+      } else note(WAIT_NOTE);
       const r = await waitStopped('wait-stop', T.stopMs);
       if (r === 'timeout') {
         return finalize('failed', 'Timed out waiting for the app to stop. Your answer is still recorded. Quit Claude, then run: accounts go-live (it resumes).');
@@ -468,7 +542,7 @@ export async function runGoLive(ctx, deps = {}) {
         try { res = await doLink(ctx, { reasons: ['go-live'] }); } catch (e) { return rollbackFlow(`the link threw: ${e?.message ?? e}`); }
         beat();
         if (res.ok) {
-          linkedThisRun = true; gl.appSeenSinceLink = false;
+          linkedThisRun = true; gl.relaunch = null; gl.appSeenSinceLink = false;
           gl.backupId = res.backupId ?? loadState(ctx).backupId; save();
           log(`linked (backup ${gl.backupId})`);
           await deps.afterLink?.(ctx);
@@ -606,13 +680,13 @@ export async function runGoLive(ctx, deps = {}) {
   const hbTimer = setInterval(beat, deps.heartbeatMs ?? HEARTBEAT_MS);
   hbTimer.unref?.();
   try {
-    if (prev?.id === gl.id && prev.status === 'failed') { gl.deadlines = {}; log('resuming after a stopped run'); }
+    if (prev?.id === gl.id && prev.status === 'failed') { gl.deadlines = {}; gl.relaunch = null; log('resuming after a stopped run'); }
     log(`runner started (pid ${process.pid}), phase ${gl.phase}`);
     writeResult(ctx, gl, 'waiting');
     for (;;) {
       if (gl.phase === 'done') break;
       const fn = steps[gl.phase];
-      if (!fn) { finalize('failed', `Unknown phase "${gl.phase}" in the go-live state.`); break; }
+      if (!fn) { await finalize('failed', `Unknown phase "${gl.phase}" in the go-live state.`); break; }
       await deps.onPhase?.(gl.phase);
       log(`phase: ${gl.phase}`);
       const done = gl.phase;
@@ -623,6 +697,7 @@ export async function runGoLive(ctx, deps = {}) {
     }
     return { exit: 'done', status: readGoLiveResult(ctx)?.status };
   } catch (e) {
+    try { await startAppAgain('runner error'); } catch { /* best effort */ }
     note(`The runner stopped on an error: ${e?.message ?? e}. Run: accounts go-live (it resumes).`);
     save(); writeResult(ctx, gl, 'failed');
     return { exit: 'failed', status: 'failed' };

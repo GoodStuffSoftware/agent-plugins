@@ -21,8 +21,15 @@ import { unknownAccountKeys, CFG as DESKTOP_CONFIG } from './settings.mjs';
 
 const id8 = (s) => (s ? String(s).slice(0, 8) : null);
 
+/** The one line that leads every message about the account link: what the user does, and what happens. (go-live starts Claude again by itself.) */
+export const RESTART_LEAD = 'Restart Claude to sync your accounts: quit Claude from the tray icon or app menu, the sync starts right away and Claude reopens by itself when it is done.';
+/** The same for a link that is not a go-live (a plain `answer yes` or `link` waiter): it does not start Claude again. */
+export const RESTART_LEAD_WAITER = 'Restart Claude to sync your accounts: quit Claude from the tray icon or app menu and the sync starts right away; open Claude again when the notice says it is done.';
+/** What the user is told while a go-live waits for the app to stop (the command, the runner's notes and `accounts status`). */
+export const WAIT_NOTE = `${RESTART_LEAD} There is no time limit and nothing needs to be run again. Closing the window only hides it.`;
+
 export const REASON_TEXT = {
-  'app-running': 'the Claude desktop app is running (quit it from the tray icon first)',
+  'app-running': 'the Claude desktop app is running; this runs by itself after your next normal quit',
   'app-started': 'the Claude desktop app started during the pass; it will finish when the app exits',
   'no-group': 'no pair of accounts is answered yes (run: accounts answer yes)',
   'not-linked': 'the accounts are not linked',
@@ -77,7 +84,7 @@ export function formatPass(sum) {
   if (sum.skipped) { out.push(`Not run: ${REASON_TEXT[sum.skipped] ?? sum.skipped}.`); return out; }
   if (!sum.ok) {
     out.push(`Not finished: ${REASON_TEXT[sum.reason] ?? sum.reason ?? 'unknown reason'}.`);
-    if (sum.owed || sum.aborted) out.push('A full pass is owed; it runs when the app is stopped.');
+    if (sum.owed || sum.aborted) out.push('A full pass is owed; it runs by itself after your next normal quit of Claude.');
     return out;
   }
   out.push(head);
@@ -88,7 +95,7 @@ export function formatPass(sum) {
   }
   if (sum.tasks) out.push(`Tasks: ${sum.tasks.written} file(s) written, ${sum.tasks.deleted} removed. Backlog: ${sum.backlog?.written ?? 0} written.`);
   if (sum.settings) out.push(`Settings: ${sum.settings.written} file(s) updated${sum.settings.refused ? `, ${sum.settings.refused} refused` : ''}. Memory: ${sum.memory?.copied ?? 0} copied.`);
-  if (sum.owed) out.push(`Owed: ${sum.owed} item(s) wait for a full pass (app stopped).`);
+  if (sum.owed) out.push(`Owed: ${sum.owed} item(s) wait for a full pass (it runs by itself after your next normal quit).`);
   for (const n of sum.notes) out.push(`Note: ${n}`);
   return out.slice(0, 15);
 }
@@ -170,6 +177,9 @@ export function collectStatus(ctx, o = {}) {
 
 export function formatStatus(st, { all = false } = {}) {
   const out = [];
+  // the one line the user needs when a link is waiting for them to quit Claude
+  if (st.goLive?.status === 'waiting' && st.goLive.phase === 'wait-stop') out.push(WAIT_NOTE);
+  else if (!st.linked && st.app?.running && st.waiter?.alive && (st.waiter.reasons ?? []).includes('link')) out.push(RESTART_LEAD_WAITER);
   const signed = st.accounts.find((a) => a.signedIn);
   out.push(`Accounts: ${st.accounts.map((a) => `${a.id}${a.signedIn ? '*' : ''}`).join(', ') || 'none'}${signed ? ' (* signed in)' : ''}; ${plural(st.folders.length, 'folder')}.`);
   if (st.accounts.length < 2) { out.push('Only one account on this machine: nothing to link.'); return out; }
@@ -205,7 +215,7 @@ export function formatStatus(st, { all = false } = {}) {
 
 /** One status line for the go-live result file. */
 export function formatGoLive(g) {
-  const last = (g.messages ?? []).slice(-1)[0];
+  const last = String((g.messages ?? []).slice(-1)[0] ?? '').replace(WAIT_NOTE, '').trim();   // the wait note leads `accounts status` on its own
   const phase = g.status === 'waiting' ? ` (phase ${g.phase})` : '';
   const done = g.finishedAt ? `, finished ${g.finishedAt}` : '';
   const paused = g.status !== 'ok' && g.push?.pausedByGoLive && !g.push?.reEnabled ? ' Push is paused by go-live and stays off until it finishes or you run: config enabled true.' : '';
