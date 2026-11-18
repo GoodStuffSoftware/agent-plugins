@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync, mkdirSync, renameSync, unlinkSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, win32 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { userInfo } from 'node:os';
 import { STATE_DIR, loadConfig, rcSettings } from '../config.mjs';
@@ -37,8 +37,8 @@ const isWin = (o) => (o.platform ?? process.platform) === 'win32';
 const xmlEsc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 /** The scheduler binary of this machine (full path: the task and the calls do not depend on PATH). */
-export const schtasksExe = (env = process.env) => join(env.SystemRoot ?? env.windir ?? 'C:\\Windows', 'System32', 'schtasks.exe');
-export const wscriptExe = (env = process.env) => join(env.SystemRoot ?? env.windir ?? 'C:\\Windows', 'System32', 'wscript.exe');
+export const schtasksExe = (env = process.env) => win32.join(env.SystemRoot ?? env.windir ?? 'C:\\Windows', 'System32', 'schtasks.exe');
+export const wscriptExe = (env = process.env) => win32.join(env.SystemRoot ?? env.windir ?? 'C:\\Windows', 'System32', 'wscript.exe');
 
 /** DOMAIN\user of the current user, as the task XML wants it. */
 export function currentUser(env = process.env) {
