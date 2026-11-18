@@ -38,6 +38,7 @@ import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
 import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass } from './accounts/rcrestore.mjs';
+import { rcRepair } from './accounts/rcrepair.mjs';
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
@@ -800,6 +801,16 @@ async function accountsCommand(sub, args) {
   }
 
   if (sub === 'go-live') return goLiveCommand(ctx, args);
+
+  // the file-side steps of the random-Remote-Control-name repair for one session (the skill drives the app-side steps)
+  if (sub === 'rc-repair') {
+    const idArg = args.find((a) => !a.startsWith('--'));
+    if (!idArg) { console.error('Usage: accounts rc-repair <localSessionId|cliSessionId> [--stop-cli] [--dry-run] [--force] [--verify] [--json]'); return 2; }
+    const r = await rcRepair(ctx, { id: idArg, stopCli: has('--stop-cli'), dryRun: has('--dry-run'), force: has('--force'), verify: has('--verify'), platform: platform(), log });
+    const { text, ...facts } = r;
+    emit({ command: 'rc-repair', ...facts, text }, [text]);
+    return r.ok ? 0 : (r.status === 'verify-failed' ? 1 : 3);
+  }
 
   // Remote Control relink at Windows logon: the command the "session-sync RC restore" task runs, and its install and removal.
   if (sub === 'rc-restore') {

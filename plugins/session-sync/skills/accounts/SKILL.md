@@ -1,5 +1,5 @@
 ---
-description: Share Code-tab conversations, local scheduled tasks and app settings between several claude.ai accounts signed into the Claude desktop app on one machine. Use when the user wants to share conversations between accounts, has a second claude.ai account, switched accounts and lost their sessions, or asks what link, unlink, rollback or the accountLink setting do.
+description: Share Code-tab conversations, local scheduled tasks and app settings between several claude.ai accounts signed into the Claude desktop app on one machine. Use when the user wants to share conversations between accounts, has a second claude.ai account, switched accounts and lost their sessions, or asks what link, unlink, rollback or the accountLink setting do. Also use it when a Remote Control session shows a random name (for example old-guy-2-lovely-thimble) while its Claude process is running, or the user says the RC name is wrong.
 ---
 
 # Link conversations across claude.ai accounts
@@ -177,6 +177,18 @@ Restarting the Claude app turns Remote Control off for every Code session, and a
 - **Windows restart or shutdown:** the app quits with the OS, so the quit-time relink cannot run. A hidden per-user logon task, "session-sync RC restore", runs `accounts rc-restore --if-app-stopped` before Claude starts and does the relink then (nothing owed exits quietly; this step writes nothing while the app runs). It installs itself at a session start; by hand: `node "<plugin>/lib/cli.mjs" accounts rc-restore install-logon-task` or `uninstall-logon-task` (each saves `rcRestore.logonTask` so a removal sticks). Do not run `--if-app-stopped` yourself while Claude runs: it refuses.
 - **Live relink (0.5.7, while the app runs):** a stale or random-name link of a session whose CLI is not running (quiet 2 minutes, not mid-turn, never your own session) is cleared in place after a backup, so its next connect gets a titled link. It runs from the wake prompt, from the watcher every `rcRestore.liveEveryMs`, and as a sweep at an account switch; one `sync.log` line per pass. By hand: `node "<plugin>/lib/cli.mjs" accounts rc-restore --live [--all] [--dry-run] [--json]` (`--dry-run` lists what it would clear and why; it changes nothing). It never stops a process.
 - **Settings** (`node "<plugin>/lib/cli.mjs" config rcRestore.<key> <value>`): `rcRestore.liveRelink` (default `idle-only`; `off` = no live relink), `rcRestore.liveMax` (default 10, 1 to 100), `rcRestore.liveEveryMs` (default 600000), `rcRestore.enabled` (default true), `rcRestore.days` (default 3, 1 to 90), `rcRestore.wake` (default true; false = relink and free restore only), `rcRestore.wakeMax` (default 4, 1 to 50: sessions woken per restart), `rcRestore.logonTask` (default true; false = no logon task, and removes it).
+
+## Random Remote Control name on a running session
+
+A session whose Claude process runs can show a random Remote Control name on claude.ai (the CLI holds a `noHistoryBackfill` link in memory, so clearing the transcript while it runs does nothing). The fix needs the CLI stopped while the clear line is written, so it is a manual procedure. **Mike approved stopping that session's CLI for this repair (2026-11-18).** That covers an idle session only: never one that is mid-turn. Do **one session at a time**. `<id>` is the local session id (`local_<uuid>`) or the CLI session id; `<session>` below is the app tool's session argument.
+
+1. App tool `set_remote_control(<session>, false)`.
+2. Look first: `node "<plugin>/lib/cli.mjs" accounts rc-repair <id> --stop-cli --dry-run --json` lists the pids it would stop and what it would clear. It refuses a mid-turn session, a link that is already cleared or healthy (`--force` overrides), a live CLI without `--stop-cli`, and an unreadable process list.
+3. Run it for real: `node "<plugin>/lib/cli.mjs" accounts rc-repair <id> --stop-cli [--json]`. It stops only the `claude.exe` whose command line holds that exact `--resume <cliSessionId>` (hidden), confirms it is gone, backs the transcript up under `~/.claude/session-sync/accounts/rc-restore/backup/<stamp>/`, and appends the CLI's own clear line (a newline first if the file lacks one). It works whatever `rcRestore.enabled` is. It never prints command lines.
+4. Wake the session: send it the message `Remote Control relink check from session-sync: no action needed. Reply "ok" in one word and do nothing else.` `set_remote_control(true)` is refused until the session is active.
+5. App tool `set_remote_control(<session>, true)`.
+6. Verify: `node "<plugin>/lib/cli.mjs" accounts rc-repair <id> --verify` prints the last link id, whether it has `noHistoryBackfill`, and PASS or FAIL. PASS means a new `cse_` id without `noHistoryBackfill`.
+7. Tell the user to archive the old random-name entry on claude.ai, signed in as the account that shows it. Archiving before step 6 passes makes the next connect mint another random name.
 
 ## Don't overstate
 
