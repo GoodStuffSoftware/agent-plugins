@@ -1132,6 +1132,9 @@ if (cmd === 'rc-wake') {
         writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`);
       }
     }
+    // 0.5.9: a session started from claude.ai or the phone under the other account is only reported here (the app runs; the repair waits
+    // for a quit or a switch). Throttled to one pass per 10 minutes, independent of `rcRestore.enabled`, never writes a record.
+    if (input.session_id && prompt && !prompt.startsWith('/')) spawnLook(makeCtx(), { log, settings });
   } catch (e) { log(`rc-wake failed: ${e?.message || e}`); }
   process.exit(0);
 }

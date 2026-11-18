@@ -146,7 +146,9 @@ test('L6 off Windows and with rcRestore disabled: no-op, the app state is not ev
   const boom = () => { throw new Error('must not be read'); };
   assert.equal((await rcLogonStep(w.ctx, { platform: 'linux', readApp: boom })).reason, 'platform');
   assert.equal((await rcLogonStep(w.ctx, { platform: 'darwin', readApp: boom })).reason, 'platform');
-  assert.equal((await rcLogonStep(w.ctx, { settings: { ...RC_DEFAULTS, enabled: false }, readApp: boom })).reason, 'disabled');
+  // 0.5.9: "disabled" now needs rc restore AND the spawn fix off; with only rc restore off the spawn fix still looks (nothing owed here)
+  assert.equal((await rcLogonStep(w.ctx, { settings: { ...RC_DEFAULTS, enabled: false, spawnFix: 'off' }, readApp: boom })).reason, 'disabled');
+  assert.equal((await rcLogonStep(w.ctx, { settings: { ...RC_DEFAULTS, enabled: false }, readApp: boom })).reason, 'nothing-owed');
 });
 
 /* ------------------------------------------------------------------ the launcher */

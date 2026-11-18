@@ -343,10 +343,13 @@ export async function rcQuitStep(ctx, o = {}) {
  * relink is owed per rcPlan, it runs the same quit step the waiter runs (rcQuitStep: relink, then free restore, each write checked against
  * the app's lock marker and made after a backup). When the app is running, or starts mid-way, nothing is written past that point and the
  * relink stays owed. Nothing owed: returns quietly, no log line.
+ * 0.5.9: the foreign Remote Control spawn fix (rcspawn.mjs) is owed work too, and is not gated by `rcRestore.enabled`, only by
+ * `rcRestore.spawnFix`: with rc restore off it runs alone (spawnFixStep); with it on, rcQuitStep runs it after the relink planning.
  * o: { settings (rcSettings), platform, readApp(): the appState object (tests), tries/retryMs (an unknown process probe is retried), sleep,
- *      log(line), + the options of rcPlan / rcQuitStep: acct, now, days, projects, stopped }
- * @returns {Promise<{ran:boolean, reason?:string, res?, plan?}>}
- *   reason: platform | disabled | no-account | app-running | app-unknown | nothing-owed | locked
+ *      log(line), + the options of rcPlan / rcQuitStep: acct, now, days, projects, stopped; spawnFix overrides settings.spawnFix }
+ * @returns {Promise<{ran:boolean, reason?:string, res?, plan?, spawn?}>}
+ *   spawn: the spawnFixCore / spawnFixStep result (found, fixed, failed, pending, skipped) when the spawn fix looked at the store
+ *   reason: platform | disabled (rc restore and the spawn fix are both off) | no-account | app-running | app-unknown | nothing-owed | locked
  */
 export async function rcLogonStep(ctx, o = {}) {
   const log = o.log ?? (() => {});

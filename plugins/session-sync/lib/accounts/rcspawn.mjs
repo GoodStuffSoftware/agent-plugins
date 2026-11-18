@@ -73,6 +73,7 @@ function byCreation(rec, history, cur) {
 /** What is wrong with one parsed record: { spawnId, spawnForeign, foreignIds, undated }. */
 function decide(rec, fc, tp, cur) {
   const out = { spawnId: null, spawnForeign: false, foreignIds: [], undated: false };
+  if (rec.remoteControlSpawn && typeof rec.remoteControlSpawn === 'object' && rec.remoteControlSpawn.detachedAt !== undefined) return out;   // already detached (by the app or by this module): never touched again
   const spawn = liveSpawn(rec) ? rec.remoteControlSpawn : null;
   if (spawn) {
     out.spawnId = typeof spawn.ccrSessionId === 'string' ? spawn.ccrSessionId : null;

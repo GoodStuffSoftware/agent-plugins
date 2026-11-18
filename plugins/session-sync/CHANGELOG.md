@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** foreign Remote Control spawn records are detected and repaired at an account switch. A session started from claude.ai or the phone under the account that was signed in before a switch keeps a live `remoteControlSpawn` and `cse_` bridge ids of the old account, so every resume attaches to the old account's org and the app stops the session. With Claude stopped, the account pass, the quit step, the logon step and the watcher's stop step now back the record up (byte for byte, under `accounts/rc-restore/backup/<stamp>/`), then edit it in place (one inode, so every hard link shows the change): the spawn gets `detachedAt` exactly as the app writes it, and the foreign ids leave `bridgeSessionIds`. Own-account, already-detached and undated records are never touched; nothing is written while the app runs (the wake hook and the watcher only report, "pending, fixed at the next quit or switch"). A record whose unedited round trip is not byte-identical is left alone and reported.
+* **session-sync:** `accounts rc-spawn-fix [--dry-run] [--json]` runs it by hand (a real run needs Claude stopped; `--dry-run` reads only and works while it runs). Setting `rcRestore.spawnFix` (`auto` default, or `off` for no automatic repair; also `config rcRestore.spawnFix`), independent of `rcRestore.enabled`.
+* **session-sync:** `accounts status` lists the sessions flagged now and the ones fixed earlier, and `sync.log` gets one `rc-spawn: found N, fixed M, pending P, skipped S` line per pass that found something.
+
 ## 0.5.8 - 2026-11-18
 
 ### Added
