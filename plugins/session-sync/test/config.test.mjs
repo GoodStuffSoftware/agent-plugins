@@ -81,10 +81,13 @@ test('accountLink: defaults to ask; the plugin option env var wins; an unknown v
 
 test('rcRestore: defaults, a partial block keeps the other defaults, a bad value falls back, saveConfig merges the block', async () => {
   const { loadConfig, saveConfig, describeConfig, rcSettings, RC_DEFAULTS, CONFIG_FILE } = await import('../lib/config.mjs');
-  assert.deepEqual({ ...DEFAULTS.rcRestore }, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
-  assert.deepEqual({ ...RC_DEFAULTS }, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
-  assert.deepEqual(describeConfig({ ...DEFAULTS, remoteFrom: 'default' }).rcRestore, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
-  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+  assert.deepEqual({ ...DEFAULTS.rcRestore }, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000, spawnFix: 'auto' });
+  assert.deepEqual({ ...RC_DEFAULTS }, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000, spawnFix: 'auto' });
+  assert.deepEqual(describeConfig({ ...DEFAULTS, remoteFrom: 'default' }).rcRestore, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000, spawnFix: 'auto' });
+  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000, spawnFix: 'auto' });
+  assert.equal(rcSettings({ rcRestore: { spawnFix: 'off' } }).spawnFix, 'off');
+  assert.equal(rcSettings({ rcRestore: { spawnFix: 'maybe' } }).spawnFix, 'auto');
+  assert.equal(rcSettings({ rcRestore: { enabled: false } }).spawnFix, 'auto');
   assert.equal(rcSettings({ rcRestore: { days: 'x' } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 91 } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 1 } }).days, 1);
@@ -97,6 +100,6 @@ test('rcRestore: defaults, a partial block keeps the other defaults, a bad value
     saveConfig({ rcRestore: { days: 5 } });
     saveConfig({ rcRestore: { wake: false } });
     assert.deepEqual(JSON.parse((await import('node:fs')).readFileSync(CONFIG_FILE, 'utf8')).rcRestore, { days: 5, wake: false });
-    assert.deepEqual(loadConfig().rcRestore, { enabled: true, days: 5, wake: false, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+    assert.deepEqual(loadConfig().rcRestore, { enabled: true, days: 5, wake: false, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000, spawnFix: 'auto' });
   } finally { try { unlinkSync(CONFIG_FILE); } catch { /* none */ } }
 });

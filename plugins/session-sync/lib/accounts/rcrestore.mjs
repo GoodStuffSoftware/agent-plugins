@@ -34,6 +34,7 @@ import { listFolders, RECORD } from './folders.mjs';
 import { lockfilePresent, lockStartedAtMs, readSignedIn, appState } from './appstate.mjs';
 import { makeForeign } from './rclinks.mjs';
 import { liveCliIds } from './proc.mjs';
+import { spawnFixCore, spawnFixMode, spawnPlan, spawnFixStep } from './rcspawn.mjs';
 
 export const DAY_MS = 24 * 3600 * 1000;
 /** The app's launch pass accepts a marker younger than this (qz = 36e5 in the app bundle). */
@@ -318,8 +319,10 @@ export async function rcQuitStep(ctx, o = {}) {
   const lock = await withAccountsLock(ctx, () => {
     const plan = rcPlan(ctx, { ...o, persist: true });
     if (!plan.acct) return { ran: false, reason: 'no-account' };
+    // sessions started from claude.ai under another account: detached at this stop (rcspawn.mjs; not gated by rcRestore.enabled, only by spawnFix)
+    const spawn = spawnFixCore(ctx, { ...o, acct: plan.acct, apply: true });
     if (!plan.relink.length) clearRelinkOwed(ctx);
-    if (!plan.relink.length && !plan.targets.length) return { ran: false, reason: 'nothing-to-do', plan };
+    if (!plan.relink.length && !plan.targets.length) return { ran: false, reason: 'nothing-to-do', plan, spawn };
     const res = applyPlan(ctx, plan, o);
     if (res.status === 'ok') clearRelinkOwed(ctx);   // every relink of the plan is done (or no longer needed): nothing is owed
     writeJsonAtomic(accPath(ctx, 'rc-restore.json'), {
@@ -327,7 +330,7 @@ export async function rcQuitStep(ctx, o = {}) {
       relinked: res.relinked, marked: res.marked, refreshed: res.refreshed, status: res.status,
       targets: plan.targets.map((t) => t.id),
     });
-    return { ran: true, plan, res };
+    return { ran: true, plan, res, spawn };
   });
   if (!lock.ok) return { ran: false, reason: 'locked' };
   return lock.value;
@@ -348,12 +351,15 @@ export async function rcQuitStep(ctx, o = {}) {
 export async function rcLogonStep(ctx, o = {}) {
   const log = o.log ?? (() => {});
   if ((o.platform ?? ctx.platform ?? process.platform) !== 'win32') return { ran: false, reason: 'platform' };
-  if (o.settings && !o.settings.enabled) return { ran: false, reason: 'disabled' };
+  const rcOn = !(o.settings && !o.settings.enabled);
+  const spawnOn = spawnFixMode(o) !== 'off';   // the spawn fix (rcspawn.mjs) is not gated by rcRestore.enabled
+  if (!rcOn && !spawnOn) return { ran: false, reason: 'disabled' };
   if (!ctx.store || !ctx.userData) return { ran: false, reason: 'no-store' };
   const po = { ...o, days: o.days ?? o.settings?.days };   // rcRestore.days is the window, as for the waiter's quit step
-  const plan = rcPlan(ctx, po);   // read only, and before the process probe: with nothing owed (the usual logon) no PowerShell is started
+  const plan = rcOn ? rcPlan(ctx, po) : { acct: (o.acct ?? readSignedIn(ctx.userData)) || null, relink: [] };   // read only, and before the process probe: with nothing owed (the usual logon) no PowerShell is started
   if (!plan.acct) return { ran: false, reason: 'no-account' };
-  if (!plan.relink.length) { clearRelinkOwed(ctx); return { ran: false, reason: 'nothing-owed', plan }; }
+  const spawnOwed = spawnOn && spawnPlan(ctx, { ...po, acct: plan.acct }).flagged.length > 0;
+  if (!plan.relink.length && !spawnOwed) { clearRelinkOwed(ctx); return { ran: false, reason: 'nothing-owed', plan }; }
   const readApp = o.readApp ?? (() => appState({ ctx, probeProcesses: true, now: ctx.now() }));
   const tries = Math.max(1, o.tries ?? 3);
   const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -369,10 +375,15 @@ export async function rcLogonStep(ctx, o = {}) {
     return { ran: false, reason };
   }
   const detail = [];   // the per-session lines of the quit step: one summary line is logged, the details only when the step did not finish
-  const r = await rcQuitStep(ctx, { ...po, log: (l) => detail.push(l) });   // re-plans under accounts.lock and checks the lock marker before every write
+  const stepLog = (l) => { if (l.startsWith('rc-spawn:')) log(l); else detail.push(l); };   // the spawn fix has its own line
+  if (!rcOn) {   // rc restore is off: only the spawn fix is owed (it takes the lock itself and checks the lock marker before every write)
+    const spawn = await spawnFixStep(ctx, { ...po, acct: plan.acct, apply: true, log: stepLog });
+    return { ran: spawn.ran, reason: spawn.ran ? undefined : (spawn.reason ?? 'nothing-owed'), spawn };
+  }
+  const r = await rcQuitStep(ctx, { ...po, log: stepLog });   // re-plans under accounts.lock and checks the lock marker before every write
   if (!r.ran) {
     if (r.reason === 'locked') log('rc-restore: logon relink skipped, another pass holds the accounts lock');
-    return { ran: false, reason: r.reason ?? 'nothing-owed' };
+    return { ran: false, reason: r.reason ?? 'nothing-owed', ...(r.spawn ? { spawn: r.spawn } : {}) };
   }
   const x = r.res;
   log(`rc-restore: logon relink: ${x.relinked} relinked, ${x.marked} marked, ${x.refreshed} refreshed, status ${x.status}${x.status === 'refused_app_running' ? ' (the app started)' : ''}`);

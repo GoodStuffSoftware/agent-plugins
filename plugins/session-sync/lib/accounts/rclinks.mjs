@@ -244,34 +244,36 @@ export function makeForeign(ctx, acct, o = {}) {
   const fresh = {};
   let undated = 0;   // links this check could not date (kept: an undatable link is never called foreign)
   const lastSwitch = list.length && list[list.length - 1].acct === cur ? list[list.length - 1].at : null;
-  function foreign(bridgeId, transcript) {
-    if (!bridgeId) return false;
+  /** 'foreign' | 'own' (minted under the signed-in account, or no link) | 'undated' (cannot be told; not foreign). */
+  function classify(bridgeId, transcript) {
+    if (!bridgeId) return 'own';
     if (cache.has(bridgeId)) return cache.get(bridgeId);
-    let r = false;
+    let r = 'own';
     const led = links[bridgeId];
-    if (led?.acct) r = lower(led.acct) !== cur;
+    if (led?.acct) r = lower(led.acct) !== cur ? 'foreign' : 'own';
     else if (list.length) {
       const { before: seen, after } = transcript ? firstSeenBounds(transcript, bridgeId) : { before: null, after: null };
       if (seen !== null) {
         const a = acctAt(list, seen, cur);
         // the link may have been minted after the last event before it: when the next event is under another account, it cannot be dated
         const straddles = after !== null && acctAt(list, after, cur) !== a;
-        if (a && !straddles) { fresh[bridgeId] = { acct: a, firstSeen: seen }; r = a !== cur; }
-        else undated++;
+        if (a && !straddles) { fresh[bridgeId] = { acct: a, firstSeen: seen }; r = a !== cur ? 'foreign' : 'own'; }
+        else { undated++; r = 'undated'; }
       } else if (transcript && lastSwitch !== null) {
         let m = null; try { m = statSync(transcript).mtimeMs; } catch { /* gone */ }
-        if (m !== null && m < lastSwitch) { const a = acctAt(list, m, cur); r = !!a && a !== cur; }   // untouched since the switch: dated by its last write
-        else undated++;
-      } else undated++;
-    }
+        if (m !== null && m < lastSwitch) { const a = acctAt(list, m, cur); r = a && a !== cur ? 'foreign' : (a ? 'own' : 'undated'); }   // untouched since the switch: dated by its last write
+        else { undated++; r = 'undated'; }
+      } else { undated++; r = 'undated'; }
+    } else r = 'undated';   // no history at all: nothing to date it by
     cache.set(bridgeId, r);
     return r;
   }
+  const foreign = (bridgeId, transcript) => classify(bridgeId, transcript) === 'foreign';
   function flush() {
     try {
       if (dirty) writeHistory(ctx, list);
       observeLinks(ctx, fresh);
     } catch { /* a cache: the next pass rebuilds it */ }
   }
-  return { foreign, flush, history: list, get undated() { return undated; } };
+  return { foreign, classify, flush, history: list, get undated() { return undated; } };
 }
