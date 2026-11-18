@@ -37,7 +37,8 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
-import { rcSettings, decideWake } from './accounts/rcrestore.mjs';
+import { rcSettings, decideWake, rcLogonStep } from './accounts/rcrestore.mjs';
+import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
@@ -347,6 +348,20 @@ function rcHookArm() {
 }
 
 /**
+ * The setup of the "session-sync RC restore" logon task, next to the waiter's setup (a session start): installed while rcRestore is enabled and
+ * rcRestore.logonTask is on, removed when either is off. Windows only. A stamp keeps the usual run free of any process start.
+ * A sandboxed test run (the app-state seam) skips it unless the scheduler seam (SESSION_SYNC_TEST_SCHTASKS) stands in for schtasks.
+ */
+function rcLogonTaskSetup() {
+  if (platform() !== 'win32') return;
+  if (process.env.SESSION_SYNC_TEST_APP_STATE && !process.env.SESSION_SYNC_TEST_SCHTASKS) return;
+  if (!makeCtx().store) return;
+  const r = ensureLogonTask({ settings: rcRestoreNow() });
+  if (r.action === 'installed' || r.action === 'removed') log(`rc-restore: logon task ${r.action} ("session-sync RC restore")`);
+  else if (r.ok === false) log(`rc-restore: logon task setup failed: ${r.error}`);
+}
+
+/**
  * For the interactive commands (go-live, answer yes), never the hook: end a waiter left by an older copy of the plugin, so the
  * next one (armWaiter, or the runner) comes from this copy. Never throws.
  */
@@ -486,6 +501,7 @@ async function accountsHookStep() {
     try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     await accountsHookStepInner(parts);
     try { rcHookArm(); } catch { /* never block a session */ }   // after the account step: that one may have armed the waiter with a reason of its own
+    try { rcLogonTaskSetup(); } catch { /* never block a session */ }
   } finally {
     if (parts.length) writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: parts.join('\n\n') } })}\n`);
   }
@@ -641,7 +657,7 @@ async function accountsCommand(sub, args) {
   const ctx = makeCtx();
   const hook = args.includes('--from-hook');
   const has = (f) => args.includes(f);
-  if (!ctx.store && sub !== 'wait' && sub !== 'launch-detached') {
+  if (!ctx.store && sub !== 'wait' && sub !== 'launch-detached' && sub !== 'rc-restore') {
     emit({ ok: false, reason: 'no-store' }, ['The Claude desktop session store was not found on this machine.']);
     return 3;
   }
@@ -761,6 +777,27 @@ async function accountsCommand(sub, args) {
 
   if (sub === 'go-live') return goLiveCommand(ctx, args);
 
+  // Remote Control relink at Windows logon: the command the "session-sync RC restore" task runs, and its install and removal.
+  if (sub === 'rc-restore') {
+    const what = args.find((a) => !a.startsWith('--'));
+    if (what === 'install-logon-task' || what === 'uninstall-logon-task') {
+      const install = what === 'install-logon-task';
+      // an explicit install or removal is the user's choice: it is kept in rcRestore.logonTask, or the next session start would undo a removal
+      try { saveConfig({ rcRestore: { logonTask: install } }); } catch { /* the task itself matters more */ }
+      const r = install ? installLogonTask() : uninstallLogonTask();
+      log(`rc-restore: ${what}: ${r.action}${r.ok ? '' : ` FAILED ${r.error}`}`);
+      emit({ command: 'rc-restore', ...r }, [r.ok ? (r.action === 'skipped' ? 'Nothing to do: the logon task is Windows only.' : `Logon task "session-sync RC restore": ${r.action}${install ? '' : ' (rcRestore.logonTask is now false, so a session start does not put it back)'}.`) : `Logon task failed: ${r.error}`]);
+      return r.ok ? 0 : 1;
+    }
+    if (what || !has('--if-app-stopped')) {
+      console.error('Usage: accounts rc-restore --if-app-stopped | install-logon-task | uninstall-logon-task');
+      return 2;
+    }
+    const r = await rcLogonStep(ctx, { settings: rcRestoreNow(), platform: platform(), log });
+    if (r.ran) emit({ ok: true, command: 'rc-restore', ran: true, relinked: r.res.relinked, status: r.res.status }, [`Remote Control relink: ${r.res.relinked} relinked (${r.res.status}).`]);
+    return 0;   // nothing owed, the app running, or an unknown state all end quietly: the task retries at the next logon
+  }
+
   // hidden: the helper the SessionStart hook starts (detached, hidden). Only the two long-lived entries may be launched.
   if (sub === 'launch-detached') {
     const ok = args[0] === 'accounts' && (args[1] === 'wait' || args[1] === 'golive-run');
@@ -784,7 +821,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task');
   return 2;
 }
 
@@ -847,12 +884,19 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, accountLink: value, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  if (key === 'rcRestore.enabled' || key === 'rcRestore.wake') {
+  if (key === 'rcRestore.enabled' || key === 'rcRestore.wake' || key === 'rcRestore.logonTask') {
     const sub = key.split('.')[1];
     const on = /^(true|1|yes|on)$/i.test(value);
     saveConfig({ rcRestore: { [sub]: on } });
     log(`config: ${key} -> ${on}`);
-    console.log(JSON.stringify({ ok: true, [key]: on, configFile: CONFIG_FILE }, null, 2));
+    const facts = { ok: true, [key]: on, configFile: CONFIG_FILE };
+    if (sub !== 'wake') {   // the logon task follows rcRestore.enabled and rcRestore.logonTask at once (Windows only; a no-op elsewhere)
+      try {
+        const t = ensureLogonTask({ settings: rcRestoreNow(), force: true });
+        if (t.action !== 'skipped' && t.action !== 'none') { facts.logonTask = t.ok ? t.action : `failed: ${t.error}`; log(`config: logon task ${facts.logonTask}`); }
+      } catch (e) { facts.logonTask = `failed: ${e?.message ?? e}`; }
+    }
+    console.log(JSON.stringify(facts, null, 2));
     process.exit(0);
   }
   if (key === 'artifactShare.enabled') {
@@ -895,7 +939,7 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'rcRestore.days': n, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, artifactShare.enabled, artifactShare.email');
+  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, rcRestore.logonTask, artifactShare.enabled, artifactShare.email');
   process.exit(2);
 }
 

@@ -22,7 +22,7 @@ export const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 export const CONFIG_FILE = join(STATE_DIR, 'config.json');
 
 /** Remote Control restore (accounts/rcrestore.mjs). Defined here, with the other settings; rcrestore.mjs re-exports it. */
-export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4 });
+export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
 
 /** The `rcRestore` settings from a loaded config, validated: a partial block keeps the other defaults, a bad value falls back. */
 export function rcSettings(cfg = {}) {
@@ -34,6 +34,7 @@ export function rcSettings(cfg = {}) {
     days: Number.isFinite(days) && days >= 1 && days <= 90 ? days : RC_DEFAULTS.days,
     wake: raw.wake === undefined ? RC_DEFAULTS.wake : raw.wake !== false,
     wakeMax: Number.isInteger(wakeMax) && wakeMax >= 1 && wakeMax <= 50 ? wakeMax : RC_DEFAULTS.wakeMax,
+    logonTask: raw.logonTask === undefined ? RC_DEFAULTS.logonTask : raw.logonTask !== false,
   };
 }
 
@@ -96,6 +97,7 @@ export const DEFAULTS = Object.freeze({
   //   enabled: relink stale links and mark sessions so the app reconnects them at its next start (free, no model turn)
   //   days:    only sessions active within this many days are looked at (1-90)
   //   wake:    after the restart, the first prompt of one session wakes the rest with one short turn each (costs a turn per session)
+  //   logonTask: a hidden "At log on" task runs the relink after a Windows restart, when the quit step could not (false: no task)
   rcRestore: RC_DEFAULTS,
   // Share new artifacts with the other linked account (invite sent and accepted by an agent-driven browser; artifacts.mjs; `config artifactShare.enabled|email`).
   artifactShare: Object.freeze({ enabled: true, emails: Object.freeze({}) }),
