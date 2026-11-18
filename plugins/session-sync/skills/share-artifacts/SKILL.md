@@ -1,5 +1,5 @@
 ---
-description: Share artifacts between the two linked claude.ai accounts: send an Editor invite from a browser signed in as the owner and accept it in a browser signed in as the receiver, both driven by an agent (the desktop app's browser pane, and Claude in Chrome when it is set up). Use when a session-sync notice says artifacts are waiting to be shared, or the user asks to share, invite or give the other account access to their artifacts.
+description: Share artifacts between the two linked claude.ai accounts by sending an Editor invite from a browser signed in as the owner and accepting it in a browser signed in as the receiver, both driven by an agent (the desktop app's browser pane, and Claude in Chrome when it is set up). Use when a session-sync notice says artifacts are waiting to be shared, or the user asks to share, invite or give the other account access to their artifacts.
 ---
 
 # Share artifacts between the two linked accounts
