@@ -190,14 +190,14 @@ function bridgeLineStart(fd, abs, len, size) {
   return b.subarray(ls, le).includes('"type":"bridge-session"') ? { start: a + ls, end: a + le } : null;
 }
 
-/** The `timestamp` of the nearest of the (up to 3) lines after offset `le` (the newline that ends the bridge line); null when none has one. */
+/** The `timestamp` of the nearest of the (up to 20: metadata lines carry none) lines after offset `le` (the newline that ends the bridge line); null when none has one. */
 function timestampAfter(fd, le, size) {
   const from = le + 1;
   if (from >= size) return null;
   const b = Buffer.alloc(Math.min(BLOCK, size - from));
   readSync(fd, b, 0, b.length, from);
   let pos = 0;
-  for (let k = 0; k < 3 && pos < b.length; k++) {
+  for (let k = 0; k < 20 && pos < b.length; k++) {
     let nl = b.indexOf(10, pos); if (nl < 0) nl = b.length;
     const text = b.subarray(pos, nl).toString('latin1');
     TS.lastIndex = 0;

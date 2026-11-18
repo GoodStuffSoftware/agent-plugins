@@ -546,6 +546,18 @@ test('L31 a link whose neighbours straddle the last switch cannot be dated: not 
   assert.equal(d.undated, 1);
 });
 
+test('L31b the straddle check looks past timestamp-less metadata lines after the link line', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_between', at: '2026-11-16T18:21:00.000Z', laterMs: 120_000 });
+  const lines = readFileSync(tp, 'utf8').trimEnd().split('\n');   // user, assistant, bridge, later (dated after the switch)
+  const meta = Array.from({ length: 6 }, (_, i) => JSON.stringify({ type: 'queue-operation', operation: `op${i}` }));
+  writeFileSync(tp, [...lines.slice(0, 3), ...meta, lines[3]].join('\n') + '\n');
+  setMtime(tp, NOW - 3600_000);
+  const d = await pass(w, { dryRun: true });
+  assert.deepEqual(d.wouldClear, []);
+  assert.equal(d.undated, 1);
+});
+
 test('L32 the preview lists every session a pass would clear, however many; a real pass stops at liveMax', async () => {
   const w = world();
   for (let n = 1; n <= 5; n++) session(w, n, { link: `cse_nhb${n}`, nhb: true, ageMs: n * 3600_000 });
