@@ -22,19 +22,26 @@ export const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 export const CONFIG_FILE = join(STATE_DIR, 'config.json');
 
 /** Remote Control restore (accounts/rcrestore.mjs). Defined here, with the other settings; rcrestore.mjs re-exports it. */
-export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
+export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+
+export const LIVE_RELINK_MODES = Object.freeze(['off', 'idle-only']);
 
 /** The `rcRestore` settings from a loaded config, validated: a partial block keeps the other defaults, a bad value falls back. */
 export function rcSettings(cfg = {}) {
   const raw = cfg?.rcRestore && typeof cfg.rcRestore === 'object' ? cfg.rcRestore : {};
   const days = Number(raw.days);
   const wakeMax = Number(raw.wakeMax);
+  const liveMax = Number(raw.liveMax);
+  const liveEveryMs = Number(raw.liveEveryMs);
   return {
     enabled: raw.enabled === undefined ? RC_DEFAULTS.enabled : raw.enabled !== false,
     days: Number.isFinite(days) && days >= 1 && days <= 90 ? days : RC_DEFAULTS.days,
     wake: raw.wake === undefined ? RC_DEFAULTS.wake : raw.wake !== false,
     wakeMax: Number.isInteger(wakeMax) && wakeMax >= 1 && wakeMax <= 50 ? wakeMax : RC_DEFAULTS.wakeMax,
     logonTask: raw.logonTask === undefined ? RC_DEFAULTS.logonTask : raw.logonTask !== false,
+    liveRelink: LIVE_RELINK_MODES.includes(raw.liveRelink) ? raw.liveRelink : RC_DEFAULTS.liveRelink,
+    liveMax: Number.isInteger(liveMax) && liveMax >= 1 && liveMax <= 100 ? liveMax : RC_DEFAULTS.liveMax,
+    liveEveryMs: Number.isFinite(liveEveryMs) && liveEveryMs >= 60000 && liveEveryMs <= 86400000 ? Math.floor(liveEveryMs) : RC_DEFAULTS.liveEveryMs,
   };
 }
 
@@ -98,6 +105,8 @@ export const DEFAULTS = Object.freeze({
   //   days:    only sessions active within this many days are looked at (1-90)
   //   wake:    after the restart, the first prompt of one session wakes the rest with one short turn each (costs a turn per session)
   //   logonTask: a hidden "At log on" task runs the relink after a Windows restart, when the quit step could not (false: no task)
+  //   liveRelink: 'idle-only' (default) clears a stale link of a session whose CLI is not running while the app runs; 'off' never does
+  //   liveMax / liveEveryMs: the most links one live pass clears (default 10), and how often the watcher looks (default 600000 ms)
   rcRestore: RC_DEFAULTS,
   // Share new artifacts with the other linked account (invite sent and accepted by an agent-driven browser; artifacts.mjs; `config artifactShare.enabled|email`).
   artifactShare: Object.freeze({ enabled: true, emails: Object.freeze({}) }),

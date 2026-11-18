@@ -32,7 +32,8 @@ import { fullPass, livePass, link, unlink, owedWork } from './pass.mjs';
 import { PLUGIN_VERSION, codeHash, compareVersions } from './version.mjs';
 import { verifyProcess, WAITER_MARKER } from './procid.mjs';
 import { nullUi, progressInfo } from './progress.mjs';
-import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS } from './rcrestore.mjs';
+import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS, liveRelinkPass } from './rcrestore.mjs';
+import { RC_DEFAULTS } from '../config.mjs';
 
 const asksOp = (rs) => rs.some((r) => r === 'link' || r === 'unlink');
 /** How long the watcher looks for the app's own launch-restore lines after a start (they come within a minute or two). */
@@ -354,6 +355,16 @@ export async function runWaiter(ctx, o = {}) {
     if (!a?.fullAllowed) return;
     try { await rcQuitStep(ctx, rcOptions()); } catch (e) { o.log?.(`waiter: remote control refresh failed: ${e?.message ?? e}`); }
   };
+  /**
+   * The live relink (rcrestore.mjs liveRelinkPass), while the app runs: clear the stale link of a session whose CLI is not running.
+   * `all` is the sweep at an account switch (every record, not only the recent ones). It logs its own line. Never throws.
+   */
+  const liveStep = async (all) => {
+    const c = rcCfg();
+    if (!c || c.liveRelink !== 'idle-only') return;
+    try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
+    catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); }
+  };
   /** After the app started: say what its own launch restore did (the pass line with its outcome), so we learn whether the server flags allow it here. */
   const rcLaunchLook = () => {
     const L = w.rcLaunch;
@@ -368,7 +379,7 @@ export async function runWaiter(ctx, o = {}) {
   };
   // the watcher's own state: events only set flags (S6: an event is a hint, the poll does the same work)
   const w = { dirty: false, dirtyAt: 0, event: false, coolUntil: 0, fullDone: false, settledProbeAt: -Infinity, uiMuteUntil: 0,
-    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0 };
+    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0, liveAt: clock() };
   const rcRefreshMs = o.rcRefreshMs ?? MARKER_REFRESH_MS;
   const uiGapMs = o.uiGapMs ?? (testPoll ? 0 : 1500);
   /** The accounts are not linked and nothing asks for a link: this watcher only does the Remote Control restore. */
@@ -438,6 +449,9 @@ export async function runWaiter(ctx, o = {}) {
       if (app.running) { w.fullDone = false; w.rcDone = false; w.rcTries = 0; }
       if (app.running && w.rcLaunch && rcCfg()) rcLaunchLook();
       else if (!app.running && w.rcDone && rcCfg() && clock() - w.rcRefreshAt >= rcRefreshMs) await rcRefresh();
+      // the live relink, every liveEveryMs while the app runs (the first look after an app start is the wake hook's)
+      if (!app.running) w.liveAt = clock();
+      else if (rcCfg() && clock() - w.liveAt >= (o.liveEveryMs ?? rcCfg().liveEveryMs ?? RC_DEFAULTS.liveEveryMs)) { w.liveAt = clock(); await liveStep(false); }
 
       // ---- the app runs and the accounts are linked: keep the folders the app has not loaded current
       if (watching && app.running) {
@@ -453,7 +467,10 @@ export async function runWaiter(ctx, o = {}) {
             let res = null;
             try { res = await livePass(ctx, { app, remoteList: readJson(accPath(ctx, 'remote-list.json'), null), ...(o.passOpts?.() ?? {}) }); } catch (e) { o.log?.(`waiter: targeted pass failed: ${e?.message ?? e}`); }
             if (res?.rectify?.conflicts?.length) o.log?.(`waiter: ${res.rectify.conflicts.length} conversation(s) continued from a stale copy`);
-            if (res?.switched) o.log?.(`waiter: the signed-in account changed; the previous account's folders cool for a few seconds`);
+            if (res?.switched) {
+              o.log?.(`waiter: the signed-in account changed; the previous account's folders cool for a few seconds`);
+              await liveStep(true);   // the sessions of the account just signed in: clear every stale link while their CLIs are not running yet
+            }
             await toastConflicts(ctx, o.notify);
             const end = coolingEndsAt(loadState(ctx), ctx.now());
             w.coolUntil = end;

@@ -308,7 +308,7 @@ test('K13 the hooks file registers the command on UserPromptSubmit with no match
   assert.equal(entry[0].matcher, undefined);
   const h = entry[0].hooks[0];
   assert.deepEqual(h.args.slice(1), ['rc-wake', '--from-hook']);
-  assert.ok(h.timeout <= 10);
+  assert.equal(h.timeout, 30, "the claiming prompt may run the live relink (up to three hidden process listings): not the old 10");
   assert.equal(hooks.SessionStart.some((e) => JSON.stringify(e).includes('rc-wake')), false, 'not on SessionStart');
 });
 

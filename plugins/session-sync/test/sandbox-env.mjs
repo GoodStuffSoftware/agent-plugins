@@ -61,6 +61,9 @@ process.env.XDG_CONFIG_HOME = join(home, '.config');
 // Tests that start a background process use a plain detached spawn, never a CIM launch (launcher.mjs).
 process.env.SESSION_SYNC_TEST_LAUNCH = 'spawn';
 
+// The switch-history seed (rclinks.mjs) reads the app's remote-control.log; tests never read the real one.
+process.env.SESSION_SYNC_RC_LOG = '';
+
 // A stray CLAUDE_SESSION_SYNC_REMOTE in the developer's own shell would point
 // real pushes at a real remote. Tests set their own per-case.
 delete process.env.CLAUDE_SESSION_SYNC_REMOTE;

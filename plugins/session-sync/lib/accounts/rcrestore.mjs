@@ -4,9 +4,11 @@
  * After any app restart RC is off for every Code session, and after an account switch the CLI reattaches to links minted in a
  * cross-account fallback (random names, renames never reach them). Three steps, all driven by the singleton watcher (waiter.mjs) or a hook:
  *
- *   1. RELINK (app closed)       a transcript whose LAST `bridge-session` entry carries `noHistoryBackfill:true` or an owner other than the
- *                                current account gets the CLI's own clearing line appended (after a backup). The next connect then mints a
- *                                fresh link named with the session title. Only bridge-session lines are ever read from a transcript.
+ *   1. RELINK (app closed)       a transcript whose LAST `bridge-session` entry carries `noHistoryBackfill:true` or was minted under another
+ *                                account (rclinks.mjs: the ledger and the switch history; never the `ownerAccountUuid` stamp, which is the
+ *                                CLI's cached identity) gets the CLI's own clearing line appended (after a backup). The next connect then
+ *                                mints a fresh link named with the session title. Of a transcript only bridge-session lines are read, plus
+ *                                (to date a link) the `timestamp` token of the lines next to the first one that names it, and its mtime.
  *   2. FREE RESTORE (app closed) up to 4 of the most recent eligible records get `remoteControlLiveAtUpdateQuit {at, accountId}` and
  *                                `remoteControlAutoEligible: true`, the two fields the app's own launch pass reads (the one it uses after
  *                                a quit-for-update): it warms those sessions and reconnects RC with no model turn. `at` must be younger than
@@ -14,6 +16,8 @@
  *                                is never written (it would resume interrupted turns). The edit is in place, so hard links survive.
  *   3. WAKE (app running)        the first real prompt of an interactive session after a restart gets a one-time instruction (UserPromptSubmit
  *                                hook) that tells its agent to send a no-op message to every other session that is still off.
+ *   4. LIVE RELINK (app running) step 1 for one session at a time, while the app runs: only a session whose CLI is not running, quiet for
+ *                                2 minutes and not mid-turn (liveRelinkPass). Run by the wake hook, the watcher and an account switch.
  *
  * Everything here is plain file work with injected paths; the callers decide when the app is stopped.
  */
@@ -28,6 +32,8 @@ import { RC_DEFAULTS, rcSettings } from '../config.mjs';
 import { accPath, readJson, writeJsonAtomic, detectFormat, serializeJson, withAccountsLock } from './state.mjs';
 import { listFolders, RECORD } from './folders.mjs';
 import { lockfilePresent, lockStartedAtMs, readSignedIn, appState } from './appstate.mjs';
+import { makeForeign } from './rclinks.mjs';
+import { liveCliIds } from './proc.mjs';
 
 export const DAY_MS = 24 * 3600 * 1000;
 /** The app's launch pass accepts a marker younger than this (qz = 36e5 in the app bundle). */
@@ -123,12 +129,20 @@ export function lastBridgeEntry(file) {
   } finally { try { closeSync(fd); } catch { /* ignore */ } }
 }
 
-/** Does this saved link need clearing for `acct`? A link that is already cleared (empty id) does not. */
-export function needsRelink(entry, acct) {
-  if (!entry || !entry.bridgeSessionId) return false;
-  if (entry.noHistoryBackfill === true) return true;
-  const owner = typeof entry.ownerAccountUuid === 'string' ? entry.ownerAccountUuid.toLowerCase() : '';
-  return !!owner && owner !== String(acct).toLowerCase();
+/**
+ * Why does this saved link need clearing? 'noHistoryBackfill' (a random-name bounce link), 'foreign' (minted under another account, per
+ * `foreign(bridgeSessionId)`, which comes from the link ledger and the switch history), or null. A link that is already cleared (empty
+ * id) needs nothing. The entry's `ownerAccountUuid` is never read: the CLI stamps it from its own cached identity, so on a machine that
+ * switched accounts every link carries the old account's uuid, healthy ones included.
+ */
+export function relinkReason(entry, foreign = () => false) {
+  if (!entry || !entry.bridgeSessionId) return null;
+  if (entry.noHistoryBackfill === true) return 'noHistoryBackfill';
+  return foreign(entry.bridgeSessionId) === true ? 'foreign' : null;
+}
+
+export function needsRelink(entry, foreign = () => false) {
+  return relinkReason(entry, foreign) !== null;
 }
 
 /* ------------------------------------------------------------------ eligibility and the scan */
@@ -152,6 +166,17 @@ export function markerAge(rec, acct, now) {
   return now - m.at;
 }
 
+/** A linked account keeps each conversation once per org folder (hard links): one conversation, one entry (newest activity first), every path kept. */
+function bySession(recs) {
+  const map = new Map();
+  for (const r of [...recs].sort((a, b) => b.activity - a.activity)) {
+    const k = r.rec.sessionId ?? r.path;
+    const g = map.get(k);
+    if (g) g.files.push(r.path); else map.set(k, { ...r, files: [r.path] });
+  }
+  return [...map.values()];
+}
+
 /**
  * Read-only plan: what the step would do now.
  * @returns {{acct, records:number, recent:number, relink:object[], targets:object[], needMarks:object[], noTranscript:number}}
@@ -164,22 +189,19 @@ export function rcPlan(ctx, o = {}) {
   if (!acct) return plan;
   const recs = accountRecords(ctx, acct);
   plan.records = recs.length;
-  // A linked account keeps each conversation once per org folder (hard links): one conversation, one entry, every path kept.
-  const bySession = new Map();
-  for (const r of recs.filter((x) => x.activity >= now - days * DAY_MS).sort((a, b) => b.activity - a.activity)) {
-    const k = r.rec.sessionId ?? r.path;
-    const g = bySession.get(k);
-    if (g) g.files.push(r.path); else bySession.set(k, { ...r, files: [r.path] });
-  }
-  const recent = [...bySession.values()];
+  const recent = bySession(recs.filter((x) => x.activity >= now - days * DAY_MS));
   plan.recent = recent.length;
   const projects = o.projects ?? defaultProjects();
+  const fc = o.foreignCheck ?? makeForeign(ctx, acct, o);
+  Object.defineProperty(plan, 'foreignCheck', { value: fc, enumerable: false });   // applyPlan asks it again right before each write
   for (const r of recent) {
     const tp = findTranscript(projects, r.rec);
     if (!tp) { plan.noTranscript++; continue; }
     const b = lastBridgeEntry(tp);
-    if (needsRelink(b, acct)) plan.relink.push({ file: r.path, id: r.rec.sessionId, cliSessionId: r.rec.cliSessionId, title: r.rec.title ?? '', transcript: tp, link: b.bridgeSessionId });
+    const why = relinkReason(b, (id) => fc.foreign(id, tp));
+    if (why) plan.relink.push({ file: r.path, id: r.rec.sessionId, cliSessionId: r.rec.cliSessionId, title: r.rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why });
   }
+  if (o.persist) fc.flush();   // only a pass that writes keeps the ledger: a plan read (dry run, logon check) changes nothing on disk
   const elig = recent.filter((r) => eligible(r.rec));
   const ranked = [...elig.filter((r) => r.rec.remoteControlUserEnabled === true), ...elig.filter((r) => r.rec.remoteControlUserEnabled !== true)];   // RC switched on for sure first, then link history only
   plan.targets = ranked.slice(0, MAX_RESTORE)
@@ -261,7 +283,7 @@ export function applyPlan(ctx, plan, o = {}) {
     if (!stopped()) { res.status = 'partial'; res.skipped++; log(`rc-restore: ${a.id}: not cleared, the app started`); break; }
     try {
       const again = lastBridgeEntry(a.transcript);                     // verified right before the write
-      if (!needsRelink(again, plan.acct)) { res.skipped++; continue; }
+      if (!needsRelink(again, (id) => plan.foreignCheck?.foreign(id, a.transcript) === true)) { res.skipped++; continue; }
       ensureBackupDir();
       copyFileSync(a.transcript, join(backupDir, `${a.cliSessionId}.jsonl`));
       appendClearLine(a.transcript, a.cliSessionId);
@@ -294,7 +316,7 @@ export function applyPlan(ctx, plan, o = {}) {
  */
 export async function rcQuitStep(ctx, o = {}) {
   const lock = await withAccountsLock(ctx, () => {
-    const plan = rcPlan(ctx, o);
+    const plan = rcPlan(ctx, { ...o, persist: true });
     if (!plan.acct) return { ran: false, reason: 'no-account' };
     if (!plan.relink.length) clearRelinkOwed(ctx);
     if (!plan.relink.length && !plan.targets.length) return { ran: false, reason: 'nothing-to-do', plan };
@@ -532,4 +554,153 @@ export function decideWake(ctx, o = {}) {
   // once per app run (this claim): are relinks owed because the last stop was the OS ending the session, not an app quit?
   const owed = checkRelinkOwed(ctx, { startedAt, acct, now, days: s.days, projects: o.projects });
   return { act: true, reason: 'claimed-now', text: wakeInstruction({ days: s.days, max: s.wakeMax, relinkOwed: !!owed }), ...(owed ? { relinkOwed: owed.count } : {}) };
+}
+
+/* ------------------------------------------------------------------ the live relink (the app keeps running) */
+
+/** A transcript written to within this long may belong to a session that is working or has just finished: not cleared. */
+export const LIVE_QUIET_MS = 120 * 1000;
+
+const lc = (s) => String(s ?? '').toLowerCase();
+
+/**
+ * Read-only: the sessions of `acct` whose last saved link needs clearing, newest activity first. A session counts when its record is not
+ * archived, is local, has a CLI session id and a transcript, and its last `bridge-session` entry is a `noHistoryBackfill` link or one
+ * minted under another account (relinkReason). Which of them may be cleared NOW is the live gate (liveRelinkPass).
+ * o: { acct, now, days, all (every record, not only the recent ones), projects, foreignCheck, rcLog }
+ * @returns {{acct, records:number, noTranscript:number, candidates:object[], foreignCheck}}
+ */
+export function liveRelinkCandidates(ctx, o = {}) {
+  const acct = (o.acct ?? readSignedIn(ctx.userData)) || null;
+  const out = { acct, records: 0, noTranscript: 0, candidates: [], foreignCheck: null };
+  if (!acct) return out;
+  const now = o.now ?? ctx.now();
+  const days = o.days ?? RC_DEFAULTS.days;
+  const recs = accountRecords(ctx, acct, o.all ? {} : { sinceMs: now - days * DAY_MS });
+  const groups = bySession(recs);
+  out.records = groups.length;
+  const projects = o.projects ?? defaultProjects();
+  const fc = o.foreignCheck ?? makeForeign(ctx, acct, o);
+  out.foreignCheck = fc;
+  for (const r of groups) {
+    const rec = r.rec;
+    if (rec.isArchived === true || rec.movedToCloud || (rec.backend && rec.backend.kind && rec.backend.kind !== 'local') || !rec.cliSessionId) continue;
+    const tp = findTranscript(projects, rec);
+    if (!tp) { out.noTranscript++; continue; }
+    const b = lastBridgeEntry(tp);
+    const why = relinkReason(b, (id) => fc.foreign(id, tp));
+    if (!why) continue;
+    out.candidates.push({ file: r.path, id: rec.sessionId, cliSessionId: rec.cliSessionId, title: rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why, running: rec.isRunning === true });
+  }
+  return out;
+}
+
+/** The one log line of a live pass: `rc-live: cleared N (ids...), skipped live M, quiet Q, raced R` and the rest only when not zero. */
+export function liveLine(res) {
+  const extra = ['running', 'unknown', 'self', 'deferred', 'failed', 'stale'].filter((k) => res[k]).map((k) => `${k} ${res[k]}`);
+  return `rc-live: cleared ${res.cleared.length}${res.cleared.length ? ` (${res.cleared.map((c) => c.id.replace(/^local_/, '').slice(0, 8)).join(', ')})` : ''}, skipped live ${res.skippedLive}, quiet ${res.quiet}, raced ${res.raced}${extra.length ? `, ${extra.join(', ')}` : ''}`;
+}
+
+/**
+ * Clear the stale link of every session whose conversation has no CLI running, while the app runs (the CLI keeps the link in memory,
+ * so a clear line appended while it runs does nothing, and one appended while it does not makes the next cold resume mint a titled link).
+ * A session is cleared only when ALL hold, in this order:
+ *   1 candidate (liveRelinkCandidates)  2 not the session this hook runs in  3 no live CLI for that conversation (liveCliIds; unknown
+ *   clears nothing)  4 transcript untouched for LIVE_QUIET_MS  5 record not mid-turn (isRunning is not "no CLI": 3 is the real check)
+ *   6 right before the write: the list of CLIs read again, the last entry and the age read again, the transcript backed up, the CLI's own
+ *   clear line appended, then the list read once more: a CLI that appeared meanwhile is logged `raced` (benign: retried next pass).
+ * No process is ever stopped. At most `liveMax` sessions per pass.
+ * o: { settings (rcSettings), dryRun (read only; runs even when the feature is off), all, days, max, quietMs, now, acct, projects, rcLog,
+ *      hookCliSessionId, liveCliIds (function, Set or null; tests), cimTimeoutMs, log(line) }
+ * @returns {Promise<{ran:boolean, reason?:string, dryRun:boolean, acct, candidates:number, cleared:object[], wouldClear:object[],
+ *   skippedLive:number, quiet:number, running:number, unknown:number, self:number, raced:number, deferred:number, failed:number, stale:number,
+ *   undated:number (links the history could not date: left alone)}>}
+ */
+export async function liveRelinkPass(ctx, o = {}) {
+  const s = o.settings ?? RC_DEFAULTS;
+  const dry = o.dryRun === true;
+  const log = o.log ?? (() => {});
+  const res = { ran: false, dryRun: dry, acct: null, candidates: 0, cleared: [], wouldClear: [], skippedLive: 0, quiet: 0, running: 0, unknown: 0, self: 0, raced: 0, deferred: 0, failed: 0, stale: 0, undated: 0 };
+  if (!dry && (s.enabled === false || s.liveRelink !== 'idle-only')) return { ...res, reason: 'disabled' };
+  if (!ctx.store || !ctx.userData) return { ...res, reason: 'no-store' };
+  const nowMs = () => o.now ?? ctx.now();
+  const quietMs = o.quietMs ?? LIVE_QUIET_MS;
+  const max = o.max ?? s.liveMax ?? RC_DEFAULTS.liveMax;
+  const readLive = async () => {
+    const f = 'liveCliIds' in o ? o.liveCliIds : (() => liveCliIds({ platform: o.platform ?? ctx.platform, timeoutMs: o.cimTimeoutMs }));
+    const v = typeof f === 'function' ? await f() : f;
+    return v == null ? null : new Set([...v].map(lc));
+  };
+  const scan = liveRelinkCandidates(ctx, { acct: o.acct, now: nowMs(), days: o.days ?? s.days, all: o.all === true, projects: o.projects, rcLog: o.rcLog });
+  res.acct = scan.acct;
+  if (!scan.acct) return { ...res, reason: 'no-account' };
+  res.ran = true;
+  let cands = scan.candidates;
+  if (o.hookCliSessionId) cands = cands.filter((c) => (c.cliSessionId === o.hookCliSessionId ? (res.self++, false) : true));
+  res.candidates = cands.length;
+  res.undated = scan.foreignCheck.undated;
+  // the ledger and the history are a cache of what this pass just learned (atomic, add-only): kept by every pass that may write, so a
+  // link seen now is dated by when it was first seen even when nothing is cleared this time. A dry run keeps nothing.
+  if (!dry) scan.foreignCheck.flush();
+  if (!cands.length) return res;   // nothing to look at: the OS is not asked
+
+  const live = await readLive();
+  if (live === null) { res.unknown = cands.length; if (!dry) log(liveLine(res)); return res; }
+  const todo = [];
+  for (const c of cands) {
+    if (live.has(lc(c.cliSessionId))) { res.skippedLive++; continue; }
+    let m = null; try { m = statSync(c.transcript).mtimeMs; } catch { /* gone */ }
+    if (m === null) { res.stale++; continue; }
+    if (nowMs() - m < quietMs) { res.quiet++; continue; }
+    if (c.running) { res.running++; continue; }
+    todo.push(c);
+  }
+  const batch = todo.slice(0, Math.max(0, max));
+  res.deferred = todo.length - batch.length;
+  const summary = (c) => ({ id: c.id, cliSessionId: c.cliSessionId, title: c.title, why: c.why, link: c.link });
+  if (dry) { res.wouldClear = todo.map(summary); return res; }   // the whole list; a real pass clears the first `max` of it (res.deferred is the rest)
+  if (!batch.length) { log(liveLine(res)); return res; }
+
+  const lock = await withAccountsLock(ctx, async () => {
+    const live2 = await readLive();                                      // right before the writes
+    if (live2 === null) { res.unknown += batch.length; return; }
+    const backupDir = accPath(ctx, 'rc-restore', 'backup', stamp(nowMs()));
+    const written = [];
+    for (const c of batch) {
+      if (live2.has(lc(c.cliSessionId))) { res.skippedLive++; continue; }
+      try {
+        const again = lastBridgeEntry(c.transcript);
+        if (!again || again.bridgeSessionId !== c.link || !needsRelink(again, (id) => scan.foreignCheck.foreign(id, c.transcript))) { res.stale++; continue; }
+        if (nowMs() - statSync(c.transcript).mtimeMs < quietMs) { res.quiet++; continue; }
+        mkdirSync(backupDir, { recursive: true });
+        copyFileSync(c.transcript, join(backupDir, `${c.cliSessionId}.jsonl`));
+        appendClearLine(c.transcript, c.cliSessionId);
+        written.push(c); res.cleared.push(summary(c));
+      } catch (e) { res.failed++; log(`rc-live: ${c.id}: relink FAILED ${e?.message ?? e}`); }
+    }
+    if (written.length) {
+      const after = await readLive();                                    // a CLI that loaded the pointer before or after the write
+      if (after) for (const c of written) if (after.has(lc(c.cliSessionId))) res.raced++;
+      pruneBackups(ctx, nowMs());
+    }
+  });
+  if (!lock.ok) { log('rc-live: skipped, another pass holds the accounts lock'); return { ...res, ran: false, reason: 'locked' }; }
+  log(liveLine(res));
+  return res;
+}
+
+/**
+ * The wake hook with the live relink in front of it: the prompt that claims the restart (the instruction case and the baseline case) first
+ * clears the stale links of the sessions that have no CLI yet (right after an app start none runs), so the sessions the wake then
+ * reconnects load the cleared pointer. The session the hook runs in is never touched. Never throws.
+ * o: the options of decideWake + { log, liveCliIds, now, ... } for liveRelinkPass
+ */
+export async function wakeWithRelink(ctx, o = {}) {
+  const d = decideWake(ctx, o);
+  const s = o.settings ?? RC_DEFAULTS;
+  if ((d.act || d.reason === 'baseline') && s.liveRelink === 'idle-only') {
+    try { d.live = await liveRelinkPass(ctx, { ...o, hookCliSessionId: o.sessionId, days: s.days, settings: s }); }
+    catch (e) { o.log?.(`rc-live failed: ${e?.message ?? e}`); }
+  }
+  return d;
 }

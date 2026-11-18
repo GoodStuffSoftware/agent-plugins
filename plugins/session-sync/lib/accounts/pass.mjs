@@ -23,6 +23,7 @@ import {
   loadState, saveState, withAccountsLock, accPath, journalStart, journalRead, journalClear, tickMutation, rollbackActive,
 } from './state.mjs';
 import { listFolders, groupOf, answerPairs, homeOf } from './folders.mjs';
+import { recordSwitch } from './rclinks.mjs';
 import { appState, makeS1Guard, noteSignedIn, AppRunningError, noteSwitch, folderRoles, snapshotFolder } from './appstate.mjs';
 import { rectify, inventory } from './rectify.mjs';
 import { takeBackup, backupCopy } from './backup.mjs';
@@ -149,6 +150,7 @@ export async function livePass(ctx, o = {}) {
       const now = ctx.now();
       noteSignedIn(state, app.signedIn, now);
       const sw = noteSwitch(state, app.signedIn, now);
+      if (sw.changed) recordSwitch(ctx, app.signedIn, now, { prev: sw.prev });   // the account of each link is told from this history (rclinks.mjs)
       const roles = folderRoles(app, group, state, now, group.filter((f) => !(state.group ?? []).includes(f.key)).map((f) => f.key));
       // what the app most likely loaded when it opened the signed-in account's folders: a switch, or a new app run
       if (app.signedIn && (sw.changed || state.signed.snapRun !== app.startedAtMs)) {
