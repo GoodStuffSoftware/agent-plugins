@@ -97,7 +97,7 @@ export const DEFAULTS = Object.freeze({
   //   days:    only sessions active within this many days are looked at (1-90)
   //   wake:    after the restart, the first prompt of one session wakes the rest with one short turn each (costs a turn per session)
   rcRestore: RC_DEFAULTS,
-  // Invite new artifacts to the other linked account when the user switches accounts (artifacts.mjs; `config artifactShare.enabled|email`).
+  // Share new artifacts with the other linked account (invite sent and accepted by an agent-driven browser; artifacts.mjs; `config artifactShare.enabled|email`).
   artifactShare: Object.freeze({ enabled: true, emails: Object.freeze({}) }),
 });
 

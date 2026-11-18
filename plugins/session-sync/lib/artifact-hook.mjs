@@ -4,7 +4,8 @@
  * in every session (the wake on every prompt), and cli.mjs loads the whole sync engine first.
  *
  *   node artifact-hook.mjs capture   PostToolUse, matcher "Artifact": queue a newly published artifact. Prints nothing.
- *   node artifact-hook.mjs wake      UserPromptSubmit: tell ONE session to share, once per account switch. Prints nothing otherwise.
+ *   node artifact-hook.mjs wake      UserPromptSubmit: tell ONE session to share when a browser reachable from its account can send or accept
+ *                                    an entry (entries 2+ minutes old, once per 30 minutes per account). Prints nothing otherwise.
  *
  * Any error: exit 0 with no output, so a prompt or a tool call is never broken by this.
  */
@@ -59,7 +60,7 @@ try {
     const prompt = String(input.prompt ?? '').trim();
     const sid = typeof input.session_id === 'string' ? input.session_id : '';
     if (prompt && sid && !prompt.startsWith('/')) {
-      const d = await wake({ cfg: loadConfig(), sessionCheck: (active) => interactiveSessionFor(active, sid) });
+      const d = await wake({ cfg: loadConfig(), sessionKey: sid, sessionCheck: (active) => interactiveSessionFor(active, sid) });
       if (d.act) {
         log(`artifact-share: instruction given to session ${String(input.session_id ?? '').slice(0, 8)} for ${d.due.length} artifact(s)`);
         try { writeSync(1, `${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`); } catch { /* no stdout */ }
