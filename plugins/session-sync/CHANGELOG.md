@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** `accounts rc-repair <localSessionId|cliSessionId> [--stop-cli] [--dry-run] [--force] [--verify] [--json]`, the file-side steps of the standing fix for a Remote Control session that shows a random name while its Claude process runs. It refuses a mid-turn session, a link already cleared or healthy (without `--force`), a live CLI without `--stop-cli`, and an unreadable process list. With `--stop-cli` it stops only the `claude.exe` whose command line holds that exact `--resume <id>` (hidden), confirms it is gone, backs the transcript up, and appends the CLI's own clear line. `--verify` prints the last link id, whether it has `noHistoryBackfill`, and PASS or FAIL. Works whatever `rcRestore.enabled` is; never prints a command line.
+* **session-sync:** the accounts skill has a new section, "Random Remote Control name on a running session", with the seven-step procedure (app tool `set_remote_control` off, `rc-repair`, wake, `set_remote_control` on, `--verify`, archive the old entry on claude.ai), and its description now loads it for "random Remote Control name" and "RC name wrong".
+
 ## 0.5.7 - 2026-11-18
 
 ### Added

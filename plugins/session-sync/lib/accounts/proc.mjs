@@ -12,7 +12,7 @@
  * Windows only (the live relink is a Windows feature); elsewhere the answer is null. Test seam: `o.execFileFn` (child_process.execFile).
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 /** `--resume <id>`, `--resume=<id>`, and the same for `--session-id` (a session the app started fresh), optionally quoted. */
@@ -54,4 +54,77 @@ export function liveCliIds(o = {}) {
         (err, stdout) => resolve(err ? null : parseCliIds(stdout)));
     } catch { resolve(null); }
   });
+}
+
+/* ------------------------------------------------------------------ pids (0.5.8, accounts rc-repair) */
+
+const PID_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  `Get-CimInstance -ClassName Win32_Process -Filter "Name='claude.exe'" | ForEach-Object { 'P' + [char]9 + [string]$_.ProcessId + [char]9 + [string]$_.CommandLine }`,
+  `'${END_MARK}'`,
+].join('; ');
+const UUID_ONLY = new RegExp(`^${UUID}$`, 'i');
+
+/** Split a Windows command line into arguments, double quotes grouping (a quoted argument stays ONE token, so text inside `-p "..."` is never a flag). */
+function argvOf(cmd) {
+  const out = []; let cur = ''; let q = false; let has = false;
+  for (const c of String(cmd)) {
+    if (c === '"') { q = !q; has = true; continue; }
+    if (!q && /\s/.test(c)) { if (has) { out.push(cur); cur = ''; has = false; } continue; }
+    cur += c; has = true;
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+/** The conversation ids the arguments name as `--resume <id>` or `--resume=<id>` (real arguments only). */
+function resumeIdsOf(cmd) {
+  const a = argvOf(cmd); const ids = [];
+  for (let i = 0; i < a.length; i++) {
+    const v = a[i] === '--resume' ? a[i + 1] : a[i].startsWith('--resume=') ? a[i].slice(9) : null;
+    if (v && UUID_ONLY.test(v)) ids.push(v.toLowerCase());
+  }
+  return ids;
+}
+
+/**
+ * The claude.exe processes of the listing as [{pid, ids:[every conversation id named by --resume or --session-id], resume:[ids named by --resume]}],
+ * or null when the listing is not complete and readable. Only pids and ids are kept; a command line is never stored or printed.
+ */
+export function parseCliProcs(stdout) {
+  const lines = String(stdout ?? '').split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l !== '');
+  if (lines[lines.length - 1] !== END_MARK) return null;
+  const out = [];
+  for (const l of lines.slice(0, -1)) {
+    const m = /^P\t(\d+)\t([\s\S]*)$/.exec(l);
+    if (!m || !m[2].trim()) return null;
+    const grab = (re) => { const ids = []; re.lastIndex = 0; for (let x = re.exec(m[2]); x; x = re.exec(m[2])) ids.push(x[1].toLowerCase()); return ids; };
+    out.push({ pid: Number(m[1]), ids: grab(ID_FLAG), resume: resumeIdsOf(m[2]) });
+  }
+  return out;
+}
+
+/** @returns {Promise<Array<{pid:number, ids:string[], resume:string[]}>|null>}  Windows only; null elsewhere or when unknown. */
+export function liveCliProcs(o = {}) {
+  if ((o.platform ?? process.platform) !== 'win32') return Promise.resolve(null);
+  const run = o.execFileFn ?? execFile;
+  return new Promise((resolve) => {
+    try {
+      run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', PID_SCRIPT],
+        { windowsHide: true, timeout: o.timeoutMs ?? 15000, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+        (err, stdout) => resolve(err ? null : parseCliProcs(stdout)));
+    } catch { resolve(null); }
+  });
+}
+
+/** Stop the given pids (hidden, one taskkill each, that process only). Returns the pids taskkill reported as stopped. Test seam: o.spawnSyncFn. */
+export function stopPids(pids, o = {}) {
+  const run = o.spawnSyncFn ?? spawnSync;
+  const done = [];
+  for (const pid of pids) {
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    const r = run('taskkill.exe', ['/PID', String(pid), '/F'], { windowsHide: true, stdio: 'ignore', timeout: 15000 });
+    if (r && r.status === 0) done.push(pid);
+  }
+  return done;
 }

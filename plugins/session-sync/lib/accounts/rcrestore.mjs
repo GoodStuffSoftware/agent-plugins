@@ -167,7 +167,7 @@ export function markerAge(rec, acct, now) {
 }
 
 /** A linked account keeps each conversation once per org folder (hard links): one conversation, one entry (newest activity first), every path kept. */
-function bySession(recs) {
+export function bySession(recs) {
   const map = new Map();
   for (const r of [...recs].sort((a, b) => b.activity - a.activity)) {
     const k = r.rec.sessionId ?? r.path;
@@ -212,7 +212,7 @@ export function rcPlan(ctx, o = {}) {
 
 /* ------------------------------------------------------------------ writes (the app is stopped) */
 
-const stamp = (now) => new Date(now).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+export const stamp = (now) => new Date(now).toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 
 /** Delete backup folders older than BACKUP_KEEP_MS. Never throws. */
 export function pruneBackups(ctx, now = ctx.now()) {
