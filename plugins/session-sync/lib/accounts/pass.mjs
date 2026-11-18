@@ -24,6 +24,7 @@ import {
 } from './state.mjs';
 import { listFolders, groupOf, answerPairs, homeOf } from './folders.mjs';
 import { recordSwitch } from './rclinks.mjs';
+import { spawnFixCore } from './rcspawn.mjs';
 import { appState, makeS1Guard, noteSignedIn, AppRunningError, noteSwitch, folderRoles, snapshotFolder } from './appstate.mjs';
 import { rectify, inventory } from './rectify.mjs';
 import { takeBackup, backupCopy } from './backup.mjs';
@@ -116,6 +117,9 @@ function runFull(ctx, o, { state, app, group }, rep) {
     rep.backlog = mergeBacklog(group, common);
     rep.settings = mergeSettings(group, { ...common, signedIn: app.signedIn });
     rep.memory = mergeCoworkMemory(group, common);
+    // sessions started from claude.ai under another account (a switch left their Remote Control spawn pointing at the old org): detached now,
+    // while the app is stopped and the pass holds the lock (rcspawn.mjs; rcRestore.spawnFix 'off' skips it; never throws)
+    rep.spawn = spawnFixCore(ctx, { acct: app.signedIn, apply: true, log: o.log });
 
     state.linked = true;
     state.group = keys;

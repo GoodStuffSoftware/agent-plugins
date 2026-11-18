@@ -29,7 +29,7 @@
 
 import { push, pull, preflight, remoteNewer, remoteRecordList } from './sync.mjs';
 import { notify, registerWindowsSender } from './notify.mjs';
-import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES, LIVE_RELINK_MODES } from './config.mjs';
+import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES, LIVE_RELINK_MODES, SPAWN_FIX_MODES } from './config.mjs';
 import { acquireLock } from './lock.mjs';
 import { requestDeferred, refreshDeferred, settleDeferred, readDeferred } from './defer.mjs';
 import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic, rollbackActive, rollbackMarkerFile } from './accounts/state.mjs';
@@ -39,6 +39,7 @@ import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
 import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass } from './accounts/rcrestore.mjs';
 import { rcRepair } from './accounts/rcrepair.mjs';
+import { spawnPlan, spawnFixStep, spawnLook, spawnLine } from './accounts/rcspawn.mjs';
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
@@ -426,7 +427,7 @@ async function accountsPass(ctx, reason) {
   const app = appState({ ctx, probeProcesses: true });
   const remoteList = readJson(accPath(ctx, 'remote-list.json'), null);
   const res = app.fullAllowed
-    ? await fullPass(ctx, { app, remoteList, reasons: [reason] })
+    ? await fullPass(ctx, { app, remoteList, reasons: [reason], log })
     : await livePass(ctx, { app, remoteList });
   if (res.armWaiter || res.aborted || loadState(ctx).fullPassOwed) armWaiter(ctx, 'deferred');
   // the singleton watcher follows account switches while the app runs (go-live's last pass, every push and pull)
@@ -677,6 +678,42 @@ async function liveRelinkCommand(ctx, args) {
   return 0;
 }
 
+/**
+ * `accounts rc-spawn-fix [--dry-run] [--json]`: the sessions started from claude.ai or the phone under another account, by hand (rcspawn.mjs).
+ * --dry-run only reads (and runs while Claude does); a real run needs Claude stopped, takes a backup of every record first, and runs
+ * even when rcRestore.spawnFix is 'off' (that setting only turns the automatic runs off).
+ */
+async function spawnFixCommand(ctx, args) {
+  const dry = args.includes('--dry-run');
+  const base = { spawnFix: 'auto', log };
+  if (dry) {
+    const plan = spawnPlan(ctx, {});
+    const sessions = plan.flagged.map((s) => ({ id: s.id, title: s.title, spawn: s.spawn, foreignIds: s.ids.length }));
+    const lines = plan.flagged.map((s) => `would fix ${s.id.replace(/^local_/, '').slice(0, 8)} "${s.title}" (${[s.spawn ? 'spawn detached' : '', s.ids.length ? `${s.ids.length} foreign bridge id(s) removed` : ''].filter(Boolean).join(', ')})`);
+    lines.push(plan.flagged.length ? `Dry run: ${plan.flagged.length} session(s) would be fixed; quit Claude and run: accounts rc-spawn-fix` : 'Nothing to fix: no session of the signed-in account carries a Remote Control spawn from another account.');
+    const undated = plan.skipped.filter((s) => s.reason === 'undated').length;
+    const format = plan.skipped.filter((s) => s.reason === 'format').length;
+    if (undated) lines.push(`Left alone (cannot tell which account they were started under): ${undated}.`);
+    if (format) lines.push(`Left alone (the record's formatting would change if it were rewritten): ${format}.`);
+    emit({ ok: true, command: 'rc-spawn-fix', dryRun: true, acct: plan.acct, scanned: plan.scanned, found: plan.flagged.length, skipped: plan.skipped.length, sessions }, lines);
+    return 0;
+  }
+  const app = appState({ ctx, probeProcesses: true });
+  if (!app.fullAllowed) {
+    emit({ ok: false, command: 'rc-spawn-fix', reason: app.running ? 'app-running' : 'app-unknown' }, [app.running
+      ? 'Claude is running: its own saves would overwrite the edit. Quit it from the tray icon, then run: accounts rc-spawn-fix (a --dry-run works while it runs).'
+      : 'The state of Claude could not be read, so nothing was changed. Try again.']);
+    return 3;
+  }
+  const r = await spawnFixStep(ctx, { ...base, apply: true });
+  if (r.reason === 'locked') { emit({ ok: false, command: 'rc-spawn-fix', reason: 'locked' }, ['Another account pass holds the accounts lock; try again in a minute.']); return 3; }
+  const lines = r.fixed.map((f) => `fixed ${f.id.replace(/^local_/, '').slice(0, 8)} "${f.title}"`);
+  for (const f of r.failed) lines.push(`FAILED ${f.id.replace(/^local_/, '').slice(0, 8)} "${f.title}": ${f.detail}`);
+  lines.push(r.status === 'failed' ? 'The check failed; nothing was changed (see sync.log).' : r.found ? `${spawnLine(r)}${r.backupDir ? `. Backup: ${r.backupDir}` : ''}` : 'Nothing to fix: no session of the signed-in account carries a Remote Control spawn from another account.');
+  emit({ ok: r.status === 'ok', command: 'rc-spawn-fix', dryRun: false, acct: r.acct, scanned: r.scanned, found: r.found, fixed: r.fixed, failed: r.failed, pending: r.pending, skipped: r.skipped.length, status: r.status, backupDir: r.backupDir }, lines);
+  return r.status === 'ok' ? 0 : 3;
+}
+
 /** `accounts <sub> ...` (plan 6). Returns the exit code. */
 async function accountsCommand(sub, args) {
   const ctx = makeCtx();
@@ -726,7 +763,7 @@ async function accountsCommand(sub, args) {
     if (answer === 'no') { emit({ ok: true, command: 'answer', answered: pend.length, answer }, [`Recorded: not sharing (${pend.length} pair(s)). Change your mind with: accounts answer yes, or config accountLink.`]); return 0; }
     const app = appState({ ctx, probeProcesses: true });
     if (app.fullAllowed) {
-      const res = await link(ctx, {});
+      const res = await link(ctx, { log });
       const sum = summarizePass(res, 'link');
       emit({ command: 'answer', answered: pend.length, answer, ...sum }, formatPass(sum));
       return res.ok ? 0 : 3;
@@ -749,7 +786,7 @@ async function accountsCommand(sub, args) {
       if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, state.linked ? ['The accounts are already linked. Anything still owed runs by itself after your next normal quit of Claude.'] : [RESTART_LEAD_WAITER, 'Claude is running; closing the window only hides it.']);
       return 0;
     }
-    const res = await link(ctx, { app });
+    const res = await link(ctx, { app, log });
     printPass(res, 'link');
     return res.ok ? 0 : 3;
   }
@@ -812,6 +849,9 @@ async function accountsCommand(sub, args) {
     return r.ok ? 0 : (r.status === 'verify-failed' ? 1 : 3);
   }
 
+  // sessions started from claude.ai under another account: detach their spawn record (the app must be stopped), or --dry-run to look
+  if (sub === 'rc-spawn-fix') return spawnFixCommand(ctx, args);
+
   // Remote Control relink at Windows logon: the command the "session-sync RC restore" task runs, and its install and removal.
   if (sub === 'rc-restore') {
     const what = args.find((a) => !a.startsWith('--'));
@@ -831,7 +871,8 @@ async function accountsCommand(sub, args) {
       return 2;
     }
     const r = await rcLogonStep(ctx, { settings: rcRestoreNow(), platform: platform(), log });
-    if (r.ran) emit({ ok: true, command: 'rc-restore', ran: true, relinked: r.res.relinked, status: r.res.status }, [`Remote Control relink: ${r.res.relinked} relinked (${r.res.status}).`]);
+    if (r.ran && r.res) emit({ ok: true, command: 'rc-restore', ran: true, relinked: r.res.relinked, status: r.res.status, ...(r.spawn?.fixed?.length ? { spawnFixed: r.spawn.fixed.length } : {}) }, [`Remote Control relink: ${r.res.relinked} relinked (${r.res.status}).`]);
+    else if (r.ran && r.spawn) emit({ ok: true, command: 'rc-restore', ran: true, spawnFixed: r.spawn.fixed.length }, [`Remote Control: ${r.spawn.fixed.length} session(s) started from claude.ai under another account fixed.`]);
     return 0;   // nothing owed, the app running, or an unknown state all end quietly: the task retries at the next logon
   }
 
@@ -858,7 +899,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-spawn-fix [--dry-run] [--json]');
   return 2;
 }
 
@@ -964,6 +1005,16 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'rcRestore.liveRelink': value, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
+  if (key === 'rcRestore.spawnFix') {
+    if (!SPAWN_FIX_MODES.includes(value)) {
+      console.error(`"${value}" is not a valid rcRestore.spawnFix: use ${SPAWN_FIX_MODES.join(' or ')}.`);
+      process.exit(2);
+    }
+    saveConfig({ rcRestore: { spawnFix: value } });
+    log(`config: rcRestore.spawnFix -> ${value}`);
+    console.log(JSON.stringify({ ok: true, 'rcRestore.spawnFix': value, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
   if (key === 'rcRestore.wakeMax') {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 1 || n > 50) {
@@ -986,7 +1037,7 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'rcRestore.days': n, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, rcRestore.liveRelink, rcRestore.logonTask, artifactShare.enabled, artifactShare.email');
+  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, rcRestore.liveRelink, rcRestore.spawnFix, rcRestore.logonTask, artifactShare.enabled, artifactShare.email');
   process.exit(2);
 }
 
@@ -1076,14 +1127,20 @@ if (cmd === 'rc-wake') {
     try { if (!process.stdin.isTTY) input = JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { /* no input */ }
     const settings = rcRestoreNow();
     const prompt = String(input.prompt ?? '').trim();
+    let woke = false;
     if (settings.enabled && settings.wake && input.session_id && prompt && !prompt.startsWith('/')) {
       // the prompt that claims the restart also clears the stale links of the sessions that have no CLI yet (liveRelink), before the instruction goes out
       const d = await wakeWithRelink(makeCtx(), { settings, sessionId: String(input.session_id), log, cimTimeoutMs: 6000 });
       if (d.act) {
+        woke = true;
         log(`rc-wake: instruction given to session ${String(input.session_id).slice(0, 8)}${d.relinkOwed ? `; relink owed for ${d.relinkOwed} session(s), the user is asked to quit Claude once from the tray icon` : ''}`);
         writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`);
       }
     }
+    // 0.5.9: a session started from claude.ai or the phone under the other account is only reported here (the app runs; the repair waits
+    // for a quit or a switch). Throttled to one pass per 10 minutes, independent of `rcRestore.enabled`, never writes a record. Not on the prompt
+    // that gave the wake instruction (that one already spends most of the hook's time on the process listings).
+    if (!woke && input.session_id && prompt && !prompt.startsWith('/')) spawnLook(makeCtx(), { log, settings });
   } catch (e) { log(`rc-wake failed: ${e?.message || e}`); }
   process.exit(0);
 }

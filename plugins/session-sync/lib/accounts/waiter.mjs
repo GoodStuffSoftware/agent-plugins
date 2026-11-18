@@ -32,6 +32,7 @@ import { fullPass, livePass, link, unlink, owedWork } from './pass.mjs';
 import { PLUGIN_VERSION, codeHash, compareVersions } from './version.mjs';
 import { verifyProcess, WAITER_MARKER } from './procid.mjs';
 import { nullUi, progressInfo } from './progress.mjs';
+import { spawnFixCore, spawnFixStep, spawnLine } from './rcspawn.mjs';
 import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS, liveRelinkPass } from './rcrestore.mjs';
 import { RC_DEFAULTS } from '../config.mjs';
 
@@ -275,6 +276,8 @@ export async function runWaiter(ctx, o = {}) {
   const watching = o.watch === true;
   const watchFn = o.watchFn ?? watch;
   const rcCfg = () => { try { const c = typeof o.rcRestore === 'function' ? o.rcRestore() : o.rcRestore; return c && c.enabled ? c : null; } catch { return null; } };
+  /** The settings when the spawn fix (rcspawn.mjs) is on: not gated by `enabled`, only by `spawnFix`. */
+  const spawnCfg = () => { try { const c = typeof o.rcRestore === 'function' ? o.rcRestore() : o.rcRestore; return c && c.spawnFix !== 'off' ? c : null; } catch { return null; } };
 
   if (!claimWaiter(ctx)) return { exit: 'already-running' };
   const armedAt = new Date(ctx.now()).toISOString();
@@ -322,7 +325,7 @@ export async function runWaiter(ctx, o = {}) {
   const clock = o.clock ?? Date.now;           // loop timing; ctx.now() stays the stamp for files and state
 
   // ---- Remote Control restore (rcrestore.mjs): runs after the account pass, once per stop; the marker is kept young while Claude stays closed
-  const rcOptions = () => ({ days: rcCfg()?.days, ...(o.rcOpts ?? {}), refreshMs: rcRefreshMs, log: (l) => o.log?.(l) });
+  const rcOptions = () => ({ days: rcCfg()?.days, spawnFix: rcCfg()?.spawnFix, ...(o.rcOpts ?? {}), refreshMs: rcRefreshMs, log: (l) => o.log?.(l) });
   const readApp = (probeProcesses) => (o.status ? o.status(ctx, { probeProcesses }) : appState({ ctx, probeProcesses, now: ctx.now() }));
   /** One attempt. w.rcDone is set when it is settled for this stop (done, or nothing to do); a busy lock or a refusal leaves it for a retry. */
   const rcStep = async () => {
@@ -365,6 +368,27 @@ export async function runWaiter(ctx, o = {}) {
     try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
     catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); }
   };
+  /**
+   * Sessions started from claude.ai under another account (rcspawn.mjs). While the app runs: detect and report only ("pending, fixed at the
+   * next quit or switch"), once per change of the flagged set. At a stop with rcRestore off (rcQuitStep does it otherwise): repair.
+   */
+  const spawnLook = () => {
+    const c = spawnCfg();
+    if (!c) return;
+    try {
+      const r = spawnFixCore(ctx, { ...(o.rcOpts ?? {}), spawnFix: c.spawnFix, apply: false });
+      const key = r.pending.map((x) => x.id).join(',');
+      if (key && key !== w.spawnSeen) o.log?.(spawnLine(r));
+      w.spawnSeen = key;
+    } catch (e) { o.log?.(`waiter: rc-spawn look failed: ${e?.message ?? e}`); }
+  };
+  const spawnStop = async () => {
+    w.spawnDone = true;
+    const c = spawnCfg();
+    if (!c) return;
+    try { await spawnFixStep(ctx, { ...(o.rcOpts ?? {}), spawnFix: c.spawnFix, apply: true, log: (l) => o.log?.(l) }); }
+    catch (e) { o.log?.(`waiter: rc-spawn step failed: ${e?.message ?? e}`); }
+  };
   /** After the app started: say what its own launch restore did (the pass line with its outcome), so we learn whether the server flags allow it here. */
   const rcLaunchLook = () => {
     const L = w.rcLaunch;
@@ -379,7 +403,7 @@ export async function runWaiter(ctx, o = {}) {
   };
   // the watcher's own state: events only set flags (S6: an event is a hint, the poll does the same work)
   const w = { dirty: false, dirtyAt: 0, event: false, coolUntil: 0, fullDone: false, settledProbeAt: -Infinity, uiMuteUntil: 0,
-    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0, liveAt: clock() };
+    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0, liveAt: clock(), spawnDone: false, spawnSeen: '' };
   const rcRefreshMs = o.rcRefreshMs ?? MARKER_REFRESH_MS;
   const uiGapMs = o.uiGapMs ?? (testPoll ? 0 : 1500);
   /** The accounts are not linked and nothing asks for a link: this watcher only does the Remote Control restore. */
@@ -446,12 +470,12 @@ export async function runWaiter(ctx, o = {}) {
       const app = stopWatch.read({ now, ...(skipProbe ? { probeProcesses: false } : {}) });
       nullStreak = app.s2 === null && app.s1 === false ? nullStreak + 1 : 0;
       if (app.fullAllowed) { if (!negatives) firstNegAt = now; negatives++; } else { negatives = 0; }
-      if (app.running) { w.fullDone = false; w.rcDone = false; w.rcTries = 0; }
+      if (app.running) { w.fullDone = false; w.rcDone = false; w.rcTries = 0; w.spawnDone = false; }
       if (app.running && w.rcLaunch && rcCfg()) rcLaunchLook();
       else if (!app.running && w.rcDone && rcCfg() && clock() - w.rcRefreshAt >= rcRefreshMs) await rcRefresh();
       // the live relink, every liveEveryMs while the app runs (the first look after an app start is the wake hook's)
       if (!app.running) w.liveAt = clock();
-      else if (rcCfg() && clock() - w.liveAt >= (o.liveEveryMs ?? rcCfg().liveEveryMs ?? RC_DEFAULTS.liveEveryMs)) { w.liveAt = clock(); await liveStep(false); }
+      else if ((rcCfg() || spawnCfg()) && clock() - w.liveAt >= (o.liveEveryMs ?? rcCfg()?.liveEveryMs ?? RC_DEFAULTS.liveEveryMs)) { w.liveAt = clock(); if (rcCfg()) await liveStep(false); spawnLook(); }
 
       // ---- the app runs and the accounts are linked: keep the folders the app has not loaded current
       if (watching && app.running) {
@@ -470,6 +494,7 @@ export async function runWaiter(ctx, o = {}) {
             if (res?.switched) {
               o.log?.(`waiter: the signed-in account changed; the previous account's folders cool for a few seconds`);
               await liveStep(true);   // the sessions of the account just signed in: clear every stale link while their CLIs are not running yet
+              spawnLook();            // and name the ones started from claude.ai under the account just left (detached at the next stop)
             }
             await toastConflicts(ctx, o.notify);
             const end = coolingEndsAt(loadState(ctx), ctx.now());
@@ -495,7 +520,7 @@ export async function runWaiter(ctx, o = {}) {
           if (shown) passUiStart();
           let res;
           try {
-            res = await op.fn(ctx, { reasons, ...(o.passOpts?.() ?? {}) });
+            res = await op.fn(ctx, { reasons, log: (l) => o.log?.(l), ...(o.passOpts?.() ?? {}) });
           } catch (e) {
             const report = { at: new Date(ctx.now()).toISOString(), op: op.name, ok: false, error: String(e?.message ?? e) };
             writeJsonAtomic(accPath(ctx, 'last-pass.json'), report);
@@ -531,6 +556,8 @@ export async function runWaiter(ctx, o = {}) {
         }
         // Remote Control restore: after the account pass (the records are one inode per conversation by now), once per stop
         if (watching && w.fullDone && !w.rcDone && rcCfg() && w.rcTries < RC_MAX_TRIES) { await rcStep(); if (!w.rcDone) { negatives = 0; await sleep(pollMs); continue; } }
+        // the spawn fix with rcRestore off (with it on, the step above did it): once per stop
+        if (watching && w.fullDone && !w.spawnDone && !rcCfg()) await spawnStop();
       }
       // the lock marker is gone: the stop is being confirmed, so look again at once (not after 30 s)
       await sleep(app.s1 === false && !settled && nullStreak < FAST_NULL_LIMIT && (!watching || negatives < 2) ? Math.min(pollMs, FAST_POLL_MS) : pollMs);

@@ -18,6 +18,7 @@ import { owedWork } from './pass.mjs';
 import { waiterStatus } from './waiter.mjs';
 import { accountLists, tasksDueCatchUp } from './lists.mjs';
 import { unknownAccountKeys, CFG as DESKTOP_CONFIG } from './settings.mjs';
+import { spawnStatus } from './rcspawn.mjs';
 
 const id8 = (s) => (s ? String(s).slice(0, 8) : null);
 
@@ -213,6 +214,7 @@ export function collectStatus(ctx, o = {}) {
     } : null,
     conflicts: Object.entries(state.conflicts ?? {}).map(([id, c]) => ({ id: id8(id.slice(6)), at: c.at, winner: id8(String(c.winner).split('/')[0]), loser: id8(String(c.loser).split('/')[0]), cliChanged: !!c.cliChanged })),
     held: group.length >= 2 ? heldConversations(group, state, app) : [],
+    rcSpawn: spawnStatus(ctx),   // sessions started from claude.ai under another account: flagged now (pending) and fixed earlier
   };
 }
 
@@ -225,6 +227,7 @@ export function formatStatus(st, { all = false } = {}) {
   else if (unlinked && st.app?.running && st.waiter?.alive && (st.waiter.reasons ?? []).includes('link')) out.push(RESTART_LEAD_WAITER);
   const signed = st.accounts.find((a) => a.signedIn);
   out.push(`Accounts: ${st.accounts.map((a) => `${a.id}${a.signedIn ? '*' : ''}`).join(', ') || 'none'}${signed ? ' (* signed in)' : ''}; ${plural(st.folders.length, 'folder')}.`);
+  out.push(...formatSpawn(st.rcSpawn));
   if (st.accounts.length < 2) { out.push('Only one account on this machine: nothing to link.'); return out; }
   const answered = st.pairs.filter((p) => p.answer).map((p) => `${p.pair} ${p.answer}${p.via ? ` (${p.via})` : ''}`);
   out.push(`Pairs: ${answered.join('; ') || 'none answered'}${st.pending ? `; ${st.pending} pending (run: accounts answer yes|no)` : ''}.`);
@@ -256,6 +259,21 @@ export function formatStatus(st, { all = false } = {}) {
     if (v.artifactsFromOthers.length) out.push('Share each one you need with this account on claude.ai, or republish it from this account.');
     if (v.pluginsMissing.length) out.push(`Plugins missing${tag}: ${v.pluginsMissing.join(', ')}.`);
   }
+  return out;
+}
+
+/** The status lines for the Remote Control spawn records of sessions started from claude.ai under another account (rcspawn.mjs). Silent when there is nothing to say. */
+export function formatSpawn(sp) {
+  if (!sp) return [];
+  const out = [];
+  const list = (a) => a.map((x) => `"${x.title || x.id}"`).join(', ');
+  if (sp.pending?.length) {
+    const how = sp.mode === 'off'
+      ? 'The automatic fix is off (rcRestore.spawnFix); run: accounts rc-spawn-fix with Claude quit.'
+      : 'Fixed at the next quit of Claude or account switch, or run: accounts rc-spawn-fix with Claude quit.';
+    out.push(`Remote Control: ${plural(sp.pending.length, 'session')} started from claude.ai under another account cannot be resumed (pending): ${list(sp.pending)}. ${how}`);
+  }
+  if (sp.fixed?.length) out.push(`Remote Control: fixed earlier: ${sp.fixed.map((x) => `"${x.title || x.id}" (${String(x.at ?? '').slice(0, 10)})`).join(', ')}.`);
   return out;
 }
 

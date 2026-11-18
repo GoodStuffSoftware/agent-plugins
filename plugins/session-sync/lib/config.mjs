@@ -22,9 +22,10 @@ export const STATE_DIR = join(homedir(), '.claude', 'session-sync');
 export const CONFIG_FILE = join(STATE_DIR, 'config.json');
 
 /** Remote Control restore (accounts/rcrestore.mjs). Defined here, with the other settings; rcrestore.mjs re-exports it. */
-export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+export const RC_DEFAULTS = Object.freeze({ enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000, spawnFix: 'auto' });
 
 export const LIVE_RELINK_MODES = Object.freeze(['off', 'idle-only']);
+export const SPAWN_FIX_MODES = Object.freeze(['auto', 'off']);
 
 /** The `rcRestore` settings from a loaded config, validated: a partial block keeps the other defaults, a bad value falls back. */
 export function rcSettings(cfg = {}) {
@@ -42,6 +43,7 @@ export function rcSettings(cfg = {}) {
     liveRelink: LIVE_RELINK_MODES.includes(raw.liveRelink) ? raw.liveRelink : RC_DEFAULTS.liveRelink,
     liveMax: Number.isInteger(liveMax) && liveMax >= 1 && liveMax <= 100 ? liveMax : RC_DEFAULTS.liveMax,
     liveEveryMs: Number.isFinite(liveEveryMs) && liveEveryMs >= 60000 && liveEveryMs <= 86400000 ? Math.floor(liveEveryMs) : RC_DEFAULTS.liveEveryMs,
+    spawnFix: SPAWN_FIX_MODES.includes(raw.spawnFix) ? raw.spawnFix : RC_DEFAULTS.spawnFix,   // not gated by `enabled`
   };
 }
 
@@ -107,6 +109,8 @@ export const DEFAULTS = Object.freeze({
   //   logonTask: a hidden "At log on" task runs the relink after a Windows restart, when the quit step could not (false: no task)
   //   liveRelink: 'idle-only' (default) clears a stale link of a session whose CLI is not running while the app runs; 'off' never does
   //   liveMax / liveEveryMs: the most links one live pass clears (default 10), and how often the watcher looks (default 600000 ms)
+  //   spawnFix: 'auto' (default) detaches the Remote Control spawn record of a session started from claude.ai under another account, at the
+  //             next stop of Claude (an account switch or quit; whatever `enabled` says); 'off' never edits a record (detection still reports)
   rcRestore: RC_DEFAULTS,
   // Share new artifacts with the other linked account (invite sent and accepted by an agent-driven browser; artifacts.mjs; `config artifactShare.enabled|email`).
   artifactShare: Object.freeze({ enabled: true, emails: Object.freeze({}) }),
