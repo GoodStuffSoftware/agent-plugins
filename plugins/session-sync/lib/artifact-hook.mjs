@@ -4,7 +4,8 @@
  * in every session (the wake on every prompt), and cli.mjs loads the whole sync engine first.
  *
  *   node artifact-hook.mjs capture   PostToolUse, matcher "Artifact": queue a newly published artifact. Prints nothing.
- *   node artifact-hook.mjs wake      UserPromptSubmit: tell ONE session to share, once per account switch. Prints nothing otherwise.
+ *   node artifact-hook.mjs wake      UserPromptSubmit: tell ONE session to share when a browser reachable from its account can send or accept
+ *                                    an entry (entries 2+ minutes old, once per 30 minutes per account). Prints nothing otherwise.
  *
  * Any error: exit 0 with no output, so a prompt or a tool call is never broken by this.
  */

@@ -5,9 +5,10 @@
  * from a browser signed in as the owner and ACCEPTED as the receiver. This module is the bookkeeping half:
  *
  *   capture  (PostToolUse on the `Artifact` tool)  a NEW artifact is appended to a queue, owner = the account the app runs as now
- *   wake     (UserPromptSubmit)                    when the app's account is no longer the owner of pending entries, one session is
- *                                                  told to run the share-artifacts skill (the skill drives the browser pane)
- *   queue    (`cli.mjs artifacts ...`)             pending / list / mark / forget / pane, used by the skill
+ *   wake     (UserPromptSubmit)                    when a browser reachable from THIS session's account can send a pending entry or
+ *                                                  accept an invited one, one session is told to run the share-artifacts skill (the skill
+ *                                                  drives the browser pane, and Claude in Chrome from the account it is connected to)
+ *   queue    (`cli.mjs artifacts ...`)             pending / list / mark / forget / pane / chrome-unavailable, used by the skill
  *
  * Storage: ~/.claude/session-sync/artifact-queue/, one file per artifact (`a-<id>.json`). A file is published with a hard link, so
  * "append" is atomic (readers never see a half-written entry), dedupe by id is the link failing with EEXIST, and two sessions
@@ -19,14 +20,19 @@
  */
 
 import {
-  mkdirSync, readdirSync, readFileSync, writeFileSync, linkSync, unlinkSync, renameSync, openSync, closeSync, writeSync, statSync,
+  mkdirSync, readdirSync, readFileSync, writeFileSync, linkSync, unlinkSync, renameSync, openSync, closeSync, writeSync, statSync, utimesSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { STATE_DIR } from './config.mjs';
 
 export const QUEUE_DIR = join(STATE_DIR, 'artifact-queue');
-export const STATUSES = Object.freeze(['pending', 'invited', 'done', 'failed', 'skipped']);
+/** pending: to send. invited: sent, to accept. accepted: accepted by an agent, not yet verified. done: verified (or the user said so). */
+export const STATUSES = Object.freeze(['pending', 'invited', 'accepted', 'done', 'failed', 'skipped']);
+/** The wake only touches entries this old (an artifact is often republished right after it is made), at most once per CLAIM_MS per account, and leaves a browser that reported itself unavailable alone for BACKOFF_MS. */
+export const MIN_AGE_MS = 2 * 60 * 1000;
+export const CLAIM_MS = 30 * 60 * 1000;
+export const BACKOFF_MS = 30 * 60 * 1000;
 const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const URL_RE = /https:\/\/claude\.ai\/(?:code\/)?artifact\/([A-Za-z0-9_-]{6,64})/g;
 const ENTRY_RE = /^a-([A-Za-z0-9_-]{6,64})\.json$/;
@@ -184,7 +190,7 @@ export function markEntry(dir, id, status, { link, reason, now = Date.now() } = 
   if (!e) return { ok: false, reason: `no queued artifact "${id}"` };
   const next = { ...e, status, updatedAt: new Date(now).toISOString() };
   if (link) next.inviteLink = String(link);
-  if (reason) next.reason = String(reason); else if (status === 'pending' || status === 'done' || status === 'invited') delete next.reason;
+  if (reason) next.reason = String(reason); else if (['pending', 'done', 'invited', 'accepted'].includes(status)) delete next.reason;
   writeAtomic(entryFile(dir, id), `${JSON.stringify(next, null, 2)}\n`);
   prune(dir, now);
   return { ok: true, entry: next };
@@ -194,10 +200,10 @@ export function forgetEntry(dir, id) {
   try { unlinkSync(entryFile(dir, id)); return true; } catch { return false; }
 }
 
-/** Drop finished entries (done, skipped) that have not changed for KEEP_MS. */
+/** Drop finished entries (done, accepted, skipped) that have not changed for KEEP_MS. */
 function prune(dir, now) {
   for (const e of readEntries(dir)) {
-    if ((e.status === 'done' || e.status === 'skipped') && now - Date.parse(e.updatedAt ?? e.createdAt) > KEEP_MS) forgetEntry(dir, e.id);
+    if (['done', 'accepted', 'skipped'].includes(e.status) && now - Date.parse(e.updatedAt ?? e.createdAt) > KEEP_MS) forgetEntry(dir, e.id);
   }
 }
 
@@ -205,19 +211,37 @@ function prune(dir, now) {
 
 const stateFile = (dir) => join(dir, 'state.json');
 
-/** { browsers: { <name>: { email, at } } }. The skill records each browser's signed-in account on every run. */
+/**
+ * { browsers: { <name>: { email, at, account?, unavailableAt? } } }. The skill records each browser's signed-in account on every run.
+ * `account` (an account id or its first 8+ characters) is set for a browser only sessions of that account can reach: Claude in Chrome
+ * lists only the extension instances connected to the account the session runs as. No `account` = reachable from any session (the
+ * desktop app's browser pane). `unavailableAt` is when a run found the browser not connected; recording the browser again clears it.
+ */
 export function readShareState(dir) {
   try { const s = JSON.parse(readFileSync(stateFile(dir), 'utf8')); return s && typeof s === 'object' && s.browsers && typeof s.browsers === 'object' ? s : { browsers: {} }; } catch { return { browsers: {} }; }
 }
 
-export function recordBrowser(dir, name, email, now = Date.now()) {
+export function recordBrowser(dir, name, email, { account, now = Date.now() } = {}) {
   if (!/^[a-z][a-z0-9-]{0,30}$/.test(name)) throw new Error(`"${name}" is not a valid browser name (lower-case letters, digits and dashes)`);
   if (!/^[^\s@]+@[^\s@]+$/.test(String(email))) throw new Error(`"${email}" is not an email address`);
+  if (account !== undefined && account !== null && !/^[0-9a-f-]{8,36}$/i.test(String(account))) throw new Error(`"${account}" is not an account id (8 to 36 hex characters and dashes)`);
   mkdirSync(dir, { recursive: true });
   const s = readShareState(dir);
-  s.browsers[name] = { email: String(email).trim(), at: new Date(now).toISOString() };
+  const rec = { email: String(email).trim(), at: new Date(now).toISOString() };
+  const acct = account ?? s.browsers[name]?.account;     // a run that only re-confirms the email keeps the account
+  if (acct) rec.account = String(acct).toLowerCase();
+  s.browsers[name] = rec;
   writeAtomic(stateFile(dir), `${JSON.stringify(s, null, 2)}\n`);
   return s;
+}
+
+/** A run found this browser not connected (Chrome closed): the wake leaves its work alone for BACKOFF_MS. */
+export function markBrowserUnavailable(dir, name, now = Date.now()) {
+  const s = readShareState(dir);
+  if (!s.browsers[name]) return { ok: false, reason: `no browser "${name}" is registered (artifacts pane <email> --browser ${name})` };
+  s.browsers[name] = { ...s.browsers[name], unavailableAt: new Date(now).toISOString() };
+  writeAtomic(stateFile(dir), `${JSON.stringify(s, null, 2)}\n`);
+  return { ok: true, browsers: s.browsers };
 }
 
 /* ------------------------------- accounts / emails ------------------------------- */
@@ -256,6 +280,40 @@ export function receiverEmail(emails, owner) {
   return mine && others.length === 1 ? others[0] : null;
 }
 
+/** The configured key (account id or prefix) whose email is this one, or null. */
+export function accountOfEmail(emails, email) {
+  const want = String(email ?? '').toLowerCase();
+  for (const [k, v] of Object.entries(emails ?? {})) if (String(v).toLowerCase() === want) return k.toLowerCase();
+  return null;
+}
+
+/**
+ * Can a session running as `active` drive this browser now? A browser with an `account` only answers sessions of that account (Claude
+ * in Chrome), and not while a run's "unavailable" mark is younger than BACKOFF_MS. No `account`: any session (the pane).
+ */
+export function browserUsable(b, active, now = Date.now()) {
+  if (b?.account && !(active && String(active).toLowerCase().startsWith(String(b.account).toLowerCase()))) return false;
+  const t = Date.parse(b?.unavailableAt ?? '');
+  return !(Number.isFinite(t) && now - t < BACKOFF_MS);
+}
+
+/**
+ * The browsers that can make progress on this entry from a session running as `active`. A pending entry is SENT from a browser signed in
+ * as its owner (no known owner or owner email: any usable browser; nothing recorded yet: the pane, whose account is not known). An invited
+ * entry is ACCEPTED in a browser signed in as the receiver, and only a recorded browser can say it is.
+ */
+export function workBrowsers(e, { emails, share, active, now = Date.now() }) {
+  const recorded = Object.entries(share?.browsers ?? {});
+  const usable = (recorded.length ? recorded : [['pane', {}]]).filter(([, b]) => browserUsable(b, active, now));
+  const sameMail = (b, mail) => !!b.email && String(b.email).toLowerCase() === String(mail).toLowerCase();
+  if (e.status === 'invited') {
+    const rcv = e.ownerAccount ? receiverEmail(emails, e.ownerAccount) : null;
+    return rcv ? usable.filter(([, b]) => sameMail(b, rcv)).map(([n]) => n) : [];
+  }
+  const mail = e.ownerAccount ? emailOf(emails, e.ownerAccount) : null;
+  return (mail ? usable.filter(([, b]) => !b.email || sameMail(b, mail)) : usable).map(([n]) => n);
+}
+
 /* ----------------------------------- the wake ----------------------------------- */
 
 /** Is the machine set up for this: accounts linked (accounts/state.json) and artifactShare.enabled not false. Reads one small file. */
@@ -288,60 +346,92 @@ export async function interactiveSessionFor(active, sessionId) {
   } catch { return false; }
 }
 
-const CLAIM_RE = /^claim-[0-9a-f]{16}$/;
+const claimFile = (dir, active) => join(dir, `claim-${createHash('sha256').update(String(active).toLowerCase()).digest('hex').slice(0, 16)}`);
 
 /**
- * Decide whether this prompt's session should be told to share, and take the claim if so. Cheap on purpose: nothing queued is one
- * failed readdir; nothing pending is a readdir and a few small reads; the app's account is only read when something is pending.
- * o: { dir, cfg, stateDir, active, share, sessionCheck }. `active` (the app's account) is looked up with activeAccount() when not given;
- * `sessionCheck(active)` (async, optional) says whether the prompting session may take the claim.
+ * Take the claim for an account: an exclusive create, so one session in a CLAIM_MS window gets it. A claim older than CLAIM_MS is moved
+ * aside first (a rename, so one racer wins) and the create is tried again; a mover that finds it moved a FRESH claim (another session
+ * took over a moment before) puts it back and loses. The claim is never cleared early: the rate limit is the whole point, and it also
+ * covers entries of both accounts staying pending while the app goes A, B, A, B.
+ */
+function takeClaim(claim, now) {
+  for (let i = 0; i < 3; i++) {
+    try {
+      closeSync(openSync(claim, 'wx'));
+      try { utimesSync(claim, now / 1000, now / 1000); } catch { /* the creation time stands: the same moment outside tests */ }
+      return true;
+    } catch (e) { if (e.code !== 'EEXIST') return false; }
+    let st;
+    try { st = statSync(claim); } catch { continue; }                      // it vanished: try the create again
+    if (now - st.mtimeMs < CLAIM_MS) return false;
+    const grave = `${claim}.old-${process.pid}-${randomBytes(3).toString('hex')}`;
+    try { renameSync(claim, grave); } catch { continue; }                  // somebody else moved it: look again
+    let moved = 0;
+    try { moved = statSync(grave).mtimeMs; } catch { /* gone */ }
+    if (now - moved < CLAIM_MS) {                                          // that was a fresh claim, not the old one: put it back
+      try { linkSync(grave, claim); } catch { /* already back */ }
+      try { unlinkSync(grave); } catch { /* ignore */ }
+      return false;
+    }
+    try { unlinkSync(grave); } catch { /* ignore */ }
+  }
+  return false;
+}
+
+/**
+ * Decide whether this prompt's session should be told to share, and take the claim if so. A session acts when a browser it can reach
+ * can make progress (workBrowsers): the owner's browser for a pending entry, the receiver's for an invited one. There is no account
+ * switch to wait for: an artifact of the account whose Chrome only that account's sessions can reach has to be shared while one of
+ * those runs. Only entries older than MIN_AGE_MS count, and the sessions of one account get the instruction at most once per CLAIM_MS.
+ * Cheap on purpose: nothing queued is one failed readdir; the app's account is only read when an entry is old enough to act on.
+ * o: { dir, cfg, stateDir, active, share, now, sessionCheck }. `active` (the app's account) is looked up with activeAccount() when not
+ * given; `sessionCheck(active)` (async, optional) says whether the prompting session may take the claim.
  * @returns {Promise<{act:boolean, reason:string, due?:object[], text?:string}>}
  */
 export async function wake(o = {}) {
   const dir = o.dir ?? QUEUE_DIR;
+  const now = o.now ?? Date.now();
   let names;
   try { names = readdirSync(dir); } catch { return { act: false, reason: 'no-queue' }; }
-  const entries = [];
+  const open = [];
   for (const n of names) {
     const m = ENTRY_RE.exec(n);
     const e = m ? readEntry(dir, m[1]) : null;
-    if (e && e.id === m[1]) entries.push(e);
+    if (e && e.id === m[1] && (e.status === 'pending' || e.status === 'invited')) open.push(e);
   }
-  const pending = pendingOf(entries);
-  if (!pending.length) { clearClaims(dir, names); return { act: false, reason: 'nothing-pending' }; }
+  if (!open.length) return { act: false, reason: 'nothing-pending' };
+  const aged = open.filter((e) => now - Date.parse(e.updatedAt ?? e.createdAt) >= MIN_AGE_MS);
+  if (!aged.length) return { act: false, reason: 'too-new' };
   if (!featureOn(o.cfg, o.stateDir)) return { act: false, reason: 'disabled' };
-  const active = o.active !== undefined ? o.active : await activeAccount();
-  if (!active) return { act: false, reason: 'no-active-account' };
   const emails = o.cfg?.artifactShare?.emails ?? {};
   if (new Set(Object.values(emails).map((v) => String(v).toLowerCase())).size < 2) return { act: false, reason: 'no-emails' };   // nothing the skill could send to: set artifactShare.email for both accounts
+  const active = o.active !== undefined ? o.active : await activeAccount();
+  if (!active) return { act: false, reason: 'no-active-account' };
   const share = o.share ?? readShareState(dir);
-  const due = pending.filter((e) => !sameAccount(e.ownerAccount, active) && driveableOwner(e.ownerAccount, emails, share));
-  if (!due.length) { clearClaims(dir, names); return { act: false, reason: 'none-due' }; }
-  // The claim is per switch: it is keyed by the account the app is on only, NOT by what is due, because the skill shrinks the due set as it
-  // works and a changed key would hand the instruction to the next prompt again. It goes when nothing is due (back on the owner's account, or
-  // everything handled). A run that dies leaves the entries pending: asking for the skill by hand retries them.
-  const key = createHash('sha256').update(String(active).toLowerCase()).digest('hex').slice(0, 16);
-  const claim = join(dir, `claim-${key}`);
-  try { if (statSync(claim)) return { act: false, reason: 'claimed' }; } catch { /* not taken yet */ }
+  const due = aged.filter((e) => workBrowsers(e, { emails, share, active, now }).length);
+  if (!due.length) return { act: false, reason: 'none-due' };
+  const claim = claimFile(dir, active);
+  try { if (now - statSync(claim).mtimeMs < CLAIM_MS) return { act: false, reason: 'claimed' }; } catch { /* not taken yet */ }
   // Only a session the app knows as an interactive one (the browser tools live there) may take it: not a terminal run, a headless or a scheduled session.
   if (o.sessionCheck && !(await o.sessionCheck(active))) return { act: false, reason: 'not-interactive' };
-  try { closeSync(openSync(claim, 'wx')); } catch { return { act: false, reason: 'claimed' }; }
-  return { act: true, reason: 'claimed-now', due, text: wakeInstruction({ due, active, emails }) };
+  if (!takeClaim(claim, now)) return { act: false, reason: 'claimed' };
+  return { act: true, reason: 'claimed-now', due, text: wakeInstruction({ due, active, emails, share, now }) };
 }
 
-/** A claim belongs to one switch: once nothing is due (back on the owner's account, or everything handled) the claims go, so the next switch acts again. */
-function clearClaims(dir, names) {
-  for (const n of names) if (CLAIM_RE.test(n)) { try { unlinkSync(join(dir, n)); } catch { /* ignore */ } }
-}
-
-export function wakeInstruction({ due, active, emails }) {
+export function wakeInstruction({ due, active, emails, share, now = Date.now() }) {
   const mail = emailOf(emails, active);
   const n = due.length;
-  const list = due.slice(0, 5).map((e) => `- ${e.title || '(untitled)'}: ${e.url}`).join('\n');
+  const what = (e) => {
+    if (e.status === 'invited') { const r = receiverEmail(emails, e.ownerAccount); return r ? `accept as ${r}` : 'accept'; }
+    const o = emailOf(emails, e.ownerAccount);
+    return o ? `send from ${o}` : 'send';
+  };
+  const list = due.slice(0, 5).map((e) => `- ${e.title || '(untitled)'}: ${e.url} (${what(e)})`).join('\n');
+  const reach = Object.entries(share?.browsers ?? {}).filter(([, b]) => browserUsable(b, active, now)).map(([k, b]) => `${k}${b.email ? ` (${b.email})` : ''}`);
   return [
-    `session-sync: ${n} new artifact${n === 1 ? '' : 's'} made in your other claude.ai account ${n === 1 ? 'is' : 'are'} not shared with the account you are on now${mail ? ` (${mail})` : ''}:`,
+    `session-sync: ${n} artifact${n === 1 ? '' : 's'} to share between your two claude.ai accounts (this session runs as ${mail || 'one of them'}${reach.length ? `; browsers registered for it: ${reach.join(', ')}` : ''}):`,
     list + (n > 5 ? `\n- and ${n - 5} more` : ''),
-    'Run the session-sync share-artifacts skill (skills/share-artifacts) in ONE background browser subagent (agent-companion:ac-browser when it exists): it sends an Editor invite to this account from the Claude desktop browser pane and returns invitation links. Do not open any browser window yourself.',
-    'When it returns, give the user the invitation links in one short message and ask them to open each one, click Accept, and say when done; then follow the skill to verify and mark them done. If the user is busy, mention it in one line and carry on with their request first.',
+    'Run the session-sync share-artifacts skill (skills/share-artifacts) in ONE background browser subagent (agent-companion:ac-browser when it exists): it sends the Editor invite from the owner\'s browser, accepts it in the receiver\'s browser when that one is reachable, and otherwise returns invitation links. Do not open any browser window yourself, and never launch Chrome.',
+    'When it returns, verify what you can with Artifact read and tell the user the result in one or two lines (links to tap only for what could not be accepted). If the user is busy, mention it in one line and carry on with their request first.',
   ].join('\n');
 }

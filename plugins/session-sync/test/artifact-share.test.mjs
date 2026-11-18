@@ -4,14 +4,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readdirSync, rmSync, readFileSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import {
   isNewArtifact, isRepublishResponse, extractArtifact, entryFromHook, enqueue, readEntries, pendingOf, markEntry, forgetEntry, wake,
-  recordBrowser, readShareState, emailOf, receiverEmail, driveableOwner, featureOn,
+  recordBrowser, readShareState, emailOf, receiverEmail, driveableOwner, featureOn, markBrowserUnavailable, accountOfEmail, browserUsable,
 } from '../lib/artifacts.mjs';
 import { artifactShareSettings } from '../lib/config.mjs';
 import { cworld, cleanupWorlds, A, B } from './fixtures/cliworld.mjs';
@@ -29,7 +29,7 @@ const tmp = () => mkdtempSync(join(tmpdir(), 'ss-art-'));
 const EMAILS = { [A]: 'main@example.com', [B.slice(0, 8)]: 'overflow@example.com' };
 const CFG = { artifactShare: { enabled: true, emails: EMAILS } };
 const LINKED_DIR = () => { const d = tmp(); mkdirSync(join(d, 'accounts'), { recursive: true }); writeFileSync(join(d, 'accounts', 'state.json'), JSON.stringify({ linked: true })); return d; };
-const entry = (id, over = {}) => ({ id, url: `https://claude.ai/artifact/${id}`, title: 't', ownerAccount: A, createdAt: new Date().toISOString(), sessionId: 's', status: 'pending', ...over });
+const entry = (id, over = {}) => ({ id, url: `https://claude.ai/artifact/${id}`, title: 't', ownerAccount: A, createdAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(), sessionId: 's', status: 'pending', ...over });
 
 /* ---------------------------------- capture rules ---------------------------------- */
 
@@ -163,32 +163,32 @@ test('N9 settings: on by default; emails are validated', () => {
 
 const wakeOpts = (extra = {}) => ({ cfg: CFG, stateDir: extra.stateDir, ...extra });
 
-test('N10 nothing queued or nothing pending: no instruction, and an old claim is cleared', async () => {
+test('N10 nothing queued or nothing pending: no instruction, and a claim is left alone (the rate limit outlives the queue)', async () => {
   const sd = LINKED_DIR();
   const dir = join(sd, 'q');
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'no-queue');
   enqueue(dir, entry(ID1, { status: 'done' }));
+  enqueue(dir, entry(ID2, { status: 'accepted' }));
   writeFileSync(join(dir, 'claim-0123456789abcdef'), '');
   const r = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) });
   assert.deepEqual([r.act, r.reason], [false, 'nothing-pending']);
-  assert.equal(existsSync(join(dir, 'claim-0123456789abcdef')), false);
+  assert.equal(existsSync(join(dir, 'claim-0123456789abcdef')), true);
 });
 
-test('N11 a switch away from the owner acts once; a second session does not; back and forth acts again', async () => {
+test('N11 no account switch needed: a session acts as soon as a browser it can reach can send; one per account per 30 minutes; the text names the work', async () => {
   const sd = LINKED_DIR();
   const dir = join(sd, 'q');
   enqueue(dir, entry(ID1, { ownerAccount: A }));
-  assert.deepEqual([(await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) })).act], [false], 'still on the owner account');
-  const first = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) });
+  const first = await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) });      // the app is still on the owner's account
   assert.equal(first.act, true);
   assert.match(first.text, /share-artifacts/);
   assert.match(first.text, /ONE background/);
   assert.ok(first.text.includes(URL1));
-  assert.ok(first.text.includes('overflow@example.com'));
+  assert.ok(first.text.includes('send from main@example.com'));
+  assert.ok(first.text.includes('main@example.com'));
   assert.ok(first.text.split('\n').length <= 6, 'a few lines');
-  assert.deepEqual([(await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason], ['claimed']);
-  await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) });                 // back on the owner: the switch is over
-  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).act, true, 'the next switch acts again');
+  assert.deepEqual([(await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) })).reason], ['claimed']);
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).act, true, 'the other account has its own claim');
 });
 
 test('N12 eight sessions prompting at once: exactly one acts (the claim is an exclusive create)', async () => {
@@ -271,16 +271,22 @@ test('N16 capture: owner unknown is stored as null; unlinked machine and the off
   }
 });
 
-test('N17 wake end to end: silent with nothing pending; one JSON instruction after a switch; silent for the next session; silent off a slash command', () => {
+/** Make every queued entry of a hook-test world old enough for the wake (it only touches entries 2+ minutes old). */
+function ageEntries(w, minutes = 10) {
+  const dir = join(w.stateDir, 'artifact-queue');
+  for (const e of readEntries(dir)) writeFileSync(join(dir, `a-${e.id}.json`), JSON.stringify({ ...e, createdAt: new Date(Date.now() - minutes * 60 * 1000).toISOString() }));
+}
+
+test('N17 wake end to end: silent with nothing pending or only fresh entries; one JSON instruction; silent for the next session; silent off a slash command', () => {
   const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
   w.putState((s) => { s.linked = true; });
   w.setApp({ running: true, signedIn: A });
-  putRecord(w.fB.path, 7, {});                                  // the session is an interactive one of the account the app is on after the switch
+  putRecord(w.fA.path, 7, {});                                  // the session is an interactive one of the account the app is on
   const prompt = (text = 'please continue', session_id = uuid('d', 7)) => ({ session_id, prompt: text, hook_event_name: 'UserPromptSubmit' });
   assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'nothing queued');
   runHook(w, 'capture', publish(ID1));
-  assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'still on the owner account');
-  w.setApp({ running: true, signedIn: B });
+  assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'a fresh entry waits (it may be republished in a minute)');
+  ageEntries(w);
   assert.equal(runHook(w, 'wake', prompt('/clear')).stdout, '', 'a slash command is not a real prompt');
   assert.equal(runHook(w, 'wake', prompt('go', uuid('d', 99))).stdout, '', 'a session the app has no record of (a terminal or headless run) does not act and does not use the claim');
   assert.equal(runHook(w, 'wake', { prompt: 'go' }).stdout, '', 'no session id');
@@ -291,7 +297,7 @@ test('N17 wake end to end: silent with nothing pending; one JSON instruction aft
   assert.deepEqual(Object.keys(out), ['hookSpecificOutput']);
   assert.equal(out.hookSpecificOutput.hookEventName, 'UserPromptSubmit');
   assert.match(out.hookSpecificOutput.additionalContext, /share-artifacts/);
-  assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'one session per switch');
+  assert.equal(runHook(w, 'wake', prompt()).stdout, '', 'one session per 30 minutes');
 });
 
 test('N18 the commands: pending --json, pane, mark with link and reason, list, forget', () => {
@@ -379,20 +385,21 @@ test('N22 titles: input title, then description, then file name; one clean line'
   assert.equal(t({ file_path: 'a.html', description: 'x'.repeat(500) }).length, 120);
 });
 
-test('N23 the claim belongs to the switch: skill progress (marking entries) never hands the instruction out again', async () => {
+test('N23 the claim is a rate limit: skill progress (marking entries) never hands the instruction out again within 30 minutes, and the claim is not cleared early', async () => {
   const sd = LINKED_DIR();
   const dir = join(sd, 'q');
   const ids = ['ProgressAAA111', 'ProgressBBB222', 'ProgressCCC333'];
   for (const id of ids) enqueue(dir, entry(id));
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).act, true);
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed');
-  markEntry(dir, ids[0], 'invited', { link: 'https://claude.ai/artifacts/invite/abc' });
+  markEntry(dir, ids[0], 'skipped', { reason: 'public' });
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed', 'one entry done');
-  markEntry(dir, ids[1], 'skipped', { reason: 'public' });
-  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed', 'two entries done');
-  markEntry(dir, ids[2], 'failed', { reason: 'x' });
-  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'nothing-pending', 'all handled: the claim is cleared');
-  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith('claim-')), []);
+  markEntry(dir, ids[1], 'failed', { reason: 'x' });
+  markEntry(dir, ids[2], 'done');
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'nothing-pending');
+  enqueue(dir, entry('LaterArtifact1234'));                       // a new one right after: still inside the window
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'claimed');
+  assert.equal(readdirSync(dir).filter((n) => n.startsWith('claim-')).length, 1);
 });
 
 test('N24 the wake stays silent until the emails of both accounts are set, and a session check that says no never takes the claim', async () => {
@@ -410,13 +417,13 @@ test('N24 the wake stays silent until the emails of both accounts are set, and a
   assert.equal(yes.act, true);
 });
 
-test('N25 eight real hook processes prompting at once after a switch: exactly one prints the instruction', async () => {
+test('N25 eight real hook processes prompting at once: exactly one prints the instruction', async () => {
   const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
   w.putState((s) => { s.linked = true; });
   w.setApp({ running: true, signedIn: A });
-  putRecord(w.fB.path, 7, {});
+  putRecord(w.fA.path, 7, {});
   runHook(w, 'capture', publish(ID1));
-  w.setApp({ running: true, signedIn: B });
+  ageEntries(w);
   const one = () => new Promise((resolve) => {
     const p = spawn(process.execPath, [HOOK, 'wake'], { env: hookEnv(w), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
     let out = '';
@@ -441,4 +448,180 @@ test('N26 an id that is not an artifact id never reaches the file system: forget
   const dir = tmp();
   assert.equal(forgetEntry(dir, '../x'), false);
   assert.equal(markEntry(dir, '../x', 'done').ok, false);
+});
+
+/* ------------------- Claude in Chrome: reachability, age, rate limit, backoff, claims ------------------- */
+
+const MIN = 60 * 1000;
+/** The pane holds the main account and is reachable from any account; Chrome holds the overflow account and only its sessions reach it. */
+const withChrome = (dir) => { recordBrowser(dir, 'pane', 'main@example.com'); recordBrowser(dir, 'chrome', 'overflow@example.com', { account: B }); };
+const dueIds = (r) => (r.due ?? []).map((e) => e.id).sort();
+
+test('N27 reachability per account: the pane works from either account, Chrome only from sessions of the account it is connected to', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  withChrome(dir);
+  enqueue(dir, entry(ID1, { ownerAccount: A }));        // main owns it: sent from the pane
+  enqueue(dir, entry(ID2, { ownerAccount: B }));        // overflow owns it: sent from Chrome
+  const fromA = await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) });
+  assert.deepEqual(dueIds(fromA), [ID1], 'a main-account session cannot reach Chrome: only the pane work is due');
+  assert.ok(fromA.text.includes('send from main@example.com') && !fromA.text.includes(ID2));
+  const fromB = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) });
+  assert.deepEqual(dueIds(fromB), [ID1, ID2].sort(), 'an overflow session reaches both browsers');
+  assert.ok(fromB.text.includes('send from overflow@example.com'));
+  assert.match(fromB.text, /chrome \(overflow@example\.com\)/);
+  // account match is by prefix
+  assert.equal(browserUsable({ account: B.slice(0, 8) }, B), true);
+  assert.equal(browserUsable({ account: B }, A), false);
+  assert.equal(browserUsable({ account: B }, null), false);
+  assert.equal(browserUsable({}, A), true, 'no account: any session (the pane)');
+  // overflow-only work is not due from a main session at all
+  const dir2 = join(LINKED_DIR(), 'q');
+  withChrome(dir2);
+  enqueue(dir2, entry(ID2, { ownerAccount: B }));
+  const none = await wake({ dir: dir2, ...wakeOpts({ stateDir: sd, active: A }) });
+  assert.deepEqual([none.act, none.reason], [false, 'none-due']);
+  assert.deepEqual(readdirSync(dir2).filter((n) => n.startsWith('claim-')), [], 'no claim taken when nothing can progress');
+});
+
+test('N28 an invited entry wakes a session that can reach the receiver\'s browser; nothing recorded for the receiver means nothing to do', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  const sent = () => new Date(Date.now() - 10 * MIN).toISOString();
+  withChrome(dir);
+  enqueue(dir, entry(ID1, { ownerAccount: A, status: 'invited', updatedAt: sent(), inviteLink: 'https://claude.ai/artifacts/invite/x' }));   // main -> overflow: accepted in Chrome
+  assert.deepEqual([(await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) })).reason], ['none-due'], 'a main session cannot reach Chrome to accept');
+  const fromB = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B }) });
+  assert.deepEqual([fromB.act, dueIds(fromB)], [true, [ID1]]);
+  assert.ok(fromB.text.includes('accept as overflow@example.com'));
+  const dir2 = join(LINKED_DIR(), 'q');
+  withChrome(dir2);
+  enqueue(dir2, entry(ID2, { ownerAccount: B, status: 'invited', updatedAt: sent() }));   // overflow -> main: accepted in the pane, from any session
+  assert.equal((await wake({ dir: dir2, ...wakeOpts({ stateDir: sd, active: A }) })).act, true);
+  const dir3 = join(LINKED_DIR(), 'q');
+  recordBrowser(dir3, 'pane', 'main@example.com');                                   // no browser holds the overflow account
+  enqueue(dir3, entry(ID1, { ownerAccount: A, status: 'invited', updatedAt: sent() }));
+  assert.equal((await wake({ dir: dir3, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'none-due', 'links go to the user instead');
+  for (const status of ['accepted', 'done', 'failed', 'skipped']) {
+    const d = join(LINKED_DIR(), 'q');
+    enqueue(d, entry(ID1, { status }));
+    assert.equal((await wake({ dir: d, ...wakeOpts({ stateDir: sd, active: B }) })).reason, 'nothing-pending', status);
+  }
+});
+
+test('N29 only entries older than about 2 minutes count (an invited entry by its last change)', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  const t0 = Date.now();
+  enqueue(dir, entry(ID1, { createdAt: new Date(t0).toISOString() }));
+  const r1 = await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 119 * 1000 }) });
+  assert.deepEqual([r1.act, r1.reason], [false, 'too-new']);
+  assert.deepEqual(readdirSync(dir).filter((n) => n.startsWith('claim-')), [], 'a fresh entry does not burn the claim');
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 121 * 1000 }) })).act, true);
+  const dir2 = join(LINKED_DIR(), 'q');
+  recordBrowser(dir2, 'pane', 'overflow@example.com');
+  enqueue(dir2, entry(ID2, { ownerAccount: A, status: 'invited', createdAt: new Date(t0 - 60 * MIN).toISOString(), updatedAt: new Date(t0).toISOString() }));
+  assert.equal((await wake({ dir: dir2, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 60 * 1000 }) })).reason, 'too-new', 'invited a minute ago');
+  assert.equal((await wake({ dir: dir2, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 3 * MIN }) })).act, true);
+});
+
+test('N30 once per 30 minutes per account: inside the window nothing, after it the next session acts, and racing sessions over an expired claim give one winner', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  enqueue(dir, entry(ID1));
+  const t0 = Date.now();
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 }) })).act, true);
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 29 * MIN }) })).reason, 'claimed');
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 31 * MIN }) })).act, true, 'the window is over');
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 32 * MIN }) })).reason, 'claimed', 'and a new one started');
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.old-')), [], 'no leftover from the takeover');
+  // eight at once over a claim that expired
+  const claim = join(dir, readdirSync(dir).find((n) => /^claim-[0-9a-f]{16}$/.test(n)));
+  const old = new Date(Date.now() - 40 * MIN);
+  utimesSync(claim, old, old);
+  const rs = await Promise.all(Array.from({ length: 8 }, () => wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) })));
+  assert.equal(rs.filter((r) => r.act).length, 1);
+  assert.equal(readdirSync(dir).filter((n) => /^claim-[0-9a-f]{16}$/.test(n)).length, 1);
+  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.old-')), []);
+});
+
+test('N31 Chrome unavailable: its work is left alone for 30 minutes, the pane work still goes, recording Chrome again clears the mark', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  withChrome(dir);
+  enqueue(dir, entry(ID2, { ownerAccount: B }));        // needs Chrome to send
+  const t0 = Date.now();
+  assert.equal(markBrowserUnavailable(dir, 'chrome', t0).ok, true);
+  assert.equal(readShareState(dir).browsers.chrome.account, B.toLowerCase(), 'the account is kept');
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B, now: t0 + 5 * MIN }) })).reason, 'none-due');
+  assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: B, now: t0 + 29 * MIN }) })).reason, 'none-due');
+  enqueue(dir, entry(ID1, { ownerAccount: A }));        // pane work
+  const mixed = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B, now: t0 + 10 * MIN }) });
+  assert.deepEqual([mixed.act, dueIds(mixed)], [true, [ID1]]);
+  const dir2 = join(LINKED_DIR(), 'q');
+  withChrome(dir2);
+  enqueue(dir2, entry(ID2, { ownerAccount: B }));
+  markBrowserUnavailable(dir2, 'chrome', t0);
+  assert.equal((await wake({ dir: dir2, ...wakeOpts({ stateDir: sd, active: B, now: t0 + 31 * MIN }) })).act, true, 'the 30 minutes are over');
+  const dir3 = join(LINKED_DIR(), 'q');
+  withChrome(dir3);
+  enqueue(dir3, entry(ID2, { ownerAccount: B }));
+  markBrowserUnavailable(dir3, 'chrome');
+  recordBrowser(dir3, 'chrome', 'overflow@example.com');                              // a run found it connected again
+  assert.equal(readShareState(dir3).browsers.chrome.unavailableAt, undefined);
+  assert.equal(readShareState(dir3).browsers.chrome.account, B.toLowerCase());
+  assert.equal((await wake({ dir: dir3, ...wakeOpts({ stateDir: sd, active: B }) })).act, true);
+  assert.equal(markBrowserUnavailable(join(LINKED_DIR(), 'q'), 'chrome').ok, false, 'not registered');
+});
+
+test('N32 entries of both accounts staying pending across A, B, A, B: each account is told once per window, then again, never every prompt and never never', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  withChrome(dir);
+  enqueue(dir, entry(ID1, { ownerAccount: A }));
+  enqueue(dir, entry(ID2, { ownerAccount: B }));
+  const t0 = Date.now();
+  const at = async (min, active) => (await wake({ dir, ...wakeOpts({ stateDir: sd, active, now: t0 + min * MIN }) })).reason;
+  assert.equal(await at(0, A), 'claimed-now');
+  assert.equal(await at(1, B), 'claimed-now');
+  assert.equal(await at(2, A), 'claimed');
+  assert.equal(await at(3, B), 'claimed');
+  assert.equal(await at(31, A), 'claimed-now', 'the claim of A did not stay stuck');
+  assert.equal(await at(32, B), 'claimed-now', 'the claim of B did not stay stuck');
+  assert.equal(await at(33, A), 'claimed');
+});
+
+test('N33 the commands for Chrome: pane --browser chrome keeps the account, chrome-unavailable, reachable in pending, accepted status', () => {
+  const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
+  w.putState((s) => { s.linked = true; });
+  w.setApp({ running: true, signedIn: B });
+  const dir = join(w.stateDir, 'artifact-queue');
+  const state = () => JSON.parse(runCli(w, ['artifacts', 'list', '--json']).stdout).browsers;
+  assert.equal(runCli(w, ['artifacts', 'chrome-unavailable']).status, 1, 'not registered yet');
+  assert.equal(runCli(w, ['artifacts', 'pane', 'main@example.com']).status, 0);
+  assert.equal(state().pane.account, undefined, 'the pane is reachable from any account');
+  const set = runCli(w, ['artifacts', 'pane', 'overflow@example.com', '--browser', 'chrome', '--account', B]);
+  assert.equal(set.status, 0, set.stderr);
+  assert.equal(state().chrome.account, B);
+  assert.equal(runCli(w, ['artifacts', 'pane', 'overflow@example.com', '--browser', 'chrome']).status, 0);
+  assert.equal(state().chrome.account, B, 're-confirming the email keeps the account');
+  assert.equal(runCli(w, ['artifacts', 'pane', 'overflow@example.com', '--browser', 'chrome', '--account', 'not-an-id!']).status, 1);
+  assert.equal(accountOfEmail(EMAILS, 'OVERFLOW@example.com'), B.slice(0, 8));
+  const fresh = cworld({ config: { artifactShare: { emails: EMAILS } } });
+  assert.equal(runCli(fresh, ['artifacts', 'pane', 'overflow@example.com', '--browser', 'chrome']).status, 0);
+  assert.equal(JSON.parse(runCli(fresh, ['artifacts', 'list', '--json']).stdout).browsers.chrome.account, B.slice(0, 8), 'taken from the configured email when --account is left out');
+  enqueue(dir, entry(ID1, { ownerAccount: A }));
+  enqueue(dir, entry(ID2, { ownerAccount: A, status: 'invited' }));
+  let p = JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout);
+  assert.deepEqual(p.reachable, { pane: true, chrome: true });
+  assert.deepEqual(p.entries.map((e) => e.id), [ID1], 'pending alone');
+  assert.deepEqual(JSON.parse(runCli(w, ['artifacts', 'pending', '--json', '--with-invited']).stdout).entries.map((e) => e.id).sort(), [ID1, ID2].sort());
+  const un = runCli(w, ['artifacts', 'chrome-unavailable']);
+  assert.equal(un.status, 0, un.stderr);
+  p = JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout);
+  assert.deepEqual(p.reachable, { pane: true, chrome: false });
+  w.setApp({ running: true, signedIn: A });
+  assert.deepEqual(JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout).reachable, { pane: true, chrome: false });
+  assert.equal(runCli(w, ['artifacts', 'mark', ID2, 'accepted']).status, 0);
+  assert.equal(readEntries(dir).find((e) => e.id === ID2).status, 'accepted');
 });

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** artifact sharing works both ways with Claude in Chrome as a second agent-driven browser. Register it once (`artifacts pane <email> --browser chrome --account <id>`; a separate Chrome profile signed in as the other account, the Claude extension connected to it, Chrome left running). An overflow-account session then sends its own artifacts from Chrome and the other account's from the pane, and the subagent clicks Accept in the receiver's browser, so no link needs tapping when both browsers are reachable. Chrome is reachable only from sessions of the account its extension is connected to and is never launched by an agent: when it is not connected the work waits. New `artifacts chrome-unavailable` and `pending --with-invited`, an `accepted` status, and `reachable` in `artifacts pending`.
+
+### Changed
+
+* **session-sync:** the artifact-share trigger no longer waits for an account switch. A session is asked to share when a browser its account can reach can send a pending entry or accept an invited one, for entries older than about 2 minutes, at most once per 30 minutes per account (the claim is time-based, which also fixes a claim that stayed stuck when entries of both accounts stayed pending across A to B to A to B), and with a 30-minute back-off after a run reports Chrome unavailable.
+
 ## 0.5.5 (2026-11-17)
 
 ### Added
