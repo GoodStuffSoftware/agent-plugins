@@ -33,6 +33,8 @@ export const STATUSES = Object.freeze(['pending', 'invited', 'accepted', 'done',
 export const MIN_AGE_MS = 2 * 60 * 1000;
 export const CLAIM_MS = 30 * 60 * 1000;
 export const BACKOFF_MS = 30 * 60 * 1000;
+/** A session the app does not list as interactive is not asked again for this long. */
+const NOINT_MS = 5 * 60 * 1000;
 const ID_RE = /^[A-Za-z0-9_-]{6,64}$/;
 const URL_RE = /https:\/\/claude\.ai\/(?:code\/)?artifact\/([A-Za-z0-9_-]{6,64})/g;
 const ENTRY_RE = /^a-([A-Za-z0-9_-]{6,64})\.json$/;
@@ -356,6 +358,7 @@ export async function interactiveSessionFor(active, sessionId) {
 
 const claimFile = (dir, active) => join(dir, `claim-${createHash('sha256').update(String(active).toLowerCase()).digest('hex').slice(0, 16)}`);
 
+const GUARD_MS = 30 * 1000;
 /**
  * Take the claim for an account: an exclusive create, so one session in a CLAIM_MS window gets it. The claim file's mtime is when it was
  * taken. An EXPIRED claim is renewed in place (its mtime moved to now), never deleted, so the file is always there for a racer to see;
@@ -363,7 +366,6 @@ const claimFile = (dir, active) => join(dir, `claim-${createHash('sha256').updat
  * crashed holder) is removed after GUARD_MS, losing that one prompt. The claim is never cleared early: the rate limit is the whole
  * point, and it also covers entries of both accounts staying pending while the app goes A, B, A, B.
  */
-const GUARD_MS = 30 * 1000;
 function takeClaim(claim, now) {
   const stamp = () => { try { utimesSync(claim, now / 1000, now / 1000); return true; } catch { return false; } };
   try {
@@ -390,7 +392,7 @@ function takeClaim(claim, now) {
  * those runs. Only entries older than MIN_AGE_MS count, and the sessions of one account get the instruction at most once per CLAIM_MS.
  * Cheap on purpose: nothing queued is one failed readdir; the app's account is only read when an entry is old enough to act on.
  * o: { dir, cfg, stateDir, active, share, now, sessionCheck }. `active` (the app's account) is looked up with activeAccount() when not
- * given; `sessionCheck(active)` (async, optional) says whether the prompting session may take the claim.
+ * given; `sessionCheck(active)` (async, optional) says whether the prompting session may take the claim; `sessionKey` (the session id) lets a "no" be remembered.
  * @returns {Promise<{act:boolean, reason:string, due?:object[], text?:string}>}
  */
 export async function wake(o = {}) {
@@ -418,7 +420,18 @@ export async function wake(o = {}) {
   const claim = claimFile(dir, active);
   try { if (now - statSync(claim).mtimeMs < CLAIM_MS) return { act: false, reason: 'claimed' }; } catch { /* not taken yet */ }
   // Only a session the app knows as an interactive one (the browser tools live there) may take it: not a terminal run, a headless or a scheduled session.
-  if (o.sessionCheck && !(await o.sessionCheck(active))) return { act: false, reason: 'not-interactive' };
+  if (o.sessionCheck) {
+    // A "no" is remembered for NOINT_MS per session (o.sessionKey), so a terminal or headless session does not scan the app's session store on every prompt.
+    const memo = o.sessionKey ? join(dir, `noint-${createHash('sha256').update(`${String(active).toLowerCase()} ${o.sessionKey}`).digest('hex').slice(0, 16)}`) : null;
+    try { if (memo && now - statSync(memo).mtimeMs < NOINT_MS) return { act: false, reason: 'not-interactive' }; } catch { /* no memo */ }
+    if (!(await o.sessionCheck(active))) {
+      if (memo) {
+        try { closeSync(openSync(memo, 'w')); utimesSync(memo, now / 1000, now / 1000); } catch { /* ignore */ }
+        for (const n of names) if (n.startsWith('noint-')) { try { if (now - statSync(join(dir, n)).mtimeMs > CLAIM_MS) unlinkSync(join(dir, n)); } catch { /* gone */ } }
+      }
+      return { act: false, reason: 'not-interactive' };
+    }
+  }
   if (!takeClaim(claim, now)) return { act: false, reason: 'claimed' };
   return { act: true, reason: 'claimed-now', due, text: wakeInstruction({ due, active, emails, share, now }) };
 }

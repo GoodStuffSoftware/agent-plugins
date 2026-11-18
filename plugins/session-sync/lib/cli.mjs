@@ -922,8 +922,10 @@ if (cmd === 'artifacts') {
         driveable: A.driveableOwner(e.ownerAccount, emails, share),
       }));
       const active = sub === 'pending' ? await A.activeAccount() : null;
-      const reachable = active ? Object.fromEntries(Object.entries(share.browsers).map(([k, b]) => [k, A.browserUsable(b, active)])) : null;   // from a session running as the app's account, now
-      const head = { enabled: cfg.artifactShare.enabled, linked: A.featureOn({ artifactShare: { enabled: true } }), browsers: share.browsers, reachable, emails, activeAccount: active, activeEmail: A.emailOf(emails, active) };
+      // From a session running as the app's account: `reachable` is the account half only (null when the account cannot be read: unknown, probe it); `backoff` lists browsers a run reported unavailable less than 30 minutes ago, which gates the automatic trigger, not a run the user asked for.
+      const reachable = active ? Object.fromEntries(Object.entries(share.browsers).map(([k, b]) => [k, A.browserReachableFrom(b, active)])) : null;
+      const backoff = Object.fromEntries(Object.entries(share.browsers).filter(([, b]) => Date.now() - Date.parse(b.unavailableAt ?? '') < A.BACKOFF_MS).map(([k, b]) => [k, b.unavailableAt]));
+      const head = { enabled: cfg.artifactShare.enabled, linked: A.featureOn({ artifactShare: { enabled: true } }), browsers: share.browsers, reachable, backoff, emails, activeAccount: active, activeEmail: A.emailOf(emails, active) };
       out({ ok: true, ...head, entries: shown }, shown.length ? shown.map(line).join('\n') : (sub === 'pending' ? 'nothing pending' : 'the queue is empty'));
       process.exit(0);
     }

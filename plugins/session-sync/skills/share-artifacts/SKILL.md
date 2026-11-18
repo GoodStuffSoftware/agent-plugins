@@ -43,7 +43,7 @@ Each entry has `status` (`pending` = to send, `invited` = sent, to accept), `id`
 - `ownerEmail` or `receiverEmail` missing for an entry whose `ownerAccount` is set: the account emails are not configured. Stop and tell the user to run `node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" config artifactShare.email <account id> <email>` once for each of the two accounts.
 - `ownerAccount` null (the account could not be told when the artifact was made): handled in step 3.
 
-Give the subagent the list (status, id, url, title, ownerEmail, receiverEmail, inviteLink), the email the pane is expected to hold, and steps 2 to 7.
+Give the subagent the list (status, id, url, title, ownerEmail, receiverEmail, inviteLink), `browsers`, `reachable`, `backoff` and `activeAccount` from the same output (the pane's expected email is `browsers.pane.email`; none recorded means unknown, read it from the page), and steps 2 to 7. `reachable` is the account half only (null: the app's account could not be read, so probe Chrome and let the CLI refuse); `backoff` names a browser a recent run found unavailable.
 
 ## 2. Check which browsers are reachable and who they are signed in as (subagent)
 
@@ -53,7 +53,7 @@ Give the subagent the list (status, id, url, title, ownerEmail, receiverEmail, i
 node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts pane <email>
 ```
 
-**Chrome** (only when `browsers` has a `chrome` entry **and `reachable.chrome` is true**: it is false for a session of the other account, which cannot see that Chrome at all, and during the 30-minute back-off; then skip Chrome and say so in the report. Try it when entries need it: only Chrome can send or accept them). Load the `mcp__claude-in-chrome__*` tools, call `list_connected_browsers`, then `select_browser` for the connected one.
+**Chrome** (only when `browsers` has a `chrome` entry **and `reachable.chrome` is not false**: it is false for a session of the other account, which cannot see that Chrome at all; then skip Chrome and say so in the report. A `backoff.chrome` entry gates only the automatic trigger: when the user asked for this run, probe Chrome anyway, since it may have been started since. Try it when entries need it: only Chrome can send or accept them). Load the `mcp__claude-in-chrome__*` tools, call `list_connected_browsers`, then `select_browser` for the connected one.
 
 - Not connected (empty list, the tools missing, or the call errors): do **not** open or launch Chrome. Record it and carry on with the pane:
 
@@ -77,9 +77,9 @@ For each entry, compare `ownerEmail` and `receiverEmail` with the emails of the 
 - `pending`, a reachable browser signed in as `ownerEmail`: send from it (steps 4 to 6). The receiver is `receiverEmail`; if null (the owner was unknown), the other configured email.
 - `pending`, no reachable browser holds `ownerEmail`: leave it pending and say so in the report ("no reachable browser is signed in as <ownerEmail>"). A later session or browser takes it; do not touch it.
 - `pending`, `ownerEmail` null: open it in a reachable browser. If the page offers **Share**, that browser's account owns it, so send to the other configured email; with no Share control, record `mark <id> skipped --reason "owner unknown, no Share control in a reachable browser"` (so it does not wake a session every 30 minutes; `mark <id> pending` revives it).
+- `invited`: accept it (step 7) when a reachable browser is signed in as `receiverEmail`; otherwise leave it for the links (step 8).
 
 Before you send an entry, re-read its status (`artifacts list --json`) and skip it if it is no longer `pending`: a session of the other account may have started a run on the same queue.
-- `invited`: accept it (step 7) when a reachable browser is signed in as `receiverEmail`; otherwise leave it for the links (step 8).
 
 ## 4. Open the artifact and check it is private (subagent)
 

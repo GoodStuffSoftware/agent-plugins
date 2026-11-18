@@ -418,6 +418,25 @@ test('N24 the wake stays silent until the emails of both accounts are set, and a
   assert.equal(yes.act, true);
 });
 
+test('N24b a session that is not interactive is asked about once, not on every prompt (a "no" is remembered for 5 minutes per session)', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  enqueue(dir, entry(ID1));
+  let calls = 0;
+  const check = async () => { calls++; return false; };
+  const t0 = Date.now();
+  const w1 = (extra) => wake({ dir, ...wakeOpts({ stateDir: sd, active: B, sessionCheck: check, sessionKey: 'term-1', now: t0, ...extra }) });
+  assert.equal((await w1()).reason, 'not-interactive');
+  assert.equal((await w1()).reason, 'not-interactive');
+  assert.equal(calls, 1, 'the second prompt of the same session did not scan again');
+  await w1({ sessionKey: 'term-2' });
+  assert.equal(calls, 2, 'another session is asked');
+  await w1({ now: t0 + 6 * MIN });
+  assert.equal(calls, 3, 'and the same one again after 5 minutes');
+  const yes = await wake({ dir, ...wakeOpts({ stateDir: sd, active: B, sessionCheck: async () => true, sessionKey: 'app-1', now: t0 }) });
+  assert.equal(yes.act, true, 'a "no" for one session never blocks an interactive one');
+});
+
 test('N25 eight real hook processes prompting at once: exactly one prints the instruction', async () => {
   const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
   w.putState((s) => { s.linked = true; });
@@ -620,9 +639,10 @@ test('N33 the commands for Chrome: pane --browser chrome keeps the account, chro
   const un = runCli(w, ['artifacts', 'chrome-unavailable']);
   assert.equal(un.status, 0, un.stderr);
   p = JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout);
-  assert.deepEqual(p.reachable, { pane: true, chrome: false });
+  assert.deepEqual(p.reachable, { pane: true, chrome: true }, 'the back-off is not account reachability: a hand-run skill still probes Chrome');
+  assert.deepEqual(Object.keys(p.backoff), ['chrome']);
   w.setApp({ running: true, signedIn: A });
-  assert.deepEqual(JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout).reachable, { pane: true, chrome: false });
+  assert.deepEqual(JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout).reachable, { pane: true, chrome: false }, 'another account cannot reach that Chrome at all');
   assert.equal(runCli(w, ['artifacts', 'mark', ID2, 'accepted']).status, 0);
   assert.equal(readEntries(dir).find((e) => e.id === ID2).status, 'accepted');
 });

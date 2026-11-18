@@ -60,7 +60,7 @@ try {
     const prompt = String(input.prompt ?? '').trim();
     const sid = typeof input.session_id === 'string' ? input.session_id : '';
     if (prompt && sid && !prompt.startsWith('/')) {
-      const d = await wake({ cfg: loadConfig(), sessionCheck: (active) => interactiveSessionFor(active, sid) });
+      const d = await wake({ cfg: loadConfig(), sessionKey: sid, sessionCheck: (active) => interactiveSessionFor(active, sid) });
       if (d.act) {
         log(`artifact-share: instruction given to session ${String(input.session_id ?? '').slice(0, 8)} for ${d.due.length} artifact(s)`);
         try { writeSync(1, `${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`); } catch { /* no stdout */ }
