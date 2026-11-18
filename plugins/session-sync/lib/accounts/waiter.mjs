@@ -29,7 +29,7 @@ import { accPath, readJson, writeJsonAtomic, loadState, saveState, withAccountsL
 import { createStopWatch, coolingEndsAt, readSignedIn, appState } from './appstate.mjs';
 import { listFolders } from './folders.mjs';
 import { fullPass, livePass, link, unlink, owedWork } from './pass.mjs';
-import { PLUGIN_VERSION, codeHash } from './version.mjs';
+import { PLUGIN_VERSION, codeHash, compareVersions } from './version.mjs';
 import { verifyProcess, WAITER_MARKER } from './procid.mjs';
 import { nullUi, progressInfo } from './progress.mjs';
 import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS } from './rcrestore.mjs';
@@ -94,15 +94,17 @@ const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuf
  * which the SessionStart hook must not wait for (it asks only when the claim already differs from this copy).
  *
  * Nothing is ended unless it is proven to be a waiter and is not working:
- *   - another copy: the claim's version differs (no version is an older one), or the version is the same and the claim's code
- *     hash differs from this copy's (S5: a fix that shipped without a version bump). A claim with a version and no hash is taken
- *     to be current. This copy must know its own version;
+ *   - an older copy: the claim's version is older than this copy's by semver (no version is an older one), or the version is the
+ *     same and the claim's code hash differs from this copy's (S5: a fix that shipped without a version bump). A claim with a
+ *     version and no hash is taken to be current. A claim of a NEWER version is never ended (`reason: 'newer'`, silent: the caller
+ *     joins that waiter): the Claude app's own copy of the plugin can lag behind the user's cache, and its older code must not
+ *     take the waiter of the newer one. This copy must know its own version;
  *   - identity (procid.verifyProcess): its command line holds `accounts wait` and it started no later than the claim. A pid that
  *     fails this is not the waiter (pid reuse): the files are stale, they are dropped, nothing is ended. When the OS cannot be
  *     asked nothing is touched (`unverified`);
  *   - not mid-pass: accounts.lock is not held by it (checked again right before the kill). A waiter that waits holds no lock.
  * The new waiter is started by the caller (armWaiter), or by the next session start for an owed pass.
- * deps: { kill(pid), alive(pid), sleep(ms), verify(pid, want) } (tests).
+ * deps: { kill(pid), alive(pid), sleep(ms), verify(pid, want), version, hash } (tests; version and hash stand for this copy's own).
  * @returns {{replaced:boolean, reason?:string, stale?:boolean, pid?:number, version?:string|null, reasons?:string[]}}
  */
 export function replaceOldWaiter(ctx, deps = {}) {
@@ -112,9 +114,17 @@ export function replaceOldWaiter(ctx, deps = {}) {
   const claim = readJson(claimFile(ctx), null);
   const mine = claim?.pid === st.pid ? claim : null;
   const version = mine?.version ?? null;
-  if (!PLUGIN_VERSION) return { replaced: false, reason: 'unknown-version' };
+  const myVersion = deps.version !== undefined ? deps.version : PLUGIN_VERSION;
+  if (!myVersion) return { replaced: false, reason: 'unknown-version' };
   const myHash = deps.hash !== undefined ? deps.hash : codeHash();
-  if (version === PLUGIN_VERSION && (!mine?.hash || !myHash || mine.hash === myHash)) return { replaced: false, reason: 'current', version };
+  if (version) {
+    // Two copies of the plugin can run on one machine (the user's cache and the Claude app's own, which can lag behind): the older
+    // copy must never end a newer waiter. Only a newer copy replaces an older one; an equal version is told apart by its code hash.
+    const order = compareVersions(version, myVersion);
+    if (order === null) return { replaced: false, reason: 'unknown-version', version };   // not a version we can order: end nothing
+    if (order > 0) return { replaced: false, reason: 'newer', version };
+    if (order === 0 && (!mine?.hash || !myHash || mine.hash === myHash)) return { replaced: false, reason: 'current', version };
+  }
   const lockHeld = () => { const h = readJson(accPath(ctx, 'accounts.lock'), null); return !!h && h.pid === st.pid && pidAlive(h.pid); };
   if (lockHeld()) return { replaced: false, reason: 'busy', pid: st.pid };
   const claimedAt = mine?.at ?? (Date.parse(st.armedAt ?? '') || NaN);

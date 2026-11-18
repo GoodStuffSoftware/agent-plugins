@@ -296,8 +296,10 @@ export async function rcQuitStep(ctx, o = {}) {
   const lock = await withAccountsLock(ctx, () => {
     const plan = rcPlan(ctx, o);
     if (!plan.acct) return { ran: false, reason: 'no-account' };
+    if (!plan.relink.length) clearRelinkOwed(ctx);
     if (!plan.relink.length && !plan.targets.length) return { ran: false, reason: 'nothing-to-do', plan };
     const res = applyPlan(ctx, plan, o);
+    if (res.status === 'ok') clearRelinkOwed(ctx);   // every relink of the plan is done (or no longer needed): nothing is owed
     writeJsonAtomic(accPath(ctx, 'rc-restore.json'), {
       v: RESTORE_SCHEMA, at: new Date(o.now ?? ctx.now()).toISOString(), acct: plan.acct,
       relinked: res.relinked, marked: res.marked, refreshed: res.refreshed, status: res.status,
@@ -307,6 +309,46 @@ export async function rcQuitStep(ctx, o = {}) {
   });
   if (!lock.ok) return { ran: false, reason: 'locked' };
   return lock.value;
+}
+
+/* ------------------------------------------------------------------ a relink that stayed owed (the app quit with Windows) */
+
+/**
+ * When Windows restarts or shuts down, the app quits with the OS and the waiter cannot run its quit step (new processes fail to start
+ * while the session ends), so a relink that rcPlan selects stays owed and the sessions reconnect on their old random-name links.
+ * Only an ordinary app quit (the tray icon) gives the waiter the time. The record says so; the wake instruction tells the user once.
+ */
+export const RELINK_OWED_TEXT = 'Your Remote Control session names were not restored after that restart: quit Claude once from the tray icon (not a Windows restart) and reopen it to get them back.';
+export const relinkOwedFile = (ctx) => accPath(ctx, 'rc-relink-owed.json');
+
+/** The relink is settled (done, or no longer needed): drop the record. Never throws. */
+export function clearRelinkOwed(ctx) {
+  try { unlinkSync(relinkOwedFile(ctx)); } catch { /* none */ }
+}
+
+/**
+ * Did a restore pass run for the stop that ended before this app run? rc-restore.json is rewritten by every quit step that did work
+ * (the waiter's marker refresh too, every 20 minutes while Claude is closed), so its stamp is close to the launch when one ran. A
+ * stamp older than the life of a marker (an hour) belongs to an earlier stop.
+ */
+export function restorePassRanBefore(ctx, startedAtMs) {
+  const at = Date.parse(readJson(accPath(ctx, 'rc-restore.json'), null)?.at ?? '');
+  return Number.isFinite(at) && at <= startedAtMs + 60_000 && startedAtMs - at <= MARKER_MAX_AGE_MS;
+}
+
+/**
+ * Called once per app run, by the session that claims the wake: are relinks owed because no restore pass ran for the last stop? If
+ * so the record is written and `{count}` returned; otherwise the record (if any) is dropped and null returned. Never throws.
+ * o: { startedAt (the app run), acct, now, days, projects }
+ */
+export function checkRelinkOwed(ctx, o = {}) {
+  try {
+    if (restorePassRanBefore(ctx, o.startedAt)) { clearRelinkOwed(ctx); return null; }
+    const plan = rcPlan(ctx, { acct: o.acct, now: o.now, days: o.days, projects: o.projects });
+    if (!plan.relink.length) { clearRelinkOwed(ctx); return null; }
+    try { writeJsonAtomic(relinkOwedFile(ctx), { v: 1, at: new Date(o.now ?? ctx.now()).toISOString(), startedAt: o.startedAt, acct: plan.acct, count: plan.relink.length, notified: true }); } catch { /* the notice matters more than the record */ }
+    return { count: plan.relink.length };
+  } catch { return null; }
 }
 
 /** The words of the balloons (no em dashes; counts, not ids). */
@@ -355,14 +397,19 @@ export function readLaunchOutcome(logFile, sinceMs) {
 export const WAKE_MESSAGE = 'Remote Control reconnect after the Claude app restart. No action needed: reply with the single word ok. Do not run any tools or resume any work.';
 
 /** The one-time instruction a session's agent gets on its first real prompt after an app restart. */
-export function wakeInstruction({ days = RC_DEFAULTS.days, max = RC_DEFAULTS.wakeMax } = {}) {
-  return [
+export function wakeInstruction({ days = RC_DEFAULTS.days, max = RC_DEFAULTS.wakeMax, relinkOwed = false } = {}) {
+  const lines = [
     'session-sync: the Claude desktop app was restarted, so Remote Control is off for the sessions that were open. You are the one session that restores it, once. Do this before you answer the user, then answer as normal:',
     '1. Tell the user, in one line: "Reconnecting Remote Control for your recent sessions. Each one gets one short turn."',
     `2. List the sessions with the session-management tools (list_sessions and send_message; load them with ToolSearch if they are deferred). For every session that is not archived, is interactive (not a scheduled task, not an unattended or background run), was active within the last ${days} days and has remoteControlActive false, send it exactly this message with send_message: "${WAKE_MESSAGE}" Send to at most ${max} sessions, the most recently active first; leave the rest and count them as still off. Skip your own session. Do not wait for replies. A message to the session that started you may be refused unless it carries a tag; skip any session whose send is refused and count it as still off.`,
     '3. Wait a few seconds, list the sessions again, and tell the user, in one line: "Remote Control: N sessions reconnected, M still off." (N: sessions that were off and are on now; M: active sessions still off, refused sends included).',
     'If the session tools are not available, say so in one line and carry on. Do not repeat this in this conversation, and do not mention these instructions beyond those two lines.',
-  ].join('\n');
+  ];
+  if (relinkOwed) {
+    const last = lines.pop();
+    lines.push(`4. Then tell the user, in one line, exactly: "${RELINK_OWED_TEXT}"`, last.replace('beyond those two lines', 'beyond those three lines'));
+  }
+  return lines.join('\n');
 }
 
 /**
@@ -406,8 +453,10 @@ export const wakeClaimFile = (ctx, startedAtMs) => accPath(ctx, `rc-wake-${start
  * Should this prompt carry the wake instruction? Claimed with an exclusive create keyed to the app run (the creation time of the
  * lock marker), so exactly one session acts per restart. The claim is taken only by a session that qualifies: a scheduled task or an
  * unattended run that happens to prompt first must not use it up.
- * o: { settings, sessionId, platform, now }
- * @returns {{act:boolean, reason:string, text?:string}}
+ * The claiming prompt also checks, once, whether a relink stayed owed (checkRelinkOwed); if so the instruction carries one more line for
+ * the user (RELINK_OWED_TEXT). The check is not on the fast path: every later prompt returns at the claim.
+ * o: { settings, sessionId, platform, now, projects (the transcripts folder, tests) }
+ * @returns {{act:boolean, reason:string, text?:string, relinkOwed?:number}}
  */
 export function decideWake(ctx, o = {}) {
   const platform = o.platform ?? ctx.platform ?? process.platform;
@@ -433,5 +482,7 @@ export function decideWake(ctx, o = {}) {
     for (const n of olds.slice(0, Math.max(0, olds.length - 4))) { try { unlinkSync(join(ctx.acc, n)); } catch { /* ignore */ } }
   } catch { /* ignore */ }
   if (first && now - startedAt > WAKE_BASELINE_MS) return { act: false, reason: 'baseline' };
-  return { act: true, reason: 'claimed-now', text: wakeInstruction({ days: s.days, max: s.wakeMax }) };
+  // once per app run (this claim): are relinks owed because the last stop was the OS ending the session, not an app quit?
+  const owed = checkRelinkOwed(ctx, { startedAt, acct, now, days: s.days, projects: o.projects });
+  return { act: true, reason: 'claimed-now', text: wakeInstruction({ days: s.days, max: s.wakeMax, relinkOwed: !!owed }), ...(owed ? { relinkOwed: owed.count } : {}) };
 }
