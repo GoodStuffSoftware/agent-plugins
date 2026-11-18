@@ -7,7 +7,7 @@
 import { test, afterEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, linkSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { makeRoot, addFolder, putRecord, recordName, uuid, inoOf, nlinkOf, readRecord, makeClock } from './fixtures/store.mjs';
 import { spawnSync } from 'node:child_process';
 import { cworld, cleanupWorlds, CLI } from './fixtures/cliworld.mjs';
@@ -142,6 +142,14 @@ test('P3 a record with no transcript is dated by createdAt against the switch hi
   assert.deepEqual(plan.flagged.map((s) => s.id), [`local_${uuid('c', 1)}`]);
 });
 
+test('P3b a record older than everything the history knows is undated (skipped), never flagged: the first entry is only the oldest log line left', () => {
+  const w = world();
+  putRecord(w.fMe.path, 1, { createdAt: iso(SWITCH - 60 * DAY), remoteControlSpawn: SPAWN('cse_a'), bridgeSessionIds: [] });
+  const plan = spawnPlan(w.ctx, opts(w));
+  assert.deepEqual(plan.flagged, []);
+  assert.deepEqual(plan.skipped.map((s) => s.reason), ['undated']);
+});
+
 test('P4 a foreign cse_ id in bridgeSessionIds alone (no spawn at all) is flagged; the own id and non-cse ids stay', async () => {
   const w = world();
   const [p] = linked(w, 1, { bridgeSessionIds: ['cse_old', 'cse_new', 'session_keep'] });
@@ -226,16 +234,29 @@ test('P7 the app starting mid-repair: the record in hand fails with nothing writ
   assert.ok(bytes(one[0]).equals(pre[0]) && bytes(two[0]).equals(pre[1]), 'nothing was written');
 });
 
-test('P8 a record whose unedited round trip is not byte-identical is left alone and reported failed', () => {
+test('P8 a record whose unedited round trip is not byte-identical is left alone, up front (plan, dry run) and at the write', () => {
   const w = world();
   const [p] = linked(w, 1, foreignRec);
   transcript(w, 1);
   writeFileSync(p, JSON.stringify(readRecord(p), null, 3).replace('{', '{ '));   // formatting the plugin cannot reproduce
   const pre = bytes(p);
+  const plan = spawnPlan(w.ctx, opts(w));
+  assert.deepEqual([plan.flagged.length, plan.skipped.map((s) => s.reason)], [0, ['format']], 'the dry run does not promise a fix the write would refuse');
   const r = spawnFixCore(w.ctx, opts(w, { apply: true }));
-  assert.deepEqual([r.fixed.length, r.failed.length, r.status], [0, 1, 'partial']);
-  assert.match(r.failed[0].detail, /round trip/);
+  assert.deepEqual([r.found, r.fixed.length, r.failed.length, r.status, r.skipped.length], [0, 0, 0, 'ok', 1]);
   assert.ok(bytes(p).equals(pre));
+  assert.equal(backupFiles(w).length, 0);
+  // the write-time guard stays for a record that changed after the plan was made
+  const [q] = linked(w, 2, foreignRec);
+  transcript(w, 2);
+  const plan2 = spawnPlan(w.ctx, opts(w));
+  assert.equal(plan2.flagged.length, 1);
+  writeFileSync(q, JSON.stringify(readRecord(q), null, 3).replace('{', '{ '));
+  const pre2 = bytes(q);
+  const a = applySpawnFix(w.ctx, plan2, { now: NOW, stopped });
+  assert.deepEqual([a.fixed.length, a.failed.length], [0, 1]);
+  assert.match(a.failed[0].detail, /round trip/);
+  assert.ok(bytes(q).equals(pre2));
   assert.equal(backupFiles(w).length, 0);
 });
 
@@ -476,4 +497,20 @@ test('P17 the rc-wake hook looks (report only, throttled) on a real prompt and n
   const n = lines();
   hook('again');
   assert.equal(lines(), n, 'throttled: no second pass within 10 minutes');
+});
+
+test('P18 through the quit step a recent session is also an rc restore target: the spawn backup is the record as it was, and the restore keeps its own', async () => {
+  const w = world();
+  const links = linked(w, 1, { ...foreignRec, lastActivityAt: iso(NOW - 3600_000), remoteControlUserEnabled: true, remoteControlAutoEligible: false });
+  transcript(w, 1);
+  const pre = bytes(links[0]);
+  const q = await rcQuitStep(w.ctx, opts(w));
+  assert.equal(q.spawn.fixed.length, 1);
+  assert.equal(q.ran, true, 'the rc restore ran as well (marked the record)');
+  assert.ok(readRecord(links[0]).remoteControlLiveAtUpdateQuit, 'the restore marker is on the record');
+  assert.equal(readRecord(links[2]).remoteControlSpawn.detachedAt, NOW);
+  const spawnBackups = backupFiles(w).filter((f) => /^spawn-/.test(basename(f)));
+  assert.equal(spawnBackups.length, 1);
+  assert.ok(bytes(spawnBackups[0]).equals(pre), 'the pre-edit bytes survive the restore step');
+  assert.ok(backupFiles(w).length >= 2, 'the restore step made its own copy under its own name');
 });

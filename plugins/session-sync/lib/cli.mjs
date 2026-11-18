@@ -427,7 +427,7 @@ async function accountsPass(ctx, reason) {
   const app = appState({ ctx, probeProcesses: true });
   const remoteList = readJson(accPath(ctx, 'remote-list.json'), null);
   const res = app.fullAllowed
-    ? await fullPass(ctx, { app, remoteList, reasons: [reason] })
+    ? await fullPass(ctx, { app, remoteList, reasons: [reason], log })
     : await livePass(ctx, { app, remoteList });
   if (res.armWaiter || res.aborted || loadState(ctx).fullPassOwed) armWaiter(ctx, 'deferred');
   // the singleton watcher follows account switches while the app runs (go-live's last pass, every push and pull)
@@ -691,7 +691,10 @@ async function spawnFixCommand(ctx, args) {
     const sessions = plan.flagged.map((s) => ({ id: s.id, title: s.title, spawn: s.spawn, foreignIds: s.ids.length }));
     const lines = plan.flagged.map((s) => `would fix ${s.id.replace(/^local_/, '').slice(0, 8)} "${s.title}" (${[s.spawn ? 'spawn detached' : '', s.ids.length ? `${s.ids.length} foreign bridge id(s) removed` : ''].filter(Boolean).join(', ')})`);
     lines.push(plan.flagged.length ? `Dry run: ${plan.flagged.length} session(s) would be fixed; quit Claude and run: accounts rc-spawn-fix` : 'Nothing to fix: no session of the signed-in account carries a Remote Control spawn from another account.');
-    if (plan.skipped.length) lines.push(`Left alone (cannot tell which account they were started under): ${plan.skipped.length}.`);
+    const undated = plan.skipped.filter((s) => s.reason === 'undated').length;
+    const format = plan.skipped.filter((s) => s.reason === 'format').length;
+    if (undated) lines.push(`Left alone (cannot tell which account they were started under): ${undated}.`);
+    if (format) lines.push(`Left alone (the record's formatting would change if it were rewritten): ${format}.`);
     emit({ ok: true, command: 'rc-spawn-fix', dryRun: true, acct: plan.acct, scanned: plan.scanned, found: plan.flagged.length, skipped: plan.skipped.length, sessions }, lines);
     return 0;
   }
@@ -706,7 +709,7 @@ async function spawnFixCommand(ctx, args) {
   if (r.reason === 'locked') { emit({ ok: false, command: 'rc-spawn-fix', reason: 'locked' }, ['Another account pass holds the accounts lock; try again in a minute.']); return 3; }
   const lines = r.fixed.map((f) => `fixed ${f.id.replace(/^local_/, '').slice(0, 8)} "${f.title}"`);
   for (const f of r.failed) lines.push(`FAILED ${f.id.replace(/^local_/, '').slice(0, 8)} "${f.title}": ${f.detail}`);
-  lines.push(r.found ? `${spawnLine(r)}${r.backupDir ? `. Backup: ${r.backupDir}` : ''}` : 'Nothing to fix: no session of the signed-in account carries a Remote Control spawn from another account.');
+  lines.push(r.status === 'failed' ? 'The check failed; nothing was changed (see sync.log).' : r.found ? `${spawnLine(r)}${r.backupDir ? `. Backup: ${r.backupDir}` : ''}` : 'Nothing to fix: no session of the signed-in account carries a Remote Control spawn from another account.');
   emit({ ok: r.status === 'ok', command: 'rc-spawn-fix', dryRun: false, acct: r.acct, scanned: r.scanned, found: r.found, fixed: r.fixed, failed: r.failed, pending: r.pending, skipped: r.skipped.length, status: r.status, backupDir: r.backupDir }, lines);
   return r.status === 'ok' ? 0 : 3;
 }
@@ -760,7 +763,7 @@ async function accountsCommand(sub, args) {
     if (answer === 'no') { emit({ ok: true, command: 'answer', answered: pend.length, answer }, [`Recorded: not sharing (${pend.length} pair(s)). Change your mind with: accounts answer yes, or config accountLink.`]); return 0; }
     const app = appState({ ctx, probeProcesses: true });
     if (app.fullAllowed) {
-      const res = await link(ctx, {});
+      const res = await link(ctx, { log });
       const sum = summarizePass(res, 'link');
       emit({ command: 'answer', answered: pend.length, answer, ...sum }, formatPass(sum));
       return res.ok ? 0 : 3;
@@ -783,7 +786,7 @@ async function accountsCommand(sub, args) {
       if (!hook) emit({ ok: true, command: 'link', waiter: w.action }, state.linked ? ['The accounts are already linked. Anything still owed runs by itself after your next normal quit of Claude.'] : [RESTART_LEAD_WAITER, 'Claude is running; closing the window only hides it.']);
       return 0;
     }
-    const res = await link(ctx, { app });
+    const res = await link(ctx, { app, log });
     printPass(res, 'link');
     return res.ok ? 0 : 3;
   }
@@ -1124,17 +1127,20 @@ if (cmd === 'rc-wake') {
     try { if (!process.stdin.isTTY) input = JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { /* no input */ }
     const settings = rcRestoreNow();
     const prompt = String(input.prompt ?? '').trim();
+    let woke = false;
     if (settings.enabled && settings.wake && input.session_id && prompt && !prompt.startsWith('/')) {
       // the prompt that claims the restart also clears the stale links of the sessions that have no CLI yet (liveRelink), before the instruction goes out
       const d = await wakeWithRelink(makeCtx(), { settings, sessionId: String(input.session_id), log, cimTimeoutMs: 6000 });
       if (d.act) {
+        woke = true;
         log(`rc-wake: instruction given to session ${String(input.session_id).slice(0, 8)}${d.relinkOwed ? `; relink owed for ${d.relinkOwed} session(s), the user is asked to quit Claude once from the tray icon` : ''}`);
         writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`);
       }
     }
     // 0.5.9: a session started from claude.ai or the phone under the other account is only reported here (the app runs; the repair waits
-    // for a quit or a switch). Throttled to one pass per 10 minutes, independent of `rcRestore.enabled`, never writes a record.
-    if (input.session_id && prompt && !prompt.startsWith('/')) spawnLook(makeCtx(), { log, settings });
+    // for a quit or a switch). Throttled to one pass per 10 minutes, independent of `rcRestore.enabled`, never writes a record. Not on the prompt
+    // that gave the wake instruction (that one already spends most of the hook's time on the process listings).
+    if (!woke && input.session_id && prompt && !prompt.startsWith('/')) spawnLook(makeCtx(), { log, settings });
   } catch (e) { log(`rc-wake failed: ${e?.message || e}`); }
   process.exit(0);
 }

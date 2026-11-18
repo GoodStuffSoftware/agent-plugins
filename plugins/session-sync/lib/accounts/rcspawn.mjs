@@ -31,7 +31,7 @@
  * Circular import with rcrestore.mjs (its quit step calls this); both only use the other's exports inside functions, never at load.
  */
 
-import { readFileSync, readdirSync, statSync, openSync, closeSync, writeSync, ftruncateSync, fsyncSync, copyFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, openSync, closeSync, writeSync, ftruncateSync, fsyncSync, copyFileSync, mkdirSync, existsSync, constants as FS } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig, rcSettings } from '../config.mjs';
 import { accPath, readJson, writeJsonAtomic, detectFormat, serializeJson, withAccountsLock } from './state.mjs';
@@ -65,9 +65,7 @@ function byCreation(rec, history, cur) {
   if (!Number.isFinite(t) || !history.length) return 'undated';
   const a = acctAt(history, t, cur);
   if (a) return a === cur ? 'own' : 'foreign';
-  // older than everything the history knows: the first account it names stands in, when it is not the current one
-  if (t < history[0].at && history[0].acct !== cur) return 'foreign';
-  return 'undated';
+  return 'undated';   // older than the history (its first entry is only the oldest log line left) or after an unrecorded switch: never guessed
 }
 
 /** What is wrong with one parsed record: { spawnId, spawnForeign, foreignIds, undated }. */
@@ -121,11 +119,11 @@ export function spawnPlan(ctx, o = {}) {
       let text; try { text = readFileSync(path, 'utf8'); } catch { continue; }
       plan.scanned++;
       if (!text.includes('"remoteControlSpawn"') && !text.includes('"cse_')) continue;   // cheap: nothing to look at without one of the two
-      let rec; try { rec = JSON.parse(text.replace(/^﻿/, '')); } catch { continue; }
+      let rec; try { rec = JSON.parse(text.replace(/^\uFEFF/, '')); } catch { continue; }
       if (!rec || typeof rec !== 'object' || rec.isArchived === true) continue;
       if (rec.movedToCloud || (rec.backend && rec.backend.kind && rec.backend.kind !== 'local')) continue;
       if (!liveSpawn(rec) && !(Array.isArray(rec.bridgeSessionIds) && rec.bridgeSessionIds.some(isCse))) continue;
-      cands.push({ f, name, path, rec });
+      cands.push({ f, name, path, rec, text });
     }
   }
   if (!cands.length) return plan;
@@ -142,16 +140,19 @@ export function spawnPlan(ctx, o = {}) {
     const id = c.rec.sessionId ?? c.name.replace(/\.json$/, '');
     const title = c.rec.title ?? '';
     const d = decide(c.rec, fc, findTranscript(projects, c.rec), acct);
-    const s = bySid.get(id) ?? { id, title, targets: [], spawn: false, ids: [], undated: false };
+    const s = bySid.get(id) ?? { id, title, targets: [], spawn: false, ids: [], undated: false, format: false };
     bySid.set(id, s);
     if (d.undated) s.undated = true;
     if (!d.spawnForeign && !d.foreignIds.length) continue;
+    // the repair edits only what it names: a record whose unedited round trip is not byte-identical is left alone, and said so up front
+    if (!roundTrips(c.text)) { s.format = true; continue; }
     s.spawn ||= d.spawnForeign;
     for (const x of d.foreignIds) if (!s.ids.includes(x)) s.ids.push(x);
     s.targets.push({ path: c.path, name: c.name, org: c.f.org, key: sk.key, nlink: sk.nlink, links: linksOf(folders, c.name, sk.key), detach: d.spawnForeign, spawnId: d.spawnId, removeIds: d.foreignIds });
   }
   for (const s of bySid.values()) {
     if (s.targets.length) plan.flagged.push({ id: s.id, title: s.title, targets: s.targets, spawn: s.spawn, ids: s.ids });
+    else if (s.format) plan.skipped.push({ id: s.id, title: s.title, reason: 'format' });
     else if (s.undated) plan.skipped.push({ id: s.id, title: s.title, reason: 'undated' });
   }
   return plan;
@@ -165,7 +166,10 @@ export function overwriteInPlace(file, buf) {
   try { writeSync(fd, buf, 0, buf.length, 0); ftruncateSync(fd, buf.length); try { fsyncSync(fd); } catch { /* best effort */ } } finally { closeSync(fd); }
 }
 
-const parseText = (text) => JSON.parse(text.replace(/^﻿/, ''));
+const parseText = (text) => JSON.parse(text.replace(/^\uFEFF/, ''));
+
+/** True when parsing and writing the record back (in its own format) gives the same text: the only kind of record the edit touches. */
+function roundTrips(text) { try { return serializeJson(parseText(text), detectFormat(text)) === text; } catch { return false; } }
 
 /**
  * One inode: back it up, edit it in place, check it. Never throws.
@@ -192,15 +196,25 @@ function editTarget(t, o) {
     if (!changed) return { status: 'nothing' };
     const before = statKey(t.path);
     mkdirSync(o.backupDir, { recursive: true });
-    let name = `${t.org.slice(0, 8)}-${t.name}`;
-    for (let i = 2; o.used.has(name); i++) name = `${t.org.slice(0, 8)}-${i}-${t.name}`;
-    o.used.add(name);
-    const backupFile = join(o.backupDir, name);
-    copyFileSync(t.path, backupFile);
+    // a name space of its own ("spawn-"): the rc restore backs the same record up as <org8>-<name> in the same stamp folder, and neither may
+    // replace the other (the first copy is the only one of the record as it was); never overwrite an existing file
+    const base = `spawn-${t.org.slice(0, 8)}-${t.name}`;
+    let backupFile = join(o.backupDir, base);
+    for (let i = 2; ; i++) {
+      if (!o.used.has(backupFile) && !existsSync(backupFile)) { try { copyFileSync(t.path, backupFile, FS.COPYFILE_EXCL); break; } catch (e) { if (e?.code !== 'EEXIST') throw e; } }
+      backupFile = join(o.backupDir, `spawn-${t.org.slice(0, 8)}-${i}-${t.name}`);
+      if (i > 50) return { status: 'failed', detail: 'no free backup name; nothing was changed' };
+    }
+    o.used.add(backupFile);
     if (!readFileSync(backupFile).equals(raw)) return { status: 'failed', detail: `the backup ${backupFile} does not match the record; nothing was changed` };
-    if (!o.stopped()) return { status: 'failed', detail: 'the app started; nothing was written' };
+    if (!o.stopped()) return { status: 'failed', detail: `the app started; nothing was written (backup ${backupFile})` };
     const out = Buffer.from(serializeJson(rec, fmt), 'utf8');
-    overwriteInPlace(t.path, out);
+    try { overwriteInPlace(t.path, out); }
+    catch (e) {   // a write that threw may have left a partial record: put the backup bytes back
+      let restored = 'restored from the backup';
+      try { overwriteInPlace(t.path, raw); } catch (e2) { restored = `RESTORE FAILED (${e2.message}): copy ${backupFile} over ${t.path} by hand`; }
+      return { status: 'failed', detail: `the write failed (${e?.message ?? e}); ${restored}` };
+    }
     const problems = [];
     const after = statKey(t.path);
     if (!after || !before || after.key !== before.key) problems.push('inode changed');
@@ -285,7 +299,7 @@ export function spawnFixCore(ctx, o = {}) {
       Object.assign(res, { status: a.status, fixed: a.fixed, failed: a.failed, pending: a.pending, backupDir: a.backupDir });
       if (a.fixed.length) recordFixed(ctx, a.fixed, o.now ?? ctx.now());
     }
-    if (o.log && (res.found || res.skipped.length)) o.log(spawnLine(res));
+    if (o.log && (res.found || res.failed.length)) o.log(spawnLine(res));   // not for skipped alone: an undated session never resolves, so it would log at every pass
   } catch (e) { res.status = 'failed'; o.log?.(`rc-spawn: failed ${e?.message ?? e}`); }
   return res;
 }
