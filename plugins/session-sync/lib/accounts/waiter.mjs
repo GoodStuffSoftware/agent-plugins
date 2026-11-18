@@ -104,7 +104,7 @@ const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuf
  *     asked nothing is touched (`unverified`);
  *   - not mid-pass: accounts.lock is not held by it (checked again right before the kill). A waiter that waits holds no lock.
  * The new waiter is started by the caller (armWaiter), or by the next session start for an owed pass.
- * deps: { kill(pid), alive(pid), sleep(ms), verify(pid, want) } (tests).
+ * deps: { kill(pid), alive(pid), sleep(ms), verify(pid, want), version, hash } (tests; version and hash stand for this copy's own).
  * @returns {{replaced:boolean, reason?:string, stale?:boolean, pid?:number, version?:string|null, reasons?:string[]}}
  */
 export function replaceOldWaiter(ctx, deps = {}) {

@@ -35,7 +35,7 @@ export function compareVersions(a, b) {
   return 0;
 }
 
-const LIB_DIR =fileURLToPath(new URL('../', import.meta.url));
+const LIB_DIR = fileURLToPath(new URL('../', import.meta.url));
 
 function* sourceFiles(dir) {
   let ents;
