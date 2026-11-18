@@ -781,9 +781,12 @@ async function accountsCommand(sub, args) {
   if (sub === 'rc-restore') {
     const what = args.find((a) => !a.startsWith('--'));
     if (what === 'install-logon-task' || what === 'uninstall-logon-task') {
-      const r = what === 'install-logon-task' ? installLogonTask() : uninstallLogonTask();
+      const install = what === 'install-logon-task';
+      // an explicit install or removal is the user's choice: it is kept in rcRestore.logonTask, or the next session start would undo a removal
+      try { saveConfig({ rcRestore: { logonTask: install } }); } catch { /* the task itself matters more */ }
+      const r = install ? installLogonTask() : uninstallLogonTask();
       log(`rc-restore: ${what}: ${r.action}${r.ok ? '' : ` FAILED ${r.error}`}`);
-      emit({ command: 'rc-restore', ...r }, [r.ok ? (r.action === 'skipped' ? 'Nothing to do: the logon task is Windows only.' : `Logon task "session-sync RC restore": ${r.action}.`) : `Logon task failed: ${r.error}`]);
+      emit({ command: 'rc-restore', ...r }, [r.ok ? (r.action === 'skipped' ? 'Nothing to do: the logon task is Windows only.' : `Logon task "session-sync RC restore": ${r.action}${install ? '' : ' (rcRestore.logonTask is now false, so a session start does not put it back)'}.`) : `Logon task failed: ${r.error}`]);
       return r.ok ? 0 : 1;
     }
     if (what || !has('--if-app-stopped')) {
@@ -791,7 +794,7 @@ async function accountsCommand(sub, args) {
       return 2;
     }
     const r = await rcLogonStep(ctx, { settings: rcRestoreNow(), platform: platform(), log });
-    if (r.ran) emit({ ok: true, command: 'rc-restore', ran: true, relinked: r.res.relinked, status: r.res.status }, [`Remote Control relink: ${r.res.relinked} cleared (${r.res.status}).`]);
+    if (r.ran) emit({ ok: true, command: 'rc-restore', ran: true, relinked: r.res.relinked, status: r.res.status }, [`Remote Control relink: ${r.res.relinked} relinked (${r.res.status}).`]);
     return 0;   // nothing owed, the app running, or an unknown state all end quietly: the task retries at the next logon
   }
 
@@ -889,7 +892,7 @@ if (cmd === 'config') {
     const facts = { ok: true, [key]: on, configFile: CONFIG_FILE };
     if (sub !== 'wake') {   // the logon task follows rcRestore.enabled and rcRestore.logonTask at once (Windows only; a no-op elsewhere)
       try {
-        const t = ensureLogonTask({ settings: rcRestoreNow() });
+        const t = ensureLogonTask({ settings: rcRestoreNow(), force: true });
         if (t.action !== 'skipped' && t.action !== 'none') { facts.logonTask = t.ok ? t.action : `failed: ${t.error}`; log(`config: logon task ${facts.logonTask}`); }
       } catch (e) { facts.logonTask = `failed: ${e?.message ?? e}`; }
     }

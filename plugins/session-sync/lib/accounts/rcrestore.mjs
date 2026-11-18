@@ -328,6 +328,10 @@ export async function rcLogonStep(ctx, o = {}) {
   if ((o.platform ?? ctx.platform ?? process.platform) !== 'win32') return { ran: false, reason: 'platform' };
   if (o.settings && !o.settings.enabled) return { ran: false, reason: 'disabled' };
   if (!ctx.store || !ctx.userData) return { ran: false, reason: 'no-store' };
+  const po = { ...o, days: o.days ?? o.settings?.days };   // rcRestore.days is the window, as for the waiter's quit step
+  const plan = rcPlan(ctx, po);   // read only, and before the process probe: with nothing owed (the usual logon) no PowerShell is started
+  if (!plan.acct) return { ran: false, reason: 'no-account' };
+  if (!plan.relink.length) { clearRelinkOwed(ctx); return { ran: false, reason: 'nothing-owed', plan }; }
   const readApp = o.readApp ?? (() => appState({ ctx, probeProcesses: true, now: ctx.now() }));
   const tries = Math.max(1, o.tries ?? 3);
   const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -342,11 +346,8 @@ export async function rcLogonStep(ctx, o = {}) {
     log(`rc-restore: logon relink skipped, ${app.running ? 'the app is running' : 'the app state is unknown'}`);
     return { ran: false, reason };
   }
-  const plan = rcPlan(ctx, o);
-  if (!plan.acct) return { ran: false, reason: 'no-account' };
-  if (!plan.relink.length) { clearRelinkOwed(ctx); return { ran: false, reason: 'nothing-owed', plan }; }
   const detail = [];   // the per-session lines of the quit step: one summary line is logged, the details only when the step did not finish
-  const r = await rcQuitStep(ctx, { ...o, log: (l) => detail.push(l) });   // re-plans under accounts.lock and checks the lock marker before every write
+  const r = await rcQuitStep(ctx, { ...po, log: (l) => detail.push(l) });   // re-plans under accounts.lock and checks the lock marker before every write
   if (!r.ran) {
     if (r.reason === 'locked') log('rc-restore: logon relink skipped, another pass holds the accounts lock');
     return { ran: false, reason: r.reason ?? 'nothing-owed' };

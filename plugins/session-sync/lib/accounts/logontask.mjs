@@ -93,7 +93,7 @@ export function taskXml({ user, shimPath, wscript }) {
     <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
-    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>PT20M</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
   <Actions Context="Author">
@@ -123,7 +123,7 @@ export function fakeScheduler(file) {
 function schedulerOf(o) {
   if (o.run) return o.run;
   if (process.env.SESSION_SYNC_TEST_SCHTASKS) return fakeScheduler(process.env.SESSION_SYNC_TEST_SCHTASKS);
-  if (process.env.NODE_TEST_CONTEXT) return () => ({ status: 1, stdout: '', stderr: 'a test never registers a real scheduled task' });
+  if (process.env.NODE_TEST_CONTEXT || process.env.SESSION_SYNC_TEST_APP_STATE) return () => ({ status: 1, stdout: '', stderr: 'a test never registers a real scheduled task' });
   return (exe, args) => spawnSync(exe, args, { windowsHide: true, encoding: 'utf8', timeout: 20000 });
 }
 
@@ -173,7 +173,7 @@ export function installLogonTask(o = {}) {
     writeIfChanged(p.launcherPath, p.launcher);
     writeIfChanged(p.shimPath, p.shim);
   } catch (e) { return { ok: false, action: 'skipped', error: `could not write the launcher: ${String(e?.message ?? e).slice(0, 200)}` }; }
-  const xmlFile = join(p.dir, `${STAMP_NAME}.task.xml`);
+  const xmlFile = join(p.dir, `${STAMP_NAME}.${process.pid}.task.xml`);
   try {
     writeFileSync(xmlFile, p.xml);
     const r = run(schtasksExe(o.env), ['/Create', '/TN', TASK_NAME, '/XML', xmlFile, '/F'], { windowsHide: true, encoding: 'utf8', timeout: 20000 });
@@ -208,7 +208,7 @@ export function uninstallLogonTask(o = {}) {
  * The automatic setup (the SessionStart hook step, and `config rcRestore.logonTask`): install when rcRestore is enabled and rcRestore.logonTask
  * is on, remove it when either is off. Cheap on the usual run: a stamp holds the hash of what is installed, and the scheduler is asked again
  * only when that changed or a day has passed.
- * o: { settings (rcSettings of the config), + the options of installLogonTask }
+ * o: { settings (rcSettings of the config), force (ignore the stamp: the user asked now), + the options of installLogonTask }
  * @returns {{ok:boolean, action:'none'|'unchanged'|'installed'|'removed'|'not-installed'|'skipped', ...}}
  */
 export function ensureLogonTask(o = {}) {
@@ -219,11 +219,13 @@ export function ensureLogonTask(o = {}) {
   const now = (o.now ?? Date.now)();
   let p;
   try { p = plan(o); } catch (e) { return { ok: false, action: 'skipped', error: String(e?.message ?? e).slice(0, 200) }; }
-  if (stamp?.hash === p.hash && now - (Number(stamp.checkedAt) || 0) < VERIFY_EVERY_MS) return { ok: true, action: 'unchanged' };
-  if (stamp?.hash === p.hash) {   // a day on: is it still registered?
+  const same = !o.force && stamp?.hash === p.hash;
+  if (same && stamp.failedAt && now - (Number(stamp.checkedAt) || 0) < VERIFY_EVERY_MS) return { ok: true, action: 'skipped', reason: 'failed-recently' };   // the last install failed: asked again after a day
+  if (same && now - (Number(stamp.checkedAt) || 0) < VERIFY_EVERY_MS) return { ok: true, action: 'unchanged' };
+  if (same) {   // a day on: is it still registered?
     const run = schedulerOf(o);
     let there = false; try { there = exists(run, o); } catch { /* treat as missing */ }
-    if (there) { try { writeFileSync(stampFile(o), JSON.stringify({ ...stamp, checkedAt: now })); } catch { /* ignore */ } return { ok: true, action: 'unchanged' }; }
+    if (there) { try { writeFileSync(stampFile(o), JSON.stringify({ v: 1, hash: stamp.hash, task: TASK_NAME, installedAt: stamp.installedAt, checkedAt: now })); } catch { /* ignore */ } return { ok: true, action: 'unchanged' }; }
   }
   const r = installLogonTask(o);
   if (!r.ok) { try { writeFileSync(stampFile(o), JSON.stringify({ v: 1, hash: p.hash, failedAt: now, checkedAt: now })); } catch { /* ignore */ } }   // a failing scheduler is asked again after a day, not at every session start

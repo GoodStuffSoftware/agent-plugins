@@ -5,12 +5,13 @@
  */
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, symlinkSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { makeRoot, addFolder, putRecord, uuid } from './fixtures/store.mjs';
+import { cworld, cleanupWorlds, A } from './fixtures/cliworld.mjs';
 import { rcLogonStep, relinkOwedFile, RC_DEFAULTS } from '../lib/accounts/rcrestore.mjs';
 import { rcSettings } from '../lib/config.mjs';
 import { resolveCli, parseVersion, compareVersions, NEEDS, main as launcherMain } from '../lib/accounts/rc-logon-launcher.mjs';
@@ -21,7 +22,7 @@ import { writeJsonAtomic } from '../lib/accounts/state.mjs';
 
 const temps = [];
 const tmp = (label) => { const d = mkdtempSync(join(tmpdir(), `ss-${label}-`)); temps.push(d); return d; };
-after(() => { for (const d of temps) { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ } } });
+after(() => { cleanupWorlds(); for (const d of temps) { try { rmSync(d, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); } catch { /* best effort */ } } });
 
 /* ------------------------------------------------------------------ the command */
 
@@ -391,4 +392,95 @@ test('L19 CLI: config rcRestore.logonTask false removes the task, true puts it b
   const on = c.run(['config', 'rcRestore.logonTask', 'true']);
   assert.equal(JSON.parse(on.stdout).logonTask, 'installed');
   assert.ok(existsSync(join(c.dir, SHIM_NAME)));
+});
+
+/* ------------------------------------------------------------------ review round: the window setting, the junction, the hook, the failure stamp */
+
+test('L20 rcRestore.days is the window of the logon relink, as for the quit step', async () => {
+  const w = world();
+  w.ctx.setNow(NOW + 4 * 24 * 3600_000);   // the one session was last active 4 days + 1 hour ago
+  const before = readFileSync(w.tp, 'utf8');
+  const narrow = await rcLogonStep(w.ctx, { projects: w.projects, settings: { ...RC_DEFAULTS, days: 3 }, readApp: () => STOPPED, log: () => {} });
+  assert.deepEqual({ ran: narrow.ran, reason: narrow.reason }, { ran: false, reason: 'nothing-owed' }, '3 days: out of the window');
+  assert.equal(readFileSync(w.tp, 'utf8'), before);
+  const wide = await rcLogonStep(w.ctx, { projects: w.projects, settings: { ...RC_DEFAULTS, days: 7 }, readApp: () => STOPPED, log: () => {} });
+  assert.equal(wide.ran, true, '7 days: inside');
+  assert.equal(wide.res.relinked, 1);
+});
+
+test('L21 launcher: started through a junction it still runs (the entry check compares real paths)', { skip: process.platform !== 'win32' }, () => {
+  const home = tmp('rcjunc');
+  mkdirSync(join(home, '.claude', 'session-sync'), { recursive: true });
+  const real = join(home, '.claude', 'session-sync');
+  const link = join(home, 'linked');
+  symlinkSync(real, link, 'junction');
+  copyFileSync(fileURLToPath(new URL('../lib/accounts/rc-logon-launcher.mjs', import.meta.url)), join(real, LAUNCHER_NAME));
+  const r = spawnSync(process.execPath, [join(link, LAUNCHER_NAME)], { env: { ...process.env, USERPROFILE: home, HOME: home }, encoding: 'utf8', timeout: 30000, windowsHide: true });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(readFileSync(join(real, 'sync.log'), 'utf8'), /no installed session-sync copy/, 'main ran: it found no copy in the empty home and said so');
+});
+
+test('L22 a failed install is not reported as unchanged: skipped for a day, retried when forced or a day on', () => {
+  const dir = tmp('rctask');
+  let fail = true;
+  const calls = [];
+  const run = (exe, args) => { calls.push(args[0]); return args[0] === '/Create' ? { status: fail ? 5 : 0, stderr: 'ERROR: Access is denied.' } : { status: 1 }; };
+  let t = 5_000_000;
+  const o = opts(dir, { run }, { now: () => t, settings: rcSettings({}) });
+  const first = ensureLogonTask(o);
+  assert.equal(first.ok, false);
+  const n = calls.length;
+  const again = ensureLogonTask(o);
+  assert.deepEqual([again.action, again.reason, calls.length], ['skipped', 'failed-recently', n], 'not asked again within a day, and not "unchanged"');
+  fail = false;
+  assert.equal(ensureLogonTask({ ...o, force: true }).action, 'installed', 'config rcRestore.logonTask true forces a retry');
+  rmSync(dir, { recursive: true, force: true });
+  fail = true;
+  assert.equal(ensureLogonTask(o).ok, false);
+  t += VERIFY_EVERY_MS + 1;
+  fail = false;
+  assert.equal(ensureLogonTask(o).action, 'installed', 'a day on it tries again');
+});
+
+test('L23 CLI: the session-start hook installs the task once, costs no scheduler call after that, and removes it on opt-out', { skip: process.platform !== 'win32' }, () => {
+  const c = cliHome();
+  writeFileSync(join(c.dir, 'config.json'), JSON.stringify({ notifications: false, enabled: false }));   // enabled false: the hook step runs, then nothing syncs
+  mkdirSync(join(c.home, 'AppData', 'Roaming', 'Claude', 'claude-code-sessions'), { recursive: true });
+  const hook = () => c.run(['auto-pull', '--from-hook']);
+  assert.equal(hook().status, 0);
+  assert.deepEqual(c.ops().filter((o) => o !== 'query'), ['create'], 'first session start registers the task');
+  const n = c.ops().length;
+  hook();
+  assert.equal(c.ops().length, n, 'second session start: stamp hit, no scheduler call');
+  assert.match(readFileSync(join(c.dir, 'sync.log'), 'utf8'), /logon task installed/);
+  writeFileSync(join(c.dir, 'config.json'), JSON.stringify({ notifications: false, enabled: false, rcRestore: { logonTask: false } }));
+  hook();
+  assert.ok(c.ops().includes('delete'), 'opted out: removed at the next session start');
+  assert.equal(existsSync(join(c.dir, SHIM_NAME)), false);
+  const m = c.ops().length;
+  hook();
+  assert.equal(c.ops().length, m, 'and nothing more afterwards');
+});
+
+test('L24 CLI end to end: an owed relink is cleared with the app stopped and left alone with the app running', { skip: process.platform !== 'win32' }, () => {
+  const w = cworld({ accounts: 1, records: 1 });
+  writeFileSync(join(w.userData, 'config.json'), JSON.stringify({ lastKnownAccountUuid: A }));
+  putRecord(w.fA.path, 7, { lastActivityAt: iso(Date.now() - 3600_000), remoteControlUserEnabled: true, bridgeSessionIds: ['session_7'] });
+  const tp = join(w.home, '.claude', 'projects', 'C--synthetic-project-7', `${uuid('d', 7)}.jsonl`);
+  mkdirSync(join(w.home, '.claude', 'projects', 'C--synthetic-project-7'), { recursive: true });
+  writeFileSync(tp, `${JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 7), lastSequenceNum: 2, bridgeSessionId: 'cse_stale', noHistoryBackfill: true, ownerAccountUuid: A })}\n`);
+  const before = readFileSync(tp, 'utf8');
+  w.setApp({ running: true });
+  const running = w.run(['accounts', 'rc-restore', '--if-app-stopped']);
+  assert.deepEqual([running.status, running.stdout], [0, '']);
+  assert.equal(readFileSync(tp, 'utf8'), before, 'the app is running: untouched');
+  assert.match(readFileSync(join(w.stateDir, 'sync.log'), 'utf8'), /logon relink skipped, the app is running/);
+  w.setApp({ running: false });
+  const stopped = w.run(['accounts', 'rc-restore', '--if-app-stopped']);
+  assert.equal(stopped.status, 0, stopped.stderr);
+  assert.match(stopped.stdout, /1 relinked/);
+  assert.equal(JSON.parse(readFileSync(tp, 'utf8').trim().split('\n').pop()).bridgeSessionId, '', 'the CLI clearing line was appended');
+  assert.match(readFileSync(join(w.stateDir, 'sync.log'), 'utf8'), /logon relink: 1 relinked/);
+  const again = w.run(['accounts', 'rc-restore', '--if-app-stopped']);
+  assert.deepEqual([again.status, again.stdout], [0, ''], 'idempotent: nothing is owed now');
 });

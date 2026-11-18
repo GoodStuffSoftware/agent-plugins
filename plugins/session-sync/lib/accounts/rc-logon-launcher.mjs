@@ -10,11 +10,11 @@
  * update replaces the folders it looks in.
  */
 
-import { readdirSync, existsSync, appendFileSync } from 'node:fs';
+import { readdirSync, existsSync, appendFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 export const CLI_ARGS = Object.freeze(['accounts', 'rc-restore', '--if-app-stopped']);
 /** A copy older than the logon command has no such file: it is skipped (an older copy would answer "unknown command"). */
@@ -63,4 +63,9 @@ export function main({ home = homedir(), run = spawnSync, resolve = resolveCli }
   return r.status ?? 0;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) process.exit(main());
+/** Is this file the one node was started on? Compared by real path: node resolves import.meta.url, but argv[1] keeps a junction or symlink as given. */
+function isEntry() {
+  try { return !!process.argv[1] && realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]); } catch { return false; }
+}
+
+if (isEntry()) process.exit(main());
