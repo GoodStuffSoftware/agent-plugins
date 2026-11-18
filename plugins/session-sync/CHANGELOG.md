@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** the Remote Control relink now also runs when you shut Windows down or restart it instead of quitting Claude from the tray. On a Windows power-off the app dies with the session and the waiter cannot start a process, so the relink stayed owed. A hidden per-user "At log on" task, "session-sync RC restore", now runs the new `accounts rc-restore --if-app-stopped` before Claude starts (it starts about 85 s after logon). If the app is stopped and a relink is owed it runs the same relink as the quit step (after a backup, each write checked against the app's lock marker); if the app is running, or starts mid-way, it writes nothing more and the relink stays owed; with nothing owed it exits quietly. It logs one line to `sync.log`.
+* **session-sync:** `accounts rc-restore install-logon-task` and `uninstall-logon-task` (both idempotent; Windows only, a no-op elsewhere) and a setting `rcRestore.logonTask` (default true; false opts out and removes the task). The task is installed automatically at a session start while `rcRestore.enabled` is on. It runs `wscript.exe //B` on a small shim in `~/.claude/session-sync/` that starts node with window style 0 (no console flash); a launcher next to it resolves the newest installed session-sync copy (the plugin cache, then the marketplace clone), so the task survives plugin updates.
+
 ## 0.5.5 (2026-11-17)
 
 ### Added

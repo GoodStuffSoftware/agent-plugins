@@ -27,7 +27,7 @@ import { join, basename } from 'node:path';
 import { RC_DEFAULTS, rcSettings } from '../config.mjs';
 import { accPath, readJson, writeJsonAtomic, detectFormat, serializeJson, withAccountsLock } from './state.mjs';
 import { listFolders, RECORD } from './folders.mjs';
-import { lockfilePresent, lockStartedAtMs, readSignedIn } from './appstate.mjs';
+import { lockfilePresent, lockStartedAtMs, readSignedIn, appState } from './appstate.mjs';
 
 export const DAY_MS = 24 * 3600 * 1000;
 /** The app's launch pass accepts a marker younger than this (qz = 36e5 in the app bundle). */
@@ -309,6 +309,52 @@ export async function rcQuitStep(ctx, o = {}) {
   });
   if (!lock.ok) return { ran: false, reason: 'locked' };
   return lock.value;
+}
+
+/* ------------------------------------------------------------------ the logon-time relink (the app quit with Windows) */
+
+/**
+ * `accounts rc-restore --if-app-stopped`, run by the "At log on" task (logontask.mjs) before Claude starts. When the app is stopped and a
+ * relink is owed per rcPlan, it runs the same quit step the waiter runs (rcQuitStep: relink, then free restore, each write checked against
+ * the app's lock marker and made after a backup). When the app is running, or starts mid-way, nothing is written past that point and the
+ * relink stays owed. Nothing owed: returns quietly, no log line.
+ * o: { settings (rcSettings), platform, readApp(): the appState object (tests), tries/retryMs (an unknown process probe is retried), sleep,
+ *      log(line), + the options of rcPlan / rcQuitStep: acct, now, days, projects, stopped }
+ * @returns {Promise<{ran:boolean, reason?:string, res?, plan?}>}
+ *   reason: platform | disabled | no-account | app-running | app-unknown | nothing-owed | locked
+ */
+export async function rcLogonStep(ctx, o = {}) {
+  const log = o.log ?? (() => {});
+  if ((o.platform ?? ctx.platform ?? process.platform) !== 'win32') return { ran: false, reason: 'platform' };
+  if (o.settings && !o.settings.enabled) return { ran: false, reason: 'disabled' };
+  if (!ctx.store || !ctx.userData) return { ran: false, reason: 'no-store' };
+  const readApp = o.readApp ?? (() => appState({ ctx, probeProcesses: true, now: ctx.now() }));
+  const tries = Math.max(1, o.tries ?? 3);
+  const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  let app = null;
+  for (let i = 0; i < tries; i++) {   // the process probe can fail while the machine is still busy logging on: unknown is retried, running is not
+    app = readApp();
+    if (app.fullAllowed || app.running) break;
+    if (i + 1 < tries) await sleep(o.retryMs ?? 5000);
+  }
+  if (!app.fullAllowed) {
+    const reason = app.running ? 'app-running' : 'app-unknown';
+    log(`rc-restore: logon relink skipped, ${app.running ? 'the app is running' : 'the app state is unknown'}`);
+    return { ran: false, reason };
+  }
+  const plan = rcPlan(ctx, o);
+  if (!plan.acct) return { ran: false, reason: 'no-account' };
+  if (!plan.relink.length) { clearRelinkOwed(ctx); return { ran: false, reason: 'nothing-owed', plan }; }
+  const detail = [];   // the per-session lines of the quit step: one summary line is logged, the details only when the step did not finish
+  const r = await rcQuitStep(ctx, { ...o, log: (l) => detail.push(l) });   // re-plans under accounts.lock and checks the lock marker before every write
+  if (!r.ran) {
+    if (r.reason === 'locked') log('rc-restore: logon relink skipped, another pass holds the accounts lock');
+    return { ran: false, reason: r.reason ?? 'nothing-owed' };
+  }
+  const x = r.res;
+  log(`rc-restore: logon relink: ${x.relinked} relinked, ${x.marked} marked, ${x.refreshed} refreshed, status ${x.status}${x.status === 'refused_app_running' ? ' (the app started)' : ''}`);
+  if (x.status !== 'ok') for (const l of detail) log(l);
+  return r;
 }
 
 /* ------------------------------------------------------------------ a relink that stayed owed (the app quit with Windows) */

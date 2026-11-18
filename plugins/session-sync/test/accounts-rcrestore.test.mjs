@@ -336,15 +336,15 @@ test('L1 readLaunchOutcome: the pass summary and verdict lines after the start, 
 /* ------------------------------------------------------------------ settings */
 
 test('S1 rcSettings: defaults on, 3 days, wake on; partial blocks keep the other defaults; bad values fall back', () => {
-  assert.deepEqual(rcSettings({}), { enabled: true, days: 3, wake: true, wakeMax: 4 });
-  assert.deepEqual(RC_DEFAULTS, { enabled: true, days: 3, wake: true, wakeMax: 4 });
-  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4 });
-  assert.deepEqual(rcSettings({ rcRestore: { enabled: false, days: 7 } }), { enabled: false, days: 7, wake: true, wakeMax: 4 });
+  assert.deepEqual(rcSettings({}), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
+  assert.deepEqual(RC_DEFAULTS, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
+  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4, logonTask: true });
+  assert.deepEqual(rcSettings({ rcRestore: { enabled: false, days: 7 } }), { enabled: false, days: 7, wake: true, wakeMax: 4, logonTask: true });
   assert.equal(rcSettings({ rcRestore: { days: 0 } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 'many' } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 400 } }).days, 3);
-  assert.deepEqual(rcSettings({ rcRestore: 'yes' }), { enabled: true, days: 3, wake: true, wakeMax: 4 });
-  assert.deepEqual(rcSettings(undefined), { enabled: true, days: 3, wake: true, wakeMax: 4 });
+  assert.deepEqual(rcSettings({ rcRestore: 'yes' }), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
+  assert.deepEqual(rcSettings(undefined), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
 });
 
 test('E12 a linked account: one conversation per org folder counts once; 4 distinct sessions get the marker, once each, hard links kept', () => {
