@@ -1,12 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.5.6 (2026-11-17)
 
 ### Added
 
 * **session-sync:** the Remote Control relink now also runs when you shut Windows down or restart it instead of quitting Claude from the tray. On a Windows power-off the app dies with the session and the waiter cannot start a process, so the relink stayed owed. A hidden per-user "At log on" task, "session-sync RC restore", now runs the new `accounts rc-restore --if-app-stopped` before Claude starts (it starts about 85 s after logon). If the app is stopped and a relink is owed it runs the same relink as the quit step (after a backup, each write checked against the app's lock marker); if the app is running, or starts mid-way, it writes nothing more and the relink stays owed; with nothing owed it exits quietly. It logs one line to `sync.log`.
 * **session-sync:** `accounts rc-restore install-logon-task` and `uninstall-logon-task` (both idempotent; Windows only, a no-op elsewhere) and a setting `rcRestore.logonTask` (default true; false opts out and removes the task; the two commands save it too, so a removal is not undone at the next session start). The task is installed automatically at a session start while `rcRestore.enabled` is on. It runs `wscript.exe //B` on a small shim in `~/.claude/session-sync/` that starts node with window style 0 (no console flash); a launcher next to it resolves the newest installed session-sync copy (the plugin cache, then the marketplace clone), so the task survives plugin updates.
 * **session-sync:** artifact sharing works both ways with Claude in Chrome as a second agent-driven browser. Register it once (`artifacts pane <email> --browser chrome --account <id>`; a separate Chrome profile signed in as the other account, the Claude extension connected to it, Chrome left running). An overflow-account session then sends its own artifacts from Chrome and the other account's from the pane, and the subagent clicks Accept in the receiver's browser, so no link needs tapping when both browsers are reachable. Chrome is reachable only from sessions of the account its extension is connected to and is never launched by an agent: when it is not connected the work waits. New `artifacts chrome-unavailable` and `pending --with-invited`, an `accepted` status, and `reachable` in `artifacts pending`.
+
+### Fixed
+
+* **session-sync:** an older plugin copy no longer replaces a newer running waiter (versions are compared as semver; the same version is replaced only when the code hash differs), so a lagging app copy cannot kill the waiter that runs the quit step.
+* **session-sync:** after a Windows restart that left the Remote Control relink owed, the first prompt of the next app run records `accounts/rc-relink-owed.json` and tells you once to quit Claude from the tray and reopen it.
 
 ### Changed
 
