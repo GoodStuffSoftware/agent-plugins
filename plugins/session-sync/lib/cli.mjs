@@ -966,7 +966,7 @@ if (cmd === 'rc-wake') {
     if (settings.enabled && settings.wake && input.session_id && prompt && !prompt.startsWith('/')) {
       const d = decideWake(makeCtx(), { settings, sessionId: String(input.session_id) });
       if (d.act) {
-        log(`rc-wake: instruction given to session ${String(input.session_id).slice(0, 8)}`);
+        log(`rc-wake: instruction given to session ${String(input.session_id).slice(0, 8)}${d.relinkOwed ? `; relink owed for ${d.relinkOwed} session(s), the user is asked to quit Claude once from the tray icon` : ''}`);
         writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`);
       }
     }

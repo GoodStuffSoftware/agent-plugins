@@ -5,13 +5,14 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, readdirSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, readdirSync, existsSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { makeRoot, addFolder, putRecord, uuid } from './fixtures/store.mjs';
 import {
   decideWake, wakeInstruction, WAKE_MESSAGE, interactiveSession, recordForCliSession, wakeClaimFile, WAKE_BASELINE_MS, RC_DEFAULTS,
+  RELINK_OWED_TEXT, relinkOwedFile, restorePassRanBefore, checkRelinkOwed, rcQuitStep,
 } from '../lib/accounts/rcrestore.mjs';
 import { lockStartedAtMs } from '../lib/accounts/appstate.mjs';
 
@@ -28,7 +29,15 @@ function world({ lock = true } = {}) {
 }
 const sid = (n) => uuid('d', n);
 const put = (w, n, over = {}) => putRecord(w.folder.path, n, { lastActivityAt: new Date(w.now - 60_000).toISOString(), ...over });
-const decide = (w, n, extra = {}) => decideWake(w.ctx, { settings: RC_DEFAULTS, sessionId: sid(n), now: w.now, ...extra });
+const decide = (w, n, extra = {}) => decideWake(w.ctx, { settings: RC_DEFAULTS, sessionId: sid(n), now: w.now, projects: join(w.root, 'projects'), ...extra });
+/** A transcript for session n whose last bridge-session entry is `bridge` (noHistoryBackfill:true is a link that needs a relink). */
+function transcript(w, n, bridge = { noHistoryBackfill: true }) {
+  const dir = join(w.root, 'projects', 'proj');
+  mkdirSync(dir, { recursive: true });
+  const f = join(dir, `${sid(n)}.jsonl`);
+  writeFileSync(f, `${JSON.stringify({ type: 'user', text: 'hi' })}\n${JSON.stringify({ type: 'bridge-session', sessionId: sid(n), bridgeSessionId: 'cse_old', lastSequenceNum: 3, ...bridge })}\n`);
+  return f;
+}
 
 test('K1 the first qualifying prompt after a restart gets the instruction; every later one, in any session, does not (exactly one)', () => {
   const w = world();
@@ -121,6 +130,131 @@ test('K9 old claim markers are pruned, the last few kept', () => {
   assert.equal(decide(w, 1).act, true);
   assert.ok(readdirSync(w.acc).filter((x) => /^rc-wake-\d+$/.test(x)).length <= 5);
   assert.equal(existsSync(wakeClaimFile(w.ctx, lockStartedAtMs(w.ctx))), true, 'the claim just taken is kept');
+});
+
+/* ------------------------------------------------------------------ a relink left owed by a quit with Windows */
+
+const noDashes = (t) => !new RegExp(`${String.fromCharCode(0x2014)}|${String.fromCharCode(0x2013)}`).test(t);
+
+test('R1 a session that still needs a relink and no restore pass ran for the last stop: the claiming prompt is told, once, and the owed state is recorded', () => {
+  const w = world();
+  put(w, 1, {}); put(w, 2, {});
+  transcript(w, 1);                                   // random-name link: rcPlan would relink it
+  transcript(w, 2, { bridgeSessionId: '' });          // already cleared: not counted
+  const first = decide(w, 1);
+  assert.equal(first.act, true);
+  assert.equal(first.relinkOwed, 1);
+  assert.ok(first.text.includes(RELINK_OWED_TEXT), 'the instruction carries the sentence');
+  assert.match(first.text, /quit Claude once from the tray icon \(not a Windows restart\)/);
+  assert.ok(first.text.includes(WAKE_MESSAGE), 'the wake itself is unchanged');
+  assert.ok(noDashes(first.text));
+  const rec = JSON.parse(readFileSync(relinkOwedFile(w.ctx), 'utf8'));
+  assert.deepEqual([rec.count, rec.acct, rec.notified, rec.startedAt], [1, ME, true, lockStartedAtMs(w.ctx)]);
+  // every later prompt of this app run: nothing, and the check does not run again (the claim is the fast path)
+  for (const n of [1, 2]) assert.deepEqual([decide(w, n).act, decide(w, n).reason, decide(w, n).text], [false, 'claimed', undefined]);
+});
+
+test('R2 nothing owed (no relink needed): the instruction is the plain wake, no sentence, no record', () => {
+  const w = world();
+  put(w, 1, {});
+  transcript(w, 1, { noHistoryBackfill: false, ownerAccountUuid: ME });   // a titled link of this account
+  const d = decide(w, 1);
+  assert.equal(d.act, true);
+  assert.equal(d.relinkOwed, undefined);
+  assert.equal(d.text.includes(RELINK_OWED_TEXT), false);
+  assert.equal(d.text, wakeInstruction({ days: RC_DEFAULTS.days, max: RC_DEFAULTS.wakeMax }));
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), false);
+});
+
+test('R3 a restore pass ran for the last stop (rc-restore.json stamped just before the launch): not owed, even if a link is left', () => {
+  const w = world();
+  put(w, 1, {});
+  transcript(w, 1);
+  mkdirSync(w.acc, { recursive: true });
+  const run = lockStartedAtMs(w.ctx);
+  writeFileSync(join(w.acc, 'rc-restore.json'), JSON.stringify({ v: 1, at: new Date(run - 5 * 60_000).toISOString(), acct: ME, relinked: 1, status: 'partial' }));
+  assert.equal(restorePassRanBefore(w.ctx, run), true);
+  const d = decide(w, 1);
+  assert.equal(d.act, true);
+  assert.equal(d.text.includes(RELINK_OWED_TEXT), false);
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), false);
+  // a pass from an earlier stop (older than the life of a marker) does not count
+  assert.equal(restorePassRanBefore(w.ctx, run + 3 * 3600_000), false);
+  assert.equal(restorePassRanBefore(w.ctx, run + 30_000), true);
+  assert.equal(restorePassRanBefore(w.ctx, run - 3 * 3600_000), false, 'a stamp from after the launch of that run is not one for its stop');
+});
+
+test('R4 a stale pass stamp (an earlier stop) does not hide an owed relink', () => {
+  const w = world();
+  put(w, 1, {});
+  transcript(w, 1);
+  mkdirSync(w.acc, { recursive: true });
+  writeFileSync(join(w.acc, 'rc-restore.json'), JSON.stringify({ v: 1, at: new Date(lockStartedAtMs(w.ctx) - 2 * 86400_000).toISOString(), status: 'ok' }));
+  assert.equal(decide(w, 1).relinkOwed, 1);
+});
+
+test('R5 each app run is one owed state: a later restart with the relink still owed is told again; once settled the record is dropped', () => {
+  const w = world();
+  put(w, 1, {});
+  const tp = transcript(w, 1);
+  const run = lockStartedAtMs(w.ctx);
+  writeFileSync(wakeClaimFile(w.ctx, run - 60_000), '');   // an earlier run's claim: not a baseline
+  assert.equal(decide(w, 1).relinkOwed, 1);
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), true);
+  // the quit step settles it (the clearing line appended by rcrestore, as the real step does) -> the record goes with the next check
+  writeFileSync(tp, `${readFileSync(tp, 'utf8')}${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: '', lastSequenceNum: 0 })}\n`);
+  unlinkSync(wakeClaimFile(w.ctx, run));
+  const again = decide(w, 1);
+  assert.equal(again.act, true);
+  assert.equal(again.relinkOwed, undefined);
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), false, 'nothing owed any more: the record is dropped');
+});
+
+test('R6 rcQuitStep drops the record when it settles the relink (and when nothing is to relink)', async () => {
+  const w = world({ lock: false });
+  put(w, 1, {});
+  const tp = transcript(w, 1);
+  mkdirSync(w.acc, { recursive: true });
+  writeFileSync(relinkOwedFile(w.ctx), JSON.stringify({ v: 1, count: 1, notified: true }));
+  const r = await rcQuitStep(w.ctx, { acct: ME, now: w.now, projects: join(w.root, 'projects'), stopped: () => true });
+  assert.equal(r.ran, true);
+  assert.equal(r.res.relinked, 1);
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), false, 'relinked: the record is gone');
+  assert.match(readFileSync(tp, 'utf8'), /"bridgeSessionId":"","lastSequenceNum":0\}\n$/);
+  // a refused step (the app is running) keeps it
+  writeFileSync(tp, `${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_x', noHistoryBackfill: true })}\n`);
+  writeFileSync(relinkOwedFile(w.ctx), JSON.stringify({ v: 1, count: 1, notified: true }));
+  const r2 = await rcQuitStep(w.ctx, { acct: ME, now: w.now, projects: join(w.root, 'projects'), stopped: () => false });
+  assert.equal(r2.res.status, 'refused_app_running');
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), true, 'refused: still owed');
+});
+
+test('R7 the owed check never throws or fails the wake: an unreadable store and a missing transcripts folder give the plain wake', () => {
+  const w = world();
+  put(w, 1, {});
+  const d = decide(w, 1, { projects: join(w.root, 'no-such-folder') });
+  assert.equal(d.act, true);
+  assert.equal(d.relinkOwed, undefined);
+  assert.equal(checkRelinkOwed(w.ctx, { startedAt: undefined, acct: undefined }), null);
+  assert.equal(checkRelinkOwed({}, {}), null);
+});
+
+test('R8 the baseline (a plugin installed into a long-running app) is not an owed state: no sentence, no record', () => {
+  const w = world();
+  put(w, 1, {});
+  transcript(w, 1);
+  const d = decide(w, 1, { now: w.now + WAKE_BASELINE_MS + 60_000 });
+  assert.equal(d.reason, 'baseline');
+  assert.equal(existsSync(relinkOwedFile(w.ctx)), false);
+});
+
+test('R9 the sentence is one plain sentence naming the tray icon and not a Windows restart, with no em dash', () => {
+  assert.match(RELINK_OWED_TEXT, /tray icon/);
+  assert.match(RELINK_OWED_TEXT, /not a Windows restart/);
+  assert.equal(RELINK_OWED_TEXT.split(/[.!?]\s/).length, 1);
+  assert.ok(noDashes(RELINK_OWED_TEXT));
+  assert.match(wakeInstruction({ relinkOwed: true }), /beyond those three lines/);
+  assert.match(wakeInstruction({ relinkOwed: false }), /beyond those two lines/);
 });
 
 test('K10 interactiveSession and recordForCliSession', () => {
