@@ -53,7 +53,7 @@ Give the subagent the list (status, id, url, title, ownerEmail, receiverEmail, i
 node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts pane <email>
 ```
 
-**Chrome** (skip when `browsers` has no `chrome` entry and the pane covers the work; try it whenever there are entries only Chrome can handle, or invited entries to accept in it). Load the `mcp__claude-in-chrome__*` tools, call `list_connected_browsers`, then `select_browser` for the connected one.
+**Chrome** (only when `browsers` has a `chrome` entry **and `reachable.chrome` is true**: it is false for a session of the other account, which cannot see that Chrome at all, and during the 30-minute back-off; then skip Chrome and say so in the report. Try it when entries need it: only Chrome can send or accept them). Load the `mcp__claude-in-chrome__*` tools, call `list_connected_browsers`, then `select_browser` for the connected one.
 
 - Not connected (empty list, the tools missing, or the call errors): do **not** open or launch Chrome. Record it and carry on with the pane:
 
@@ -61,7 +61,7 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts pane <email>
   node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts chrome-unavailable
   ```
 
-  (A failure of this command because no `chrome` browser is registered is fine.) The wake then leaves Chrome work alone for 30 minutes.
+  (The command refuses from a session whose account cannot reach that Chrome, and fails when no `chrome` browser is registered; both are fine.) The wake then leaves Chrome work alone for 30 minutes.
 - Connected: open `https://claude.ai` in a tab of that browser (`tabs_context_mcp`, `tabs_create_mcp`, `navigate`; reuse one tab), read the email from the account menu, and record it. Add `--account <the account id this session runs as>` the first time (a connected Chrome seen from this session belongs to this session's account); later runs keep it:
 
   ```bash
@@ -76,7 +76,9 @@ For each entry, compare `ownerEmail` and `receiverEmail` with the emails of the 
 
 - `pending`, a reachable browser signed in as `ownerEmail`: send from it (steps 4 to 6). The receiver is `receiverEmail`; if null (the owner was unknown), the other configured email.
 - `pending`, no reachable browser holds `ownerEmail`: leave it pending and say so in the report ("no reachable browser is signed in as <ownerEmail>"). A later session or browser takes it; do not touch it.
-- `pending`, `ownerEmail` null: open it in a reachable browser. If the page offers **Share**, that browser's account owns it, so send to the other configured email; with no Share control, leave it pending.
+- `pending`, `ownerEmail` null: open it in a reachable browser. If the page offers **Share**, that browser's account owns it, so send to the other configured email; with no Share control, record `mark <id> skipped --reason "owner unknown, no Share control in a reachable browser"` (so it does not wake a session every 30 minutes; `mark <id> pending` revives it).
+
+Before you send an entry, re-read its status (`artifacts list --json`) and skip it if it is no longer `pending`: a session of the other account may have started a run on the same queue.
 - `invited`: accept it (step 7) when a reachable browser is signed in as `receiverEmail`; otherwise leave it for the links (step 8).
 
 ## 4. Open the artifact and check it is private (subagent)
@@ -118,7 +120,7 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts mark <id> invited --link <lin
 
 ## 7. Accept in the receiver's browser (subagent)
 
-For every `invited` entry (just sent, or from an earlier run) whose receiver's browser is reachable and signed in as `receiverEmail`: open its `inviteLink` in THAT browser (not the owner's), click **Accept**, and confirm the artifact page then loads for that account (the page opens, with edit access). Then:
+For every `invited` entry (just sent, or from an earlier run) whose receiver's browser is reachable and signed in as `receiverEmail`: open its `inviteLink` in THAT browser (not the owner's), click **Accept**, and confirm the artifact page then loads for that account (the page opens, with edit access). If there is no Accept button because the page already opens the artifact for that account (the user accepted the link earlier), that counts as accepted. Then:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts mark <id> accepted
@@ -138,7 +140,9 @@ node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" artifacts mark <id> done
 
 If it does not say writer, leave it `accepted` and say so. A session of the other account cannot read as the receiver: leave `accepted` entries as they are; the in-browser confirmation stands.
 
-Then report in one or two lines: what was shared and accepted. Only for entries still `invited` (the receiver's browser was not reachable) give the invitation link and ask the user to open it while signed in as the receiver and click **Accept**; do not open it yourself and do not open any browser window. List anything left pending or failed with its reason. Then carry on with what the user asked for.
+Then report in one or two lines: what was shared and accepted. Only for entries this run sent that are still `invited` (the receiver's browser was not reachable) give the invitation link and ask the user to open it while signed in as the receiver and click **Accept**; do not open it yourself and do not open any browser window, and do not repeat links the user already got earlier in this conversation. List anything left pending or failed with its reason. Then carry on with what the user asked for.
+
+When the user later says they accepted a link, and this session runs as the receiving account, verify with `Artifact` `read` as above and `mark <id> done`; if it does not say writer, leave it `invited` and say the invite is still not accepted (the link may have been opened in the wrong account). An `invited` entry whose receiver's browser is not reachable does not wake any session; it waits for the user's word or for that browser.
 
 ## 9. Housekeeping
 

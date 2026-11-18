@@ -954,6 +954,13 @@ if (cmd === 'artifacts') {
     }
     if (sub === 'chrome-unavailable') {   // a run found Chrome not connected: the wake leaves its work alone for 30 minutes (--browser <name> for another browser)
       const name = flag('browser') ?? 'chrome';
+      // A session of the other account cannot see that Chrome at all, so an empty list there says nothing: refuse to record it.
+      const reg = A.readShareState(A.QUEUE_DIR).browsers[name];
+      const active = reg?.account ? await A.activeAccount() : null;
+      if (reg?.account && active && !A.browserReachableFrom(reg, active)) {
+        console.error(`not recorded: ${name} is reachable only from sessions of account ${reg.account.slice(0, 8)}, this session runs as ${active.slice(0, 8)}`);
+        process.exit(1);
+      }
       const r = A.markBrowserUnavailable(A.QUEUE_DIR, name);
       if (!r.ok) { console.error(r.reason); process.exit(1); }
       out({ ok: true, browsers: r.browsers }, `recorded: ${name} unavailable, no new trigger for its work for 30 minutes`);

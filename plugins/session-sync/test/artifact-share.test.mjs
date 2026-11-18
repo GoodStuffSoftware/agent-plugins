@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   isNewArtifact, isRepublishResponse, extractArtifact, entryFromHook, enqueue, readEntries, pendingOf, markEntry, forgetEntry, wake,
   recordBrowser, readShareState, emailOf, receiverEmail, driveableOwner, featureOn, markBrowserUnavailable, accountOfEmail, browserUsable,
@@ -534,15 +535,15 @@ test('N30 once per 30 minutes per account: inside the window nothing, after it t
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 29 * MIN }) })).reason, 'claimed');
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 31 * MIN }) })).act, true, 'the window is over');
   assert.equal((await wake({ dir, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 32 * MIN }) })).reason, 'claimed', 'and a new one started');
-  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.old-')), [], 'no leftover from the takeover');
-  // eight at once over a claim that expired
+  assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.take')), [], 'no guard file left behind');
+  // eight calls over a claim that expired (in-process they run one after the other; the real race is N34)
   const claim = join(dir, readdirSync(dir).find((n) => /^claim-[0-9a-f]{16}$/.test(n)));
   const old = new Date(Date.now() - 40 * MIN);
   utimesSync(claim, old, old);
   const rs = await Promise.all(Array.from({ length: 8 }, () => wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) })));
   assert.equal(rs.filter((r) => r.act).length, 1);
   assert.equal(readdirSync(dir).filter((n) => /^claim-[0-9a-f]{16}$/.test(n)).length, 1);
-  assert.deepEqual(readdirSync(dir).filter((n) => n.includes('.old-')), []);
+  assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.take')), []);
 });
 
 test('N31 Chrome unavailable: its work is left alone for 30 minutes, the pane work still goes, recording Chrome again clears the mark', async () => {
@@ -624,4 +625,74 @@ test('N33 the commands for Chrome: pane --browser chrome keeps the account, chro
   assert.deepEqual(JSON.parse(runCli(w, ['artifacts', 'pending', '--json']).stdout).reachable, { pane: true, chrome: false });
   assert.equal(runCli(w, ['artifacts', 'mark', ID2, 'accepted']).status, 0);
   assert.equal(readEntries(dir).find((e) => e.id === ID2).status, 'accepted');
+});
+
+/* ------------------------------ review round: claim race, pane, back-off ------------------------------ */
+
+test('N34 real processes racing over an EXPIRED claim: exactly one acts, every round (the claim file is renewed in place, never absent)', async () => {
+  const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
+  w.putState((s) => { s.linked = true; });
+  w.setApp({ running: true, signedIn: A });
+  putRecord(w.fA.path, 7, {});
+  runHook(w, 'capture', publish(ID1));
+  ageEntries(w);
+  const dir = join(w.stateDir, 'artifact-queue');
+  const claim = join(dir, `claim-${createHash('sha256').update(A.toLowerCase()).digest('hex').slice(0, 16)}`);
+  const one = () => new Promise((resolve) => {
+    const p = spawn(process.execPath, [HOOK, 'wake'], { env: hookEnv(w), windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let out = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.on('close', (code) => resolve({ code, out }));
+    p.stdin.end(JSON.stringify({ session_id: uuid('d', 7), prompt: 'go' }));
+  });
+  for (let round = 0; round < 12; round++) {
+    writeFileSync(claim, '');
+    const old = new Date(Date.now() - 40 * MIN);
+    utimesSync(claim, old, old);
+    const rs = await Promise.all(Array.from({ length: 8 }, one));
+    assert.ok(rs.every((r) => r.code === 0));
+    assert.equal(rs.filter((r) => r.out.trim()).length, 1, `round ${round}`);
+    assert.deepEqual(readdirSync(dir).filter((n) => n.endsWith('.take')), [], 'no guard file left behind');
+  }
+});
+
+test('N35 the pane is always there: with only Chrome recorded, pane work still triggers; a stale guard file is cleared without blocking for long', async () => {
+  const sd = LINKED_DIR();
+  const dir = join(sd, 'q');
+  recordBrowser(dir, 'chrome', 'overflow@example.com', { account: B });
+  enqueue(dir, entry(ID1, { ownerAccount: A }));                                        // main-owned: sent from the pane, whose account is not recorded yet
+  const fromA = await wake({ dir, ...wakeOpts({ stateDir: sd, active: A }) });
+  assert.deepEqual([fromA.act, dueIds(fromA)], [true, [ID1]]);
+  const dir2 = join(LINKED_DIR(), 'q');
+  recordBrowser(dir2, 'chrome', 'overflow@example.com', { account: B });
+  enqueue(dir2, entry(ID2, { ownerAccount: B }));                                       // overflow-owned: Chrome from an overflow session only
+  assert.equal((await wake({ dir: dir2, ...wakeOpts({ stateDir: sd, active: B }) })).act, true);
+  assert.equal(driveableOwner(A, EMAILS, { browsers: { chrome: { email: 'overflow@example.com' } } }), true, 'the pane has not recorded its account: cannot be ruled out');
+  // a crashed renewal leaves its guard behind: it blocks that one prompt, then is removed once it is stale
+  const dir3 = join(LINKED_DIR(), 'q');
+  enqueue(dir3, entry(ID1));
+  const t0 = Date.now();
+  assert.equal((await wake({ dir: dir3, ...wakeOpts({ stateDir: sd, active: A, now: t0 }) })).act, true);
+  const claim = join(dir3, readdirSync(dir3).find((n) => /^claim-[0-9a-f]{16}$/.test(n)));
+  const guard = `${claim}.take`;
+  writeFileSync(guard, '');
+  const old = new Date(Date.now() - 5 * MIN);
+  utimesSync(guard, old, old);
+  assert.equal((await wake({ dir: dir3, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 31 * MIN }) })).reason, 'claimed', 'this prompt loses to the stale guard');
+  assert.equal(existsSync(guard), false, 'and the stale guard is gone');
+  assert.equal((await wake({ dir: dir3, ...wakeOpts({ stateDir: sd, active: A, now: t0 + 32 * MIN }) })).act, true);
+});
+
+test('N36 chrome-unavailable from a session of the other account is refused: an empty Chrome list there says nothing', () => {
+  const w = cworld({ config: { artifactShare: { emails: EMAILS } } });
+  w.putState((s) => { s.linked = true; });
+  assert.equal(runCli(w, ['artifacts', 'pane', 'overflow@example.com', '--browser', 'chrome', '--account', B]).status, 0);
+  w.setApp({ running: true, signedIn: A });
+  const refused = runCli(w, ['artifacts', 'chrome-unavailable']);
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /reachable only from sessions of account/);
+  assert.equal(JSON.parse(runCli(w, ['artifacts', 'list', '--json']).stdout).browsers.chrome.unavailableAt, undefined);
+  w.setApp({ running: true, signedIn: B });
+  assert.equal(runCli(w, ['artifacts', 'chrome-unavailable']).status, 0);
+  assert.ok(JSON.parse(runCli(w, ['artifacts', 'list', '--json']).stdout).browsers.chrome.unavailableAt);
 });

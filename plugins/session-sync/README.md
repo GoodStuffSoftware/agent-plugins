@@ -191,7 +191,7 @@ One setting is needed once, because the plugin never reads the app's account fie
 ```bash
 node lib/cli.mjs config artifactShare.email <account id or its first 8 characters> <email>   # once per account
 node lib/cli.mjs config artifactShare.enabled true                                            # default; false turns it off
-node lib/cli.mjs artifacts pending|list [--json]                                              # the queue
+node lib/cli.mjs artifacts pending|list [--json] [--with-invited]                              # the queue (pending also lists sent-not-accepted with the flag)
 node lib/cli.mjs artifacts mark <id> pending|invited|accepted|done|failed|skipped [--link L] [--reason R]
 node lib/cli.mjs artifacts pane <email> [--browser chrome] [--account <id>]                   # record a browser and the account that can reach it
 node lib/cli.mjs artifacts chrome-unavailable                                                  # a run found Chrome not connected: back off 30 minutes

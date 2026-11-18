@@ -1,5 +1,5 @@
 /**
- * artifacts.mjs - invite new artifacts to the other linked claude.ai account when the user switches accounts.
+ * artifacts.mjs - share new artifacts with the other linked claude.ai account (invite sent in the owner's browser, accepted in the receiver's).
  *
  * An artifact belongs to the account whose session published it; the other account sees it only through a share invite that is SENT
  * from a browser signed in as the owner and ACCEPTED as the receiver. This module is the bookkeeping half:
@@ -265,8 +265,9 @@ export function sameAccount(a, b) {
  */
 export function driveableOwner(owner, emails, share) {
   if (!owner) return true;
-  const have = Object.values(share?.browsers ?? {}).map((b) => String(b.email).toLowerCase());
-  if (!have.length) return true;
+  const browsers = share?.browsers ?? {};
+  const have = Object.values(browsers).map((b) => String(b.email).toLowerCase());
+  if (!have.length || !browsers.pane) return true;     // the pane is always there; until it has recorded its account it cannot be ruled out
   const mail = emailOf(emails, owner);
   if (!mail) return true;
   return have.includes(mail.toLowerCase());
@@ -287,24 +288,31 @@ export function accountOfEmail(emails, email) {
   return null;
 }
 
+/** The account half of browserUsable: a browser with an `account` answers only sessions of that account (an id or its prefix). */
+export function browserReachableFrom(b, active) {
+  return !b?.account || !!(active && String(active).toLowerCase().startsWith(String(b.account).toLowerCase()));
+}
+
 /**
  * Can a session running as `active` drive this browser now? A browser with an `account` only answers sessions of that account (Claude
  * in Chrome), and not while a run's "unavailable" mark is younger than BACKOFF_MS. No `account`: any session (the pane).
  */
 export function browserUsable(b, active, now = Date.now()) {
-  if (b?.account && !(active && String(active).toLowerCase().startsWith(String(b.account).toLowerCase()))) return false;
+  if (!browserReachableFrom(b, active)) return false;
   const t = Date.parse(b?.unavailableAt ?? '');
   return !(Number.isFinite(t) && now - t < BACKOFF_MS);
 }
 
 /**
  * The browsers that can make progress on this entry from a session running as `active`. A pending entry is SENT from a browser signed in
- * as its owner (no known owner or owner email: any usable browser; nothing recorded yet: the pane, whose account is not known). An invited
- * entry is ACCEPTED in a browser signed in as the receiver, and only a recorded browser can say it is.
+ * as its owner (no known owner or owner email: any usable browser). The pane is always there: until it has recorded its account it
+ * counts as a browser whose account is not known. An invited entry is ACCEPTED in a browser signed in as the receiver, and only a
+ * recorded browser can say it is.
  */
 export function workBrowsers(e, { emails, share, active, now = Date.now() }) {
   const recorded = Object.entries(share?.browsers ?? {});
-  const usable = (recorded.length ? recorded : [['pane', {}]]).filter(([, b]) => browserUsable(b, active, now));
+  const all = recorded.some(([n]) => n === 'pane') ? recorded : [['pane', {}], ...recorded];
+  const usable = all.filter(([, b]) => browserUsable(b, active, now));
   const sameMail = (b, mail) => !!b.email && String(b.email).toLowerCase() === String(mail).toLowerCase();
   if (e.status === 'invited') {
     const rcv = e.ownerAccount ? receiverEmail(emails, e.ownerAccount) : null;
@@ -349,33 +357,30 @@ export async function interactiveSessionFor(active, sessionId) {
 const claimFile = (dir, active) => join(dir, `claim-${createHash('sha256').update(String(active).toLowerCase()).digest('hex').slice(0, 16)}`);
 
 /**
- * Take the claim for an account: an exclusive create, so one session in a CLAIM_MS window gets it. A claim older than CLAIM_MS is moved
- * aside first (a rename, so one racer wins) and the create is tried again; a mover that finds it moved a FRESH claim (another session
- * took over a moment before) puts it back and loses. The claim is never cleared early: the rate limit is the whole point, and it also
- * covers entries of both accounts staying pending while the app goes A, B, A, B.
+ * Take the claim for an account: an exclusive create, so one session in a CLAIM_MS window gets it. The claim file's mtime is when it was
+ * taken. An EXPIRED claim is renewed in place (its mtime moved to now), never deleted, so the file is always there for a racer to see;
+ * the renewal runs under a short exclusive guard file (`<claim>.take`), is re-checked once the guard is held, and a stale guard (a
+ * crashed holder) is removed after GUARD_MS, losing that one prompt. The claim is never cleared early: the rate limit is the whole
+ * point, and it also covers entries of both accounts staying pending while the app goes A, B, A, B.
  */
+const GUARD_MS = 30 * 1000;
 function takeClaim(claim, now) {
-  for (let i = 0; i < 3; i++) {
-    try {
-      closeSync(openSync(claim, 'wx'));
-      try { utimesSync(claim, now / 1000, now / 1000); } catch { /* the creation time stands: the same moment outside tests */ }
-      return true;
-    } catch (e) { if (e.code !== 'EEXIST') return false; }
-    let st;
-    try { st = statSync(claim); } catch { continue; }                      // it vanished: try the create again
-    if (now - st.mtimeMs < CLAIM_MS) return false;
-    const grave = `${claim}.old-${process.pid}-${randomBytes(3).toString('hex')}`;
-    try { renameSync(claim, grave); } catch { continue; }                  // somebody else moved it: look again
-    let moved = 0;
-    try { moved = statSync(grave).mtimeMs; } catch { /* gone */ }
-    if (now - moved < CLAIM_MS) {                                          // that was a fresh claim, not the old one: put it back
-      try { linkSync(grave, claim); } catch { /* already back */ }
-      try { unlinkSync(grave); } catch { /* ignore */ }
-      return false;
-    }
-    try { unlinkSync(grave); } catch { /* ignore */ }
+  const stamp = () => { try { utimesSync(claim, now / 1000, now / 1000); return true; } catch { return false; } };
+  try {
+    closeSync(openSync(claim, 'wx'));
+    stamp();                                                               // outside tests `now` is the creation time already
+    return true;
+  } catch (e) { if (e.code !== 'EEXIST') return false; }
+  try { if (now - statSync(claim).mtimeMs < CLAIM_MS) return false; } catch { return false; }
+  const guard = `${claim}.take`;
+  try { closeSync(openSync(guard, 'wx')); } catch (e) {
+    if (e.code === 'EEXIST') { try { if (Date.now() - statSync(guard).mtimeMs > GUARD_MS) unlinkSync(guard); } catch { /* gone */ } }
+    return false;                                                          // somebody else is renewing it
   }
-  return false;
+  try {
+    if (now - statSync(claim).mtimeMs < CLAIM_MS) return false;            // renewed while we were getting the guard
+    return stamp();
+  } catch { return false; } finally { try { unlinkSync(guard); } catch { /* ignore */ } }
 }
 
 /**
