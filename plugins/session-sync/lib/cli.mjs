@@ -29,7 +29,7 @@
 
 import { push, pull, preflight, remoteNewer, remoteRecordList } from './sync.mjs';
 import { notify, registerWindowsSender } from './notify.mjs';
-import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES } from './config.mjs';
+import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES, LIVE_RELINK_MODES } from './config.mjs';
 import { acquireLock } from './lock.mjs';
 import { requestDeferred, refreshDeferred, settleDeferred, readDeferred } from './defer.mjs';
 import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic, rollbackActive, rollbackMarkerFile } from './accounts/state.mjs';
@@ -37,7 +37,7 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
-import { rcSettings, decideWake, rcLogonStep } from './accounts/rcrestore.mjs';
+import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass } from './accounts/rcrestore.mjs';
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
@@ -338,7 +338,7 @@ let waiterArmedHere = false;   // this process already armed (or joined) the wai
 const armWaiter = (ctx, reason) => { waiterArmedHere = true; return ensureWaiter(ctx, reason, spawnWaiter); };
 
 /** The Remote Control restore settings (config rcRestore.*), read afresh. Windows only: elsewhere the whole feature is off. */
-const rcRestoreNow = () => (platform() === 'win32' ? rcSettings(loadConfig()) : { enabled: false, days: 3, wake: false, wakeMax: 4 });
+const rcRestoreNow = () => (platform() === 'win32' ? rcSettings(loadConfig()) : { enabled: false, days: 3, wake: false, wakeMax: 4, liveRelink: 'off' });
 
 /** The watcher also prepares Remote Control at the quit, with one account or several: a session start with the app running makes sure it is there. */
 function rcHookArm() {
@@ -652,6 +652,30 @@ async function goLiveCommand(ctx, args) {
   return 0;
 }
 
+/**
+ * `accounts rc-restore --live [--all] [--dry-run] [--json]`: one live relink pass by hand (rcrestore.mjs liveRelinkPass). Without --all the window
+ * is rcRestore.days; with it every non-archived session. --dry-run changes nothing (and runs even when the feature is off); a real run
+ * honours rcRestore.enabled and rcRestore.liveRelink like the hooks do.
+ */
+async function liveRelinkCommand(ctx, args) {
+  const dry = args.includes('--dry-run');
+  const settings = dry ? rcSettings(loadConfig()) : rcRestoreNow();
+  const r = await liveRelinkPass(ctx, { settings, dryRun: dry, all: args.includes('--all'), log });
+  const facts = {
+    ok: r.ran || r.reason === 'disabled', command: 'rc-restore', mode: 'live', dryRun: dry, all: args.includes('--all'), ran: r.ran, reason: r.reason ?? null, acct: r.acct,
+    candidates: r.candidates, cleared: r.cleared.length, skippedLive: r.skippedLive, quiet: r.quiet, running: r.running, unknown: r.unknown, deferred: r.deferred, raced: r.raced, failed: r.failed, undated: r.undated,
+    sessions: (dry ? r.wouldClear : r.cleared).map((c) => ({ id: c.id, title: c.title, why: c.why })),
+  };
+  const lines = [];
+  if (!r.ran) lines.push(r.reason === 'disabled' ? 'The live relink is off (rcRestore.enabled or rcRestore.liveRelink). Nothing was changed. A --dry-run still shows what it would do.' : `Nothing done: ${r.reason}.`);
+  else {
+    for (const c of dry ? r.wouldClear : r.cleared) lines.push(`${dry ? 'would clear' : 'cleared'} ${c.id.replace(/^local_/, '').slice(0, 8)} "${c.title}" (${c.why === 'foreign' ? 'link minted under another account' : 'noHistoryBackfill link'})`);
+    lines.push(`${dry ? 'Dry run: ' : ''}${dry ? r.wouldClear.length : r.cleared.length} ${dry ? 'would be cleared' : 'cleared'} of ${r.candidates} stale; skipped live ${r.skippedLive}, quiet ${r.quiet}, mid-turn ${r.running}, unknown ${r.unknown}${r.undated ? `, undated (left alone) ${r.undated}` : ''}${r.deferred ? `, ${dry ? 'beyond the limit of one pass' : 'over the limit'} ${r.deferred}` : ''}${dry ? '' : `, raced ${r.raced}`}.`);
+  }
+  emit(facts, lines);
+  return 0;
+}
+
 /** `accounts <sub> ...` (plan 6). Returns the exit code. */
 async function accountsCommand(sub, args) {
   const ctx = makeCtx();
@@ -789,8 +813,10 @@ async function accountsCommand(sub, args) {
       emit({ command: 'rc-restore', ...r }, [r.ok ? (r.action === 'skipped' ? 'Nothing to do: the logon task is Windows only.' : `Logon task "session-sync RC restore": ${r.action}${install ? '' : ' (rcRestore.logonTask is now false, so a session start does not put it back)'}.`) : `Logon task failed: ${r.error}`]);
       return r.ok ? 0 : 1;
     }
+    // a manual sweep of the live relink: every non-archived session of the signed-in account whose CLI is not running and whose link is stale
+    if (!what && has('--live')) return liveRelinkCommand(ctx, args);
     if (what || !has('--if-app-stopped')) {
-      console.error('Usage: accounts rc-restore --if-app-stopped | install-logon-task | uninstall-logon-task');
+      console.error('Usage: accounts rc-restore --if-app-stopped | install-logon-task | uninstall-logon-task | --live [--all] [--dry-run] [--json]');
       return 2;
     }
     const r = await rcLogonStep(ctx, { settings: rcRestoreNow(), platform: platform(), log });
@@ -917,6 +943,16 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'artifactShare.email': { [acct.toLowerCase()]: mail }, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
+  if (key === 'rcRestore.liveRelink') {
+    if (!LIVE_RELINK_MODES.includes(value)) {
+      console.error(`"${value}" is not a valid rcRestore.liveRelink: use ${LIVE_RELINK_MODES.join(' or ')}.`);
+      process.exit(2);
+    }
+    saveConfig({ rcRestore: { liveRelink: value } });
+    log(`config: rcRestore.liveRelink -> ${value}`);
+    console.log(JSON.stringify({ ok: true, 'rcRestore.liveRelink': value, configFile: CONFIG_FILE }, null, 2));
+    process.exit(0);
+  }
   if (key === 'rcRestore.wakeMax') {
     const n = Number(value);
     if (!Number.isInteger(n) || n < 1 || n > 50) {
@@ -939,7 +975,7 @@ if (cmd === 'config') {
     console.log(JSON.stringify({ ok: true, 'rcRestore.days': n, configFile: CONFIG_FILE }, null, 2));
     process.exit(0);
   }
-  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, rcRestore.logonTask, artifactShare.enabled, artifactShare.email');
+  console.error('unknown setting "' + key + '". Valid: remote, enabled, notifications, notifyMode, debounceMinutes, accountLink, progressIcon, rcRestore.enabled, rcRestore.days, rcRestore.wake, rcRestore.wakeMax, rcRestore.liveRelink, rcRestore.logonTask, artifactShare.enabled, artifactShare.email');
   process.exit(2);
 }
 
@@ -1030,7 +1066,8 @@ if (cmd === 'rc-wake') {
     const settings = rcRestoreNow();
     const prompt = String(input.prompt ?? '').trim();
     if (settings.enabled && settings.wake && input.session_id && prompt && !prompt.startsWith('/')) {
-      const d = decideWake(makeCtx(), { settings, sessionId: String(input.session_id) });
+      // the prompt that claims the restart also clears the stale links of the sessions that have no CLI yet (liveRelink), before the instruction goes out
+      const d = await wakeWithRelink(makeCtx(), { settings, sessionId: String(input.session_id), log, cimTimeoutMs: 6000 });
       if (d.act) {
         log(`rc-wake: instruction given to session ${String(input.session_id).slice(0, 8)}${d.relinkOwed ? `; relink owed for ${d.relinkOwed} session(s), the user is asked to quit Claude once from the tray icon` : ''}`);
         writeStdout(`${JSON.stringify({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: d.text } })}\n`);

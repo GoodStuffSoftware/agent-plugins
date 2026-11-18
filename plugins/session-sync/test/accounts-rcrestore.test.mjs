@@ -57,14 +57,15 @@ const GOOD = { bridgeSessionId: 'cse_good', ownerAccountUuid: ME };
 
 /* ------------------------------------------------------------------ relink */
 
-test('R1 relink: noHistoryBackfill and a foreign owner are affected; an own, clean link and no link are not', () => {
-  assert.equal(needsRelink(STALE, ME), true);
-  assert.equal(needsRelink(FOREIGN, ME), true);
-  assert.equal(needsRelink({ ...FOREIGN, ownerAccountUuid: ME.toUpperCase() }, ME), false, 'the owner compares case-insensitively');
-  assert.equal(needsRelink(GOOD, ME), false);
-  assert.equal(needsRelink({ ...GOOD, noHistoryBackfill: false }, ME), false);
-  assert.equal(needsRelink(null, ME), false);
-  assert.equal(needsRelink({ bridgeSessionId: '', noHistoryBackfill: true }, ME), false, 'an already cleared link is left alone');
+test('R1 relink: noHistoryBackfill, or a link the ledger calls foreign; the owner stamp, a clean link and no link are not', () => {
+  const yes = () => true;
+  assert.equal(needsRelink(STALE), true);
+  assert.equal(needsRelink(FOREIGN), false, 'the owner field is no account signal: only the ledger and the switch history can call a link foreign');
+  assert.equal(needsRelink(FOREIGN, yes), true);
+  assert.equal(needsRelink(GOOD), false);
+  assert.equal(needsRelink({ ...GOOD, noHistoryBackfill: false }), false);
+  assert.equal(needsRelink(null), false);
+  assert.equal(needsRelink({ bridgeSessionId: '', noHistoryBackfill: true }, yes), false, 'an already cleared link is left alone');
 });
 
 test('R2 lastBridgeEntry: the last entry wins, wherever it is, and nothing else in the file is parsed', () => {
@@ -84,7 +85,7 @@ test('R2 lastBridgeEntry: the last entry wins, wherever it is, and nothing else 
 test('R3 plan: only records active within the window, of the current account, with an affected last entry', () => {
   const w = world();
   session(w, 1, { bridge: STALE });                              // affected
-  session(w, 2, { bridge: FOREIGN });                            // affected
+  session(w, 2, { bridge: FOREIGN });                            // another owner stamp: not an account signal, not affected
   session(w, 3, { bridge: GOOD });                               // clean
   session(w, 4, { bridge: STALE, agoMs: 4 * DAY_MS });           // too old for 3 days
   session(w, 5, {});                                             // no link at all
@@ -92,8 +93,8 @@ test('R3 plan: only records active within the window, of the current account, wi
   putRecord(other.path, 6, { lastActivityAt: iso(NOW - 1000), remoteControlUserEnabled: true });   // another account's folder
   const plan = rcPlan(w.ctx, { projects: w.projects, days: 3 });
   assert.equal(plan.acct, ME);
-  assert.deepEqual(plan.relink.map((x) => x.id).sort(), [`local_${uuid('c', 1)}`, `local_${uuid('c', 2)}`].sort());
-  assert.equal(rcPlan(w.ctx, { projects: w.projects, days: 7 }).relink.length, 3, 'a wider window takes the older one too');
+  assert.deepEqual(plan.relink.map((x) => x.id), [`local_${uuid('c', 1)}`]);
+  assert.equal(rcPlan(w.ctx, { projects: w.projects, days: 7 }).relink.length, 2, 'a wider window takes the older one too');
 });
 
 test('R4 apply: the clearing line is the CLI\'s own, appended once, after a backup; the second run changes nothing', () => {
@@ -336,15 +337,15 @@ test('L1 readLaunchOutcome: the pass summary and verdict lines after the start, 
 /* ------------------------------------------------------------------ settings */
 
 test('S1 rcSettings: defaults on, 3 days, wake on; partial blocks keep the other defaults; bad values fall back', () => {
-  assert.deepEqual(rcSettings({}), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
-  assert.deepEqual(RC_DEFAULTS, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
-  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4, logonTask: true });
-  assert.deepEqual(rcSettings({ rcRestore: { enabled: false, days: 7 } }), { enabled: false, days: 7, wake: true, wakeMax: 4, logonTask: true });
+  assert.deepEqual(rcSettings({}), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+  assert.deepEqual(RC_DEFAULTS, { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+  assert.deepEqual(rcSettings({ rcRestore: { wake: false } }), { enabled: true, days: 3, wake: false, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+  assert.deepEqual(rcSettings({ rcRestore: { enabled: false, days: 7 } }), { enabled: false, days: 7, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
   assert.equal(rcSettings({ rcRestore: { days: 0 } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 'many' } }).days, 3);
   assert.equal(rcSettings({ rcRestore: { days: 400 } }).days, 3);
-  assert.deepEqual(rcSettings({ rcRestore: 'yes' }), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
-  assert.deepEqual(rcSettings(undefined), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true });
+  assert.deepEqual(rcSettings({ rcRestore: 'yes' }), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
+  assert.deepEqual(rcSettings(undefined), { enabled: true, days: 3, wake: true, wakeMax: 4, logonTask: true, liveRelink: 'idle-only', liveMax: 10, liveEveryMs: 600000 });
 });
 
 test('E12 a linked account: one conversation per org folder counts once; 4 distinct sessions get the marker, once each, hard links kept', () => {

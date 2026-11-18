@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** the live relink. While Claude runs, a stale Remote Control link (a `noHistoryBackfill` random-name link, or one minted while another account was signed in) is cleared in place for a session whose CLI is not running, so its next connect makes a titled link. Gates: no live `claude.exe` for that conversation (an unreadable process list clears nothing), transcript quiet for 120 s, not mid-turn, never the hook's own session, everything re-checked right before the write, a backup first, the CLI's own clearing line, a second process check afterwards (logged as `raced`), at most `rcRestore.liveMax` per pass, no process is ever stopped. It runs in the wake hook before the first prompt after a restart gets its instruction, in the background watcher every `rcRestore.liveEveryMs` while the app runs, and as a sweep of every session at an account switch. One `sync.log` line per pass that found candidates.
+* **session-sync:** `accounts rc-restore --live [--all] [--dry-run] [--json]` for one pass by hand; `--dry-run` lists what it would clear with the reason and the skipped counts. Settings `rcRestore.liveRelink` (`idle-only` default, or `off`; also `config rcRestore.liveRelink`), `rcRestore.liveMax` (10) and `rcRestore.liveEveryMs` (600000).
+* **session-sync:** a link ledger (`accounts/rc-links.json`) and an account switch history (`accounts/switch-history.json`, seeded from the app's `remote-control.log`) record which account a link was first seen under.
+
+### Fixed
+
+* **session-sync:** the relink no longer treats a link as foreign because its `ownerAccountUuid` differs from the signed-in account. That stamp is the CLI's cached identity and was the same on healthy links, so 0.5.6 would have relinked 29 sessions where 3 needed it. Foreign now means first seen before the last account switch (per the ledger and the switch history); a link that cannot be dated is left alone.
+
+### Changed
+
+* **session-sync:** the `rc-wake` hook timeout is 30 s (was 10): the prompt that claims the restart runs the live relink, which may list processes up to three times.
+
 ## 0.5.6 (2026-11-17)
 
 ### Added
