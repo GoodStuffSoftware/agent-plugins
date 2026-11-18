@@ -13,7 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { runWaiter, ensureWaiter, waiterStatus, claimWaiter, replaceOldWaiter } from '../lib/accounts/waiter.mjs';
-import { PLUGIN_VERSION, codeHash } from '../lib/accounts/version.mjs';
+import { PLUGIN_VERSION, codeHash, compareVersions } from '../lib/accounts/version.mjs';
 import { loadState, saveState, emptyState, readJson, resetMutations } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey } from '../lib/accounts/folders.mjs';
 import { AppRunningError, appState } from '../lib/accounts/appstate.mjs';
@@ -513,6 +513,69 @@ test('S5 a waiter of the same version but other code is replaced; the same code,
     assert.equal(p.alive(), false, 'the stale watcher is ended');
     assert.equal(claimGone(w), true, 'the singleton is free for the new one');
   } finally { p.kill(); }
+});
+
+/* ---- never replace a newer waiter (the Claude app's own copy of the plugin can lag behind the user's cache) */
+
+test('V1 compareVersions: semver order, numeric parts as numbers, a pre-release before its release, junk is null', () => {
+  assert.equal(compareVersions('0.5.3', '0.5.4'), -1);
+  assert.equal(compareVersions('0.5.4', '0.5.3'), 1);
+  assert.equal(compareVersions('0.5.4', '0.5.4'), 0);
+  assert.equal(compareVersions('0.5.10', '0.5.9'), 1, '0.5.10 is newer than 0.5.9 (not a string compare)');
+  assert.equal(compareVersions('0.5.9', '0.5.10'), -1);
+  assert.equal(compareVersions('0.10.0', '0.9.9'), 1);
+  assert.equal(compareVersions('1.0.0', '0.99.99'), 1);
+  assert.equal(compareVersions('1.0.0-rc.1', '1.0.0'), -1);
+  assert.equal(compareVersions('1.0.0-rc.2', '1.0.0-rc.10'), -1);
+  assert.equal(compareVersions('1.0.0-alpha', '1.0.0-alpha.1'), -1);
+  assert.equal(compareVersions('1.0.0+build5', '1.0.0'), 0);
+  assert.equal(compareVersions('v0.5.4', '0.5.4'), 0);
+  for (const bad of [null, undefined, '', 'abc', '0.5', '0.5.x']) assert.equal(compareVersions(bad, '0.5.4'), null);
+});
+
+test('V2 a copy that is OLDER than the running waiter never ends it and says nothing (the 0.5.3 copy against a 0.5.4 waiter)', () => {
+  const w = world();
+  putWaiter(w, process.ppid, { version: '0.5.4' });
+  const r = replaceOldWaiter(w.ctx, { version: '0.5.3', kill: noKill, verify: () => assert.fail('the OS is not even asked') });
+  assert.deepEqual(r, { replaced: false, reason: 'newer', version: '0.5.4' });
+  assert.equal(existsSync(join(w.acc, 'waiter.claim')), true, 'the newer waiter keeps its claim');
+  assert.equal(existsSync(join(w.acc, 'waiter.json')), true);
+  assert.equal(waiterStatus(w.ctx).alive, true);
+  // a hash that differs does not matter: the version decides first
+  writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: process.ppid, at: w.ctx.now(), version: '0.5.4', hash: '0123456789abcdef' }));
+  assert.equal(replaceOldWaiter(w.ctx, { version: '0.5.3', hash: 'fedcba9876543210', kill: noKill }).reason, 'newer');
+});
+
+test('V3 semver, not string order: 0.5.9 does not end a 0.5.10 waiter, 0.5.10 does end a 0.5.9 one', () => {
+  const w = world();
+  putWaiter(w, process.ppid, { version: '0.5.10' });
+  assert.equal(replaceOldWaiter(w.ctx, { version: '0.5.9', kill: noKill }).reason, 'newer');
+  putWaiter(w, process.ppid, { version: '0.5.9' });
+  const r = replaceOldWaiter(w.ctx, { version: '0.5.10', verify: () => ({ ok: true, reason: 'match' }), kill: () => {}, alive: () => false });
+  assert.deepEqual([r.replaced, r.version], [true, '0.5.9']);
+  assert.equal(claimGone(w), true);
+});
+
+test('V4 a NEWER copy replaces an older waiter; the same version is replaced only when the code hash differs', () => {
+  const w = world();
+  putWaiter(w, process.ppid, { version: '0.5.3' });
+  const ok = { verify: () => ({ ok: true, reason: 'match' }), kill: () => {}, alive: () => false };
+  const r = replaceOldWaiter(w.ctx, { version: '0.5.4', ...ok });
+  assert.deepEqual([r.replaced, r.version], [true, '0.5.3']);
+  putWaiter(w, process.ppid, { version: '0.5.4' });
+  writeFileSync(join(w.acc, 'waiter.claim'), JSON.stringify({ pid: process.ppid, at: w.ctx.now(), version: '0.5.4', hash: 'aaaaaaaaaaaaaaaa' }));
+  assert.equal(replaceOldWaiter(w.ctx, { version: '0.5.4', hash: 'aaaaaaaaaaaaaaaa', kill: noKill }).reason, 'current', 'same version, same code');
+  assert.equal(replaceOldWaiter(w.ctx, { version: '0.5.4', hash: 'bbbbbbbbbbbbbbbb', ...ok }).replaced, true, 'same version, other code');
+});
+
+test('V5 a claim with no version is older than any copy; a claim version that is not a version is left alone', () => {
+  const w = world();
+  putWaiter(w, process.ppid, {});
+  const r = replaceOldWaiter(w.ctx, { version: '0.5.4', verify: () => ({ ok: true, reason: 'match' }), kill: () => {}, alive: () => false });
+  assert.deepEqual([r.replaced, r.version], [true, null]);
+  putWaiter(w, process.ppid, { version: 'banana' });
+  assert.equal(replaceOldWaiter(w.ctx, { version: '0.5.4', kill: noKill }).reason, 'unknown-version');
+  assert.equal(replaceOldWaiter(w.ctx, { version: null, kill: noKill }).reason, 'unknown-version', 'this copy does not know its own version');
 });
 
 test('S5 a stale watcher is never ended while it is mid-pass, and a pid that is not a waiter is left alone', () => {
