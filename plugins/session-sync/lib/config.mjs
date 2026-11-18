@@ -99,7 +99,7 @@ export const DEFAULTS = Object.freeze({
   //   wake:    after the restart, the first prompt of one session wakes the rest with one short turn each (costs a turn per session)
   //   logonTask: a hidden "At log on" task runs the relink after a Windows restart, when the quit step could not (false: no task)
   rcRestore: RC_DEFAULTS,
-  // Invite new artifacts to the other linked account when the user switches accounts (artifacts.mjs; `config artifactShare.enabled|email`).
+  // Share new artifacts with the other linked account (invite sent and accepted by an agent-driven browser; artifacts.mjs; `config artifactShare.enabled|email`).
   artifactShare: Object.freeze({ enabled: true, emails: Object.freeze({}) }),
 });
 

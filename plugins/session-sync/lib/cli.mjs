@@ -946,7 +946,8 @@ if (cmd === 'config') {
 // `artifacts ...`: the queue of new artifacts to invite to the other linked account (artifacts.mjs). Used by the share-artifacts skill.
 // Needs neither rclone nor `enabled`; prints plain lines, or one JSON object with --json.
 if (cmd === 'artifacts') {
-  const args = process.argv.slice(3).filter((a) => a !== '--json');
+  const withInvited = process.argv.includes('--with-invited');
+  const args = process.argv.slice(3).filter((a) => a !== '--json' && a !== '--with-invited');
   const sub = args[0] || 'list';
   const flag = (name) => { const i = args.indexOf(`--${name}`); return i >= 0 ? args[i + 1] : undefined; };
   const positional = args.filter((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--')));
@@ -960,12 +961,15 @@ if (cmd === 'artifacts') {
     if (sub === 'pending' || sub === 'list') {
       const entries = A.readEntries(A.QUEUE_DIR);
       const share = A.readShareState(A.QUEUE_DIR);
-      const shown = (sub === 'pending' ? A.pendingOf(entries) : entries).map((e) => ({
+      const shown = (sub === 'pending' ? (withInvited ? entries.filter((e) => e.status === 'pending' || e.status === 'invited') : A.pendingOf(entries)) : entries).map((e) => ({
         ...e, ownerEmail: A.emailOf(emails, e.ownerAccount), receiverEmail: A.receiverEmail(emails, e.ownerAccount),
         driveable: A.driveableOwner(e.ownerAccount, emails, share),
       }));
       const active = sub === 'pending' ? await A.activeAccount() : null;
-      const head = { enabled: cfg.artifactShare.enabled, linked: A.featureOn({ artifactShare: { enabled: true } }), browsers: share.browsers, emails, activeAccount: active, activeEmail: A.emailOf(emails, active) };
+      // From a session running as the app's account: `reachable` is the account half only (null when the account cannot be read: unknown, probe it); `backoff` lists browsers a run reported unavailable less than 30 minutes ago, which gates the automatic trigger, not a run the user asked for.
+      const reachable = active ? Object.fromEntries(Object.entries(share.browsers).map(([k, b]) => [k, A.browserReachableFrom(b, active)])) : null;
+      const backoff = Object.fromEntries(Object.entries(share.browsers).filter(([, b]) => Date.now() - Date.parse(b.unavailableAt ?? '') < A.BACKOFF_MS).map(([k, b]) => [k, b.unavailableAt]));
+      const head = { enabled: cfg.artifactShare.enabled, linked: A.featureOn({ artifactShare: { enabled: true } }), browsers: share.browsers, reachable, backoff, emails, activeAccount: active, activeEmail: A.emailOf(emails, active) };
       out({ ok: true, ...head, entries: shown }, shown.length ? shown.map(line).join('\n') : (sub === 'pending' ? 'nothing pending' : 'the queue is empty'));
       process.exit(0);
     }
@@ -984,13 +988,31 @@ if (cmd === 'artifacts') {
       out({ ok }, ok ? 'forgotten' : 'not in the queue');
       process.exit(ok ? 0 : 1);
     }
-    if (sub === 'pane') {   // record the account a driveable browser is signed in to: artifacts pane <email> [--browser <name>]
-      if (!positional[1]) { console.error('usage: artifacts pane <email> [--browser <name>]'); process.exit(2); }
-      const s = A.recordBrowser(A.QUEUE_DIR, flag('browser') ?? 'pane', positional[1]);
-      out({ ok: true, browsers: s.browsers }, `recorded ${positional[1]}`);
+    if (sub === 'pane') {   // record the account a driveable browser is signed in to: artifacts pane <email> [--browser <name>] [--account <id>]
+      if (!positional[1]) { console.error('usage: artifacts pane <email> [--browser <name>] [--account <account id>]'); process.exit(2); }
+      const name = flag('browser') ?? 'pane';
+      // Claude in Chrome (any browser but the pane) is reachable only from sessions of the account its extension is connected to; unless
+      // told, that is taken to be the configured account whose email this browser is signed in as. The pane is reachable from any account.
+      const account = flag('account') ?? (name === 'pane' || A.readShareState(A.QUEUE_DIR).browsers[name]?.account ? undefined : A.accountOfEmail(emails, positional[1]) ?? undefined);
+      const s = A.recordBrowser(A.QUEUE_DIR, name, positional[1], { account });
+      out({ ok: true, browsers: s.browsers }, `recorded ${name}: ${positional[1]}${s.browsers[name].account ? ` (reachable from sessions of account ${s.browsers[name].account.slice(0, 8)})` : ''}`);
       process.exit(0);
     }
-    console.error('usage: artifacts pending|list [--json] | mark <id> <status> [--link L] [--reason R] | forget <id> | pane <email> [--browser name]');
+    if (sub === 'chrome-unavailable') {   // a run found Chrome not connected: the wake leaves its work alone for 30 minutes (--browser <name> for another browser)
+      const name = flag('browser') ?? 'chrome';
+      // A session of the other account cannot see that Chrome at all, so an empty list there says nothing: refuse to record it.
+      const reg = A.readShareState(A.QUEUE_DIR).browsers[name];
+      const active = reg?.account ? await A.activeAccount() : null;
+      if (reg?.account && active && !A.browserReachableFrom(reg, active)) {
+        console.error(`not recorded: ${name} is reachable only from sessions of account ${reg.account.slice(0, 8)}, this session runs as ${active.slice(0, 8)}`);
+        process.exit(1);
+      }
+      const r = A.markBrowserUnavailable(A.QUEUE_DIR, name);
+      if (!r.ok) { console.error(r.reason); process.exit(1); }
+      out({ ok: true, browsers: r.browsers }, `recorded: ${name} unavailable, no new trigger for its work for 30 minutes`);
+      process.exit(0);
+    }
+    console.error('usage: artifacts pending|list [--json] [--with-invited] | mark <id> <status> [--link L] [--reason R] | forget <id> | pane <email> [--browser name] [--account id] | chrome-unavailable [--browser name]');
     process.exit(2);
   } catch (e) {
     log(`artifacts ${sub} failed: ${e?.message || e}`);
