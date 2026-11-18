@@ -1,5 +1,5 @@
 ---
-description: Share Code-tab conversations, local scheduled tasks and app settings between several claude.ai accounts signed into the Claude desktop app on one machine. Use when the user wants to share conversations between accounts, has a second claude.ai account, switched accounts and lost their sessions, or asks what link, unlink, rollback or the accountLink setting do. Also use it when a Remote Control session shows a random name (for example old-guy-2-lovely-thimble) while its Claude process is running, or the user says the RC name is wrong.
+description: Share Code-tab conversations, local scheduled tasks and app settings between several claude.ai accounts signed into the Claude desktop app on one machine. Use when the user wants to share conversations between accounts, has a second claude.ai account, switched accounts and lost their sessions, or asks what link, unlink, rollback or the accountLink setting do. Also use it for a random Remote Control name (for example old-guy-2-lovely-thimble) on a session whose Claude process is running, or when the user says RC name wrong.
 ---
 
 # Link conversations across claude.ai accounts
@@ -180,7 +180,7 @@ Restarting the Claude app turns Remote Control off for every Code session, and a
 
 ## Random Remote Control name on a running session
 
-A session whose Claude process runs can show a random Remote Control name on claude.ai (the CLI holds a `noHistoryBackfill` link in memory, so clearing the transcript while it runs does nothing). The fix needs the CLI stopped while the clear line is written, so it is a manual procedure. **Mike approved stopping that session's CLI for this repair (2026-11-18).** That covers an idle session only: never one that is mid-turn. Do **one session at a time**. `<id>` is the local session id (`local_<uuid>`) or the CLI session id; `<session>` below is the app tool's session argument.
+A session whose Claude process runs can show a random Remote Control name on claude.ai (the CLI holds a `noHistoryBackfill` link in memory, so clearing the transcript while it runs does nothing). The fix needs the CLI stopped while the clear line is written, so it is a manual procedure. **Mike approved stopping that session's CLI for this repair (2026-11-18).** That covers an idle session only: never one that is mid-turn. Do **one session at a time**. This manual procedure is the one exception to "no process is ever stopped" and "do not run steps by hand" above, which describe the automatic passes. A session that names its conversation only with `--session-id` (started fresh by the app) cannot be repaired this way: the command refuses it as not stoppable. `<id>` is the local session id (`local_<uuid>`) or the CLI session id; `<session>` below is the app tool's session argument.
 
 1. App tool `set_remote_control(<session>, false)`.
 2. Look first: `node "<plugin>/lib/cli.mjs" accounts rc-repair <id> --stop-cli --dry-run --json` lists the pids it would stop and what it would clear. It refuses a mid-turn session, a link that is already cleared or healthy (`--force` overrides), a live CLI without `--stop-cli`, and an unreadable process list.

@@ -63,7 +63,29 @@ const PID_SCRIPT = [
   `Get-CimInstance -ClassName Win32_Process -Filter "Name='claude.exe'" | ForEach-Object { 'P' + [char]9 + [string]$_.ProcessId + [char]9 + [string]$_.CommandLine }`,
   `'${END_MARK}'`,
 ].join('; ');
-const RESUME_FLAG = new RegExp(`--resume(?:=|\\s+)["']?(${UUID})`, 'gi');
+const UUID_ONLY = new RegExp(`^${UUID}$`, 'i');
+
+/** Split a Windows command line into arguments, double quotes grouping (a quoted argument stays ONE token, so text inside `-p "..."` is never a flag). */
+function argvOf(cmd) {
+  const out = []; let cur = ''; let q = false; let has = false;
+  for (const c of String(cmd)) {
+    if (c === '"') { q = !q; has = true; continue; }
+    if (!q && /\s/.test(c)) { if (has) { out.push(cur); cur = ''; has = false; } continue; }
+    cur += c; has = true;
+  }
+  if (has) out.push(cur);
+  return out;
+}
+
+/** The conversation ids the arguments name as `--resume <id>` or `--resume=<id>` (real arguments only). */
+function resumeIdsOf(cmd) {
+  const a = argvOf(cmd); const ids = [];
+  for (let i = 0; i < a.length; i++) {
+    const v = a[i] === '--resume' ? a[i + 1] : a[i].startsWith('--resume=') ? a[i].slice(9) : null;
+    if (v && UUID_ONLY.test(v)) ids.push(v.toLowerCase());
+  }
+  return ids;
+}
 
 /**
  * The claude.exe processes of the listing as [{pid, ids:[every conversation id named by --resume or --session-id], resume:[ids named by --resume]}],
@@ -77,7 +99,7 @@ export function parseCliProcs(stdout) {
     const m = /^P\t(\d+)\t([\s\S]*)$/.exec(l);
     if (!m || !m[2].trim()) return null;
     const grab = (re) => { const ids = []; re.lastIndex = 0; for (let x = re.exec(m[2]); x; x = re.exec(m[2])) ids.push(x[1].toLowerCase()); return ids; };
-    out.push({ pid: Number(m[1]), ids: grab(ID_FLAG), resume: grab(RESUME_FLAG) });
+    out.push({ pid: Number(m[1]), ids: grab(ID_FLAG), resume: resumeIdsOf(m[2]) });
   }
   return out;
 }

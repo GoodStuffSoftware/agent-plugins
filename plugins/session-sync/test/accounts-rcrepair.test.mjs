@@ -74,8 +74,9 @@ test('R3 --stop-cli stops only the pids of that conversation, re-checks, backs u
   const before = readFileSync(tp, 'utf8');
   const p = procs([proc(4242, 1), proc(4243, 2), { pid: 4244, ids: [cli(1)], resume: [] }]);
   const r = await run(w, sid(1), { listProcs: p.listProcs, stopPids: p.stopPids, stopCli: true });
-  // pid 4244 names the conversation with --session-id only: it is not a --resume process, so it is not stopped, and the re-check refuses
-  assert.equal(r.reason, 'cli-still-live'); assert.deepEqual(p.st.stopped, [4242]); assert.equal(readFileSync(tp, 'utf8'), before);
+  // pid 4244 names the conversation with --session-id only: it is not a --resume process, so the repair refuses before stopping anything (also as a dry run)
+  assert.equal(r.reason, 'cli-not-stoppable'); assert.deepEqual(p.st.stopped, []); assert.equal(readFileSync(tp, 'utf8'), before);
+  assert.equal((await run(w, sid(1), { listProcs: p.listProcs, stopPids: p.stopPids, stopCli: true, dryRun: true })).reason, 'cli-not-stoppable');
   const p2 = procs([proc(4242, 1), proc(4243, 2)]);
   const ok = await run(w, sid(1), { listProcs: p2.listProcs, stopPids: p2.stopPids, stopCli: true });
   assert.equal(ok.status, 'cleared'); assert.deepEqual(p2.st.stopped, [4242]);
