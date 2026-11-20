@@ -127,6 +127,12 @@ export interface SendService {
   /** Refused as `too_large` when the message is past `maxBytes` of files plus room for its text. */
   readDraft(a: AccountRef, draftId: string, maxBytes: number): Promise<DraftEnvelope>;
   /**
+   * A draft's text and HTML as Gmail has them now, only to show the owner what a held draft send
+   * holds (the bytes that are sent are `readDraft`'s `raw`). Optional: a provider without it shows
+   * no draft text.
+   */
+  readDraftText?(a: AccountRef, draftId: string): Promise<{ text: string; html?: string }>;
+  /**
    * Sends `draft.raw` (what `readDraft` returned and the caller checked, never a fresh copy of the
    * draft) and then deletes the draft `draftId`.
    */

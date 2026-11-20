@@ -14,6 +14,12 @@ import {
   parseScopes,
 } from "../providers/google/base";
 import { html, raw, type SafeHtml } from "./html";
+import {
+  factRowsView,
+  type MailPreviewData,
+  mailPreviewView,
+  previewFactRows,
+} from "./preview-views";
 
 /** `2026-10-29T14:03:20.000Z` as `2026-10-29 14:03 UTC`. */
 const utc = (iso: string): string => `${iso.slice(0, 10)} ${iso.slice(11, 16)} UTC`;
@@ -317,6 +323,11 @@ export interface ApprovalViewData {
   account: { label: string; address: string } | null;
   /** The tool's own approval summary. Every field is optional and untrusted. */
   preview: unknown;
+  /**
+   * The held email as it will arrive (route-prepared: the HTML is already sanitized). Absent for
+   * a kind that is not an email and for a row stored before the view existed.
+   */
+  mail?: MailPreviewData | undefined;
   previewJson: string;
   /** The stored call's arguments, clipped. */
   args: string;
@@ -361,24 +372,36 @@ function previewRows(preview: unknown): SafeHtml {
   return html`${row("Action", "action")}${row("Summary", "summary")}${row("Role", "role")}${row("To", "to")}${row("Cc", "cc")}${row("Bcc", "bcc")}${row("Reason", "reason")}`;
 }
 
-function summaryCard(d: ApprovalViewData): SafeHtml {
+/**
+ * The facts of the action itself. An email has its own card (`mailPreviewView`); a known kind
+ * (share, filter, calendar) gets its key fields; anything else, and a send stored before the
+ * view existed, gets the rows the preview always had.
+ */
+function actionFacts(d: ApprovalViewData): SafeHtml {
+  if (d.mail) return html``;
+  const rows = previewFactRows(d.tool, d.preview);
+  if (rows.length > 0) return factRowsView(rows);
   const subject = field(d.preview, "subject");
   const from = field(d.preview, "from");
   // From is the mail's own sender, or the mailbox for a send held for new recipients; other tools
-  // (share, filter, calendar) send nothing from anywhere.
+  // send nothing from anywhere.
   const fromText = typeof from === "string" && from !== "" ? from : d.held ? d.held.mailbox : "";
-  const why = field(d.preview, "heldBecause");
+  return html`${fromText === "" ? "" : html`<dt>From</dt><dd>${fromText}</dd>`}${previewRows(d.preview)}${typeof subject === "string" ? html`<dt>Subject</dt><dd class="subject">${subject === "" ? "(no subject)" : subject}</dd>` : ""}`;
+}
+
+function summaryCard(d: ApprovalViewData): SafeHtml {
+  const why = [field(d.preview, "heldBecause"), field(d.preview, "reason")].find(
+    (x): x is string => typeof x === "string" && x !== "",
+  );
   return html`<section class="card summary">
 ${
   d.status === "pending"
-    ? html`<p class="callout"><strong>Why it was held.</strong> ${typeof why === "string" && why !== "" ? why : "This kind of action always waits for your approval."}</p>`
+    ? html`<p class="callout"><strong>Why it was held.</strong> ${why ?? "This kind of action always waits for your approval."}</p>`
     : ""
 }
 <dl class="facts">
 ${d.account ? html`<dt>Account</dt><dd>${d.account.label} (${d.account.address})</dd>` : ""}
-${fromText === "" ? "" : html`<dt>From</dt><dd>${fromText}</dd>`}
-${previewRows(d.preview)}
-${typeof subject === "string" ? html`<dt>Subject</dt><dd class="subject">${subject === "" ? "(no subject)" : subject}</dd>` : ""}
+${actionFacts(d)}
 <dt>Expires</dt><dd><time datetime="${d.expires}">${utc(d.expires)}</time></dd>
 <dt>Status</dt><dd>${d.status}</dd>
 </dl>
@@ -437,10 +460,11 @@ export function approvalView(d: ApprovalViewData): SafeHtml {
   return html`<h1>Approve an action</h1>
 <p>An MCP client asked to run <strong>${d.tool}</strong>${d.account ? html` on <strong>${d.account.label}</strong> (${d.account.address})` : ""}. Nothing happens unless you approve it here.</p>
 ${summaryCard(d)}
+${d.mail ? mailPreviewView(d.mail) : ""}
 ${decide}
 ${d.resultJson === null ? "" : html`<section class="card"><h2>Result</h2><pre>${d.resultJson}</pre></section>`}
-<details class="card" open>
-<summary>Technical details: client, preview, exact arguments</summary>
+<details class="card">
+<summary>Details: client, raw preview, exact arguments</summary>
 <dl class="facts facts-small">
 <dt>Tool</dt><dd>${d.tool}</dd>
 <dt>Requested</dt><dd>${d.requested}</dd>

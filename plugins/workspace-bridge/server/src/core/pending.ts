@@ -10,6 +10,7 @@ import type { AccountRef } from "../services/types";
 import { randomId } from "./crypto";
 import { first, type PendingActionRow, type PendingStatus, run } from "./db";
 import { ToolError } from "./errors";
+import { withoutView, withView } from "./held-view";
 
 /** What a tool answers instead of running, without `isError` (s.3.3). */
 export interface PendingApproval {
@@ -27,6 +28,11 @@ export interface PendingActionInput {
   /** The validated arguments, run as they are once approved. */
   params: unknown;
   preview: unknown;
+  /**
+   * What the owner's approval page shows beyond the preview (core/held-view.ts): stored with the
+   * preview, never returned to the caller.
+   */
+  view?: unknown;
 }
 
 export interface PendingActionInfo {
@@ -101,7 +107,7 @@ export function pendingInfo(row: PendingActionRow, now: number): PendingActionIn
     tool: row.tool,
     accountId: row.account_id,
     status: row.status === "pending" && row.expires_at <= now ? "expired" : row.status,
-    preview: parseJson(row.preview),
+    preview: withoutView(parseJson(row.preview)),
     createdAt: row.created_at,
     expiresAt: row.expires_at,
     decidedAt: row.decided_at,
@@ -215,7 +221,7 @@ export function createPendingActions(deps: PendingDeps): PendingActions {
         input.tool,
         input.account?.accountId ?? null,
         params,
-        JSON.stringify(preview) ?? "null",
+        JSON.stringify(withView(preview, input.view)) ?? "null",
         grant.clientId,
         grant.grantId,
         at,

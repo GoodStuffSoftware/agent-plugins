@@ -90,6 +90,12 @@ export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
     when(args: z.output<S>, ctx: ToolContext): boolean | Promise<boolean>;
     preview(args: z.output<S>, ctx: ToolContext): unknown;
     /**
+     * More for the owner's approval page than the preview carries (the body of a held email, say):
+     * stored with the pending action and never returned to the caller. Best effort: a failure
+     * here is logged and the page falls back to the preview.
+     */
+    view?(args: z.output<S>, ctx: ToolContext): unknown;
+    /**
      * Runs once the pending action exists, never when creating it failed (the 50-open cap, a
      * rate limit, too large): the place for a "held" audit row that names `pendingActionId`. The
      * hold stands whatever it does; an error it throws is logged, not returned to the caller.

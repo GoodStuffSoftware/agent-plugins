@@ -22,6 +22,7 @@ import {
   buildRfc822,
   decodeEncodedWords,
   extractBody,
+  extractHtmlBody,
   forwardHeaderBlock,
   forwardHtmlBlock,
   forwardSubject,
@@ -539,6 +540,21 @@ async function readDraft(a: AccountRef, draftId: string, maxBytes: number): Prom
   };
 }
 
+/** A draft's text and HTML parts, for the owner's approval page only (never what is sent). */
+async function readDraftText(
+  a: AccountRef,
+  draftId: string,
+): Promise<{ text: string; html?: string }> {
+  const d = await gjson<{ message?: { payload?: GmailPart } }>(
+    a,
+    `${BASE}/drafts/${enc(draftId)}`,
+    {},
+    { fields: "message(payload)", query: { format: "full" } },
+  );
+  const html = extractHtmlBody(d.message?.payload);
+  return { text: extractBody(d.message?.payload), ...(html === "" ? {} : { html }) };
+}
+
 /**
  * Sends exactly `draft.raw`, the bytes `readDraft` returned and the caller checked, through
  * `messages/send` (keeping the thread), then deletes the draft as `drafts/send` would have. Nothing
@@ -587,6 +603,6 @@ async function sentTo(a: AccountRef, addresses: readonly string[]): Promise<stri
   return found;
 }
 
-const service: SendService = { prepare, deliver, readDraft, sendDraft, sentTo };
+const service: SendService = { prepare, deliver, readDraft, readDraftText, sendDraft, sentTo };
 
 export const googleSend = provide(SEND, service);

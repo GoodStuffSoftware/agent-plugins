@@ -171,7 +171,21 @@ export async function gateApproval(
   if (seen.size !== 1 || !account) {
     throw new Error(`${def.name}: an action held for approval must address exactly one account`);
   }
-  const held = await ctx.pending.create({ tool: def.name, account, params: args, preview });
+  let view: unknown;
+  if (def.approval.view) {
+    try {
+      view = await def.approval.view(args as never, gated);
+    } catch (e) {
+      console.error(internalErrorLine(`${def.name} approval view`, e, {}));
+    }
+  }
+  const held = await ctx.pending.create({
+    tool: def.name,
+    account,
+    params: args,
+    preview,
+    ...(view === undefined ? {} : { view }),
+  });
   if (def.approval.onHeld) {
     // The action is queued and the caller must learn its id, so a failing hook is logged only.
     try {

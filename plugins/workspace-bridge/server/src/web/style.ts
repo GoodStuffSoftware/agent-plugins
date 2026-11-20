@@ -131,10 +131,18 @@ const CARD_LAYOUTS = [
   ]),
 ].join("\n");
 
+/**
+ * The page background, drawn in this one place for every page (`page()` in html.ts is the only
+ * page shell, so accounts, approvals, the audit log, consent, notices, error pages and the public
+ * pages all get it). A theme can still replace `--wb-page-bg`.
+ */
+const BACKGROUND = "body{background:var(--wb-bg);background:var(--wb-page-bg)}";
+
 const RULES = `
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;min-height:100vh;font-family:var(--wb-font-body);font-size:var(--wb-font-size);line-height:var(--wb-line-height);color:var(--wb-text);background:var(--wb-bg);background:var(--wb-page-bg)}
+body{margin:0;min-height:100vh;font-family:var(--wb-font-body);font-size:var(--wb-font-size);line-height:var(--wb-line-height);color:var(--wb-text)}
+${BACKGROUND}
 a{color:var(--wb-link);text-underline-offset:.15em}
 .site-header{background:var(--wb-header-bg);color:var(--wb-header-text);border-bottom:1px solid var(--wb-header-border)}
 .site-header-inner{max-width:var(--wb-content-width);margin:0 auto;padding:var(--wb-space-s) var(--wb-space-m);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:var(--wb-space-xs) var(--wb-space-m);min-height:3.25rem}
@@ -232,6 +240,12 @@ td input{min-height:var(--wb-tap)}
 .field-row{display:flex;flex-wrap:wrap;gap:var(--wb-space-s);align-items:center;margin:0 0 var(--wb-space-m)}
 .field-row>*{margin:0}
 .field-row input[name=value]{flex:1 1 14rem}
+.mail-head{margin:0 0 var(--wb-space-s)}
+.mail-files{margin:0}
+.mail-note{margin:var(--wb-space-s) 0 0;font-size:.92rem}
+.mail-text{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--wb-surface-2);color:var(--wb-text);border:1px solid var(--wb-border);border-radius:var(--wb-radius);padding:var(--wb-space-m);margin:var(--wb-space-m) 0 0}
+.mail-quote{margin-top:var(--wb-space-s);color:var(--wb-text-muted);border-left:.3rem solid var(--wb-border-strong)}
+.mail-frame{display:block;width:100%;height:30rem;max-height:75vh;margin:var(--wb-space-m) 0 0;border:1px solid var(--wb-border-strong);border-radius:var(--wb-radius);background:#fff;resize:vertical}
 .page-intro{color:var(--wb-text-muted);margin:calc(var(--wb-space-s) * -1) 0 var(--wb-space-m)}
 ${CARD_LAYOUTS}
 @media (min-width:34rem){

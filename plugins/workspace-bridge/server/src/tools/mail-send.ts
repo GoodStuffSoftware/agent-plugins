@@ -15,6 +15,7 @@
 
 import { z } from "zod";
 import { ToolError } from "../core/errors";
+import { buildHeldMailView, type HeldMailAction, type HeldMailView } from "../core/held-view";
 import { accountKey } from "../core/ids";
 import { parseAddresses } from "../core/mime";
 import {
@@ -27,7 +28,13 @@ import type { SendAsAddress } from "../core/send-as";
 import { config } from "../env";
 import { googleSend } from "../providers/google/mail-send";
 import { defineTool, type Family, type HeldAction, type ToolContext } from "../registry/types";
-import { type AttachmentTotals, SEND, type SentMessage } from "../services/mail-send";
+import {
+  type AttachmentTotals,
+  type DraftEnvelope,
+  type PreparedMessage,
+  SEND,
+  type SentMessage,
+} from "../services/mail-send";
 import type { AccountRef } from "../services/types";
 import {
   accountParam,
@@ -323,39 +330,75 @@ async function preview(
   return { account: a.label, address: a.address, ...rest };
 }
 
+// The preview (what the caller sees) and the view (what the approval page shows) of one held call
+// need the same reads of Google: the message as it will be built, a draft. Each is read once per
+// call and shared, keyed by the call's `args` object; a failed read is `undefined`, never a throw.
+
+const preparedMemo = new WeakMap<object, Promise<PreparedMessage | undefined>>();
+const draftMemo = new WeakMap<object, Promise<DraftEnvelope | undefined>>();
+
+function heldPrepared(
+  args: object,
+  make: () => Promise<PreparedMessage>,
+): Promise<PreparedMessage | undefined> {
+  let p = preparedMemo.get(args);
+  if (!p) {
+    p = make().catch(() => undefined);
+    preparedMemo.set(args, p);
+  }
+  return p;
+}
+
+function heldDraft(
+  ctx: ToolContext,
+  args: object,
+  a: AccountRef,
+  draftId: string,
+): Promise<DraftEnvelope | undefined> {
+  let p = draftMemo.get(args);
+  if (!p) {
+    p = ctx
+      .use(SEND, a)
+      .readDraft(a, idOf(ctx, draftId).providerId, sendCap(ctx))
+      .catch(() => undefined);
+    draftMemo.set(args, p);
+  }
+  return p;
+}
+
 /** A draft's own recipients and subject for the approval summary; empty when it cannot be read. */
 async function draftSummary(
   ctx: ToolContext,
-  selector: string | undefined,
+  args: { account?: string | undefined },
   draftId: string,
 ): Promise<Record<string, unknown>> {
   try {
-    const id = idOf(ctx, draftId);
-    const a = await accountFor(ctx, selector, id.shortId);
-    const d = await ctx.use(SEND, a).readDraft(a, id.providerId, sendCap(ctx));
-    return { to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject };
+    const a = await accountFor(ctx, args.account, idOf(ctx, draftId).shortId);
+    const d = await heldDraft(ctx, args, a, draftId);
+    return d ? { to: d.to, cc: d.cc, bcc: d.bcc, subject: d.subject } : {};
   } catch {
     return {};
   }
 }
 
-/** The recipients a reply will really have, for the approval summary; empty when unreadable. */
-async function replySummary(
-  ctx: ToolContext,
-  args: {
-    account?: string | undefined;
-    messageId: string;
-    replyAll?: boolean | undefined;
-    to?: readonly string[] | undefined;
-    cc?: readonly string[] | undefined;
-    bcc?: readonly string[] | undefined;
-  },
-): Promise<Record<string, unknown>> {
-  try {
+type ReplyArgs = {
+  account?: string | undefined;
+  messageId: string;
+  replyAll?: boolean | undefined;
+  to?: readonly string[] | undefined;
+  cc?: readonly string[] | undefined;
+  bcc?: readonly string[] | undefined;
+  body?: string | undefined;
+  htmlBody?: string | undefined;
+};
+
+/** The reply as it will be built, or undefined when the original cannot be read. */
+async function replyPrepared(ctx: ToolContext, args: ReplyArgs): Promise<PreparedMessage | undefined> {
+  return heldPrepared(args, async () => {
     const id = idOf(ctx, args.messageId);
     const a = await accountFor(ctx, args.account, id.shortId);
     const self = (await ctx.sendAs.list(a)).map((x) => x.email);
-    const p = await ctx.use(SEND, a).prepare(a, {
+    return ctx.use(SEND, a).prepare(a, {
       kind: "reply",
       messageId: id.providerId,
       replyAll: args.replyAll === true,
@@ -363,11 +406,104 @@ async function replySummary(
       cc: nonEmpty(args.cc),
       bcc: nonEmpty(args.bcc),
       selfAddresses: self,
+      ...(args.body === undefined ? {} : { body: args.body }),
+      ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
     });
-    return { to: p.to, cc: p.cc, bcc: p.bcc, subject: p.subject };
+  });
+}
+
+/** The recipients a reply will really have, for the approval summary; empty when unreadable. */
+async function replySummary(ctx: ToolContext, args: ReplyArgs): Promise<Record<string, unknown>> {
+  const p = await replyPrepared(ctx, args);
+  return p ? { to: p.to, cc: p.cc, bcc: p.bcc, subject: p.subject } : {};
+}
+
+/** The From line of a message: the send-as address it will go out from, with its display name. */
+async function fromLine(ctx: ToolContext, a: AccountRef, from: string | undefined): Promise<string> {
+  try {
+    const f = await ctx.sendAs.assertFrom(a, from);
+    return f.displayName ? `${f.displayName} <${f.email}>` : f.email;
   } catch {
-    return {};
+    return from ?? a.address;
   }
+}
+
+type ViewArgs = {
+  from?: string | undefined;
+  to?: readonly string[] | undefined;
+  cc?: readonly string[] | undefined;
+  bcc?: readonly string[] | undefined;
+  attachments?: Parameters<typeof attachmentsPreview>[0];
+};
+
+/**
+ * The held email for the approval page (`approval.view`): From, recipients, subject, both text
+ * forms, the quoted original of a reply or forward and the file names. `prepared` is the message
+ * as it will be built; without it (the original could not be read) the caller's own text is shown.
+ */
+async function heldMailView(
+  ctx: ToolContext,
+  action: HeldMailAction,
+  a: AccountRef,
+  args: ViewArgs,
+  prepared: PreparedMessage | undefined,
+  own: { subject?: string | undefined; body: string; html?: string | undefined },
+): Promise<HeldMailView> {
+  const files = [
+    ...attachmentsPreview(args.attachments).map((f) => ({
+      name: f.filename ?? "",
+      type: f.mimeType ?? "",
+      bytes: f.approxBytes,
+    })),
+    ...(prepared?.carried?.files ?? []).map((f) => ({
+      name: f.filename,
+      type: f.mimeType,
+      bytes: f.size,
+      carried: true,
+    })),
+  ];
+  return buildHeldMailView({
+    action,
+    from: await fromLine(ctx, a, args.from),
+    to: prepared?.to ?? nonEmpty(args.to),
+    cc: prepared?.cc ?? nonEmpty(args.cc),
+    bcc: prepared?.bcc ?? nonEmpty(args.bcc),
+    subject: prepared?.subject ?? own.subject ?? "",
+    body: prepared?.body ?? own.body,
+    html: prepared ? prepared.htmlBody : own.html,
+    quote: prepared?.quote,
+    files,
+    quoteUnavailable: action !== "send" && prepared === undefined,
+  });
+}
+
+/** The view of a held draft send: the draft as Gmail has it now (best effort for its text). */
+async function draftView(
+  ctx: ToolContext,
+  a: AccountRef,
+  args: ViewArgs & { draftId: string },
+): Promise<HeldMailView> {
+  const draft = await heldDraft(ctx, args, a, args.draftId);
+  let text: { text: string; html?: string | undefined } | undefined;
+  try {
+    text = await ctx.use(SEND, a).readDraftText?.(a, idOf(ctx, args.draftId).providerId);
+  } catch {
+    text = undefined;
+  }
+  return buildHeldMailView({
+    action: "send",
+    from: draft?.from ?? (await fromLine(ctx, a, args.from)),
+    to: draft?.to ?? [],
+    cc: draft?.cc ?? [],
+    bcc: draft?.bcc ?? [],
+    subject: draft?.subject ?? "",
+    body: text?.text ?? "",
+    html: text?.html,
+    ...(draft
+      ? { fileCount: draft.attachmentTotals.count, fileBytes: draft.attachmentTotals.bytes }
+      : {}),
+    bodyUnavailable: text === undefined,
+  });
 }
 
 /** The strings of a preview field that holds a list of addresses. */
@@ -485,7 +621,7 @@ const sendMessage = defineTool({
         from: args.from ?? null,
         ...heldNote(args),
         ...(args.draftId
-          ? { draftId: args.draftId, ...(await draftSummary(ctx, args.account, args.draftId)) }
+          ? { draftId: args.draftId, ...(await draftSummary(ctx, args, args.draftId)) }
           : {
               to: nonEmpty(args.to),
               cc: nonEmpty(args.cc),
@@ -494,6 +630,31 @@ const sendMessage = defineTool({
               attachments: attachmentsPreview(args.attachments),
             }),
       }),
+    view: async (args, ctx) => {
+      const ref = args.draftId ?? args.replyToMessageId ?? args.replyThreadId;
+      const a = await accountFor(ctx, args.account, ref ? idOf(ctx, ref).shortId : undefined);
+      if (args.draftId) return draftView(ctx, a, { ...args, draftId: args.draftId });
+      const prepared = await heldPrepared(args, () =>
+        ctx.use(SEND, a).prepare(a, {
+          kind: "send",
+          to: nonEmpty(args.to),
+          cc: nonEmpty(args.cc),
+          bcc: nonEmpty(args.bcc),
+          ...(args.subject === undefined ? {} : { subject: args.subject }),
+          ...(args.body === undefined ? {} : { body: args.body }),
+          ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
+          ...(args.replyThreadId ? { replyThreadId: idOf(ctx, args.replyThreadId).providerId } : {}),
+          ...(args.replyToMessageId
+            ? { replyToMessageId: idOf(ctx, args.replyToMessageId).providerId }
+            : {}),
+        }),
+      );
+      return heldMailView(ctx, "send", a, args, prepared, {
+        subject: args.subject,
+        body: args.body ?? "",
+        html: args.htmlBody,
+      });
+    },
     // After the pending action exists, so a failed hold leaves no row, and with its id.
     onHeld: (_args, ctx, held) => auditHeld(ctx, "send_message", held),
   },
@@ -640,6 +801,13 @@ const reply = defineTool({
         attachments: attachmentsPreview(args.attachments),
         ...(await replySummary(ctx, args)),
       }),
+    view: async (args, ctx) => {
+      const a = await accountFor(ctx, args.account, idOf(ctx, args.messageId).shortId);
+      return heldMailView(ctx, "reply", a, args, await replyPrepared(ctx, args), {
+        body: args.body ?? "",
+        html: args.htmlBody,
+      });
+    },
     onHeld: (_args, ctx, held) => auditHeld(ctx, "reply", held),
   },
   async handler(args, ctx) {
@@ -751,6 +919,27 @@ const forward = defineTool({
         includeOriginalAttachments: args.includeAttachments !== false,
         attachments: attachmentsPreview(args.attachments),
       }),
+    view: async (args, ctx) => {
+      const id = idOf(ctx, args.messageId);
+      const a = await accountFor(ctx, args.account, id.shortId);
+      const prepared = await heldPrepared(args, () =>
+        ctx.use(SEND, a).prepare(a, {
+          kind: "forward",
+          messageId: id.providerId,
+          to: nonEmpty(args.to),
+          cc: nonEmpty(args.cc),
+          bcc: nonEmpty(args.bcc),
+          ...(args.forwardText === undefined ? {} : { forwardText: args.forwardText }),
+          ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
+          includeOriginalAttachments: args.includeAttachments !== false,
+          maxAttachmentBytes: sendCap(ctx),
+        }),
+      );
+      return heldMailView(ctx, "forward", a, args, prepared, {
+        body: args.forwardText ?? "",
+        html: args.htmlBody,
+      });
+    },
     onHeld: async (args, ctx, held) => {
       // A forward's preview has no subject; read the original's for the row, best effort.
       let subject: string | undefined;

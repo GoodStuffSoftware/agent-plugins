@@ -366,7 +366,18 @@ describe("send_message", () => {
     expect(r.subject).toBe("Re: Quarterly plan");
     expect(d.to).toEqual(["dan@example.net"]);
     expect(d.subject).toBe("Draft subject");
-    expect(JSON.stringify(rows.results)).not.toContain("SECRET-BODY-TEXT");
+    // The body is kept for the owner's approval page only, under `_view`; the summary beside it
+    // (what a client sees) has none, and the reply's view carries the quoted original.
+    const { _view: rv, ...rSummary } = r;
+    expect(JSON.stringify(rSummary)).not.toContain("SECRET-BODY-TEXT");
+    expect(rv).toMatchObject({
+      kind: "mail",
+      action: "reply",
+      from: expect.stringContaining("@"),
+      body: "SECRET-BODY-TEXT",
+      quote: { plain: expect.stringContaining("Here is the plan for next quarter.") },
+    });
+    expect(d._view).toMatchObject({ kind: "mail", action: "send", subject: "Draft subject" });
   });
 
   it("holds the send for approval and sends nothing", async () => {
@@ -397,7 +408,11 @@ describe("send_message", () => {
       to: ["bob@example.com"],
       subject: "Held",
     });
-    expect(row?.preview).not.toContain("SECRET-BODY-TEXT");
+    const stored = JSON.parse(row?.preview ?? "{}");
+    const { _view: view, ...summary } = stored;
+    expect(JSON.stringify(summary)).not.toContain("SECRET-BODY-TEXT");
+    expect(JSON.stringify(res.json)).not.toContain("SECRET-BODY-TEXT");
+    expect(view).toMatchObject({ kind: "mail", body: "SECRET-BODY-TEXT", to: ["bob@example.com"] });
   });
 
   it("refuses at once, queuing nothing, a send that could never go out: no recipient, sending off", async () => {

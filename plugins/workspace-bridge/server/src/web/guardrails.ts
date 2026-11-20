@@ -10,6 +10,7 @@ import { getAuth } from "../auth/server";
 import { checkCsrf, csrfToken, readSession, type Session } from "../auth/session";
 import { createAccountResolver, loadAccountsWithState } from "../core/accounts";
 import { readAudit, writeAudit } from "../core/audit";
+import { parseHeldView } from "../core/held-view";
 import {
   first,
   getAccount,
@@ -33,6 +34,8 @@ import { REGISTRY, type Registry } from "../registry/compile";
 import { type RequestScope, toolContext } from "../registry/context";
 import type { ToolContext } from "../registry/types";
 import { htmlResponse, page, type SafeHtml } from "./html";
+import { APPROVAL_PAGE_CSP, type MailPreviewData } from "./preview-views";
+import { sanitizeEmailHtml } from "./sanitize-html";
 import { approvalView, auditView } from "./views";
 
 const PENDING_ID = /^pa_[a-z2-7]{16}$/;
@@ -221,6 +224,27 @@ function allowRequest(decision: string, form: FormData, fresh: readonly string[]
   }
 }
 
+/** The held email's view with its HTML sanitized, or undefined for a row that has no view. */
+async function mailPreviewOf(row: PendingActionRow): Promise<MailPreviewData | undefined> {
+  const view = parseHeldView(row.preview);
+  if (!view) return undefined;
+  try {
+    return {
+      view,
+      safeHtml: view.html === undefined ? undefined : await sanitizeEmailHtml(view.html),
+      safeQuoteHtml:
+        view.html !== undefined && view.quote && view.quote.html !== ""
+          ? await sanitizeEmailHtml(view.quote.html)
+          : undefined,
+    };
+  } catch (e) {
+    // A sanitizer failure shows the plain text instead; the HTML is never passed through raw.
+    console.error(internalErrorLine("approval preview", e, {}));
+    const { html: _dropped, ...plain } = view;
+    return { view: plain, safeHtml: undefined, safeQuoteHtml: undefined };
+  }
+}
+
 async function approvalBody(env: Env, row: PendingActionRow, csrf: string): Promise<SafeHtml> {
   const info = pendingInfo(row, nowSeconds());
   const account = row.account_id ? await getAccount(env.DB, row.owner_id, row.account_id) : null;
@@ -237,6 +261,7 @@ async function approvalBody(env: Env, row: PendingActionRow, csrf: string): Prom
     expires: iso(row.expires_at),
     account: account ? { label: account.label, address: account.address } : null,
     preview: info.preview,
+    mail: await mailPreviewOf(row),
     previewJson: JSON.stringify(info.preview, null, 2) ?? "null",
     args: storedArgs(row.params),
     resultJson: info.result === null ? null : JSON.stringify(info.result, null, 2),
@@ -280,9 +305,12 @@ export function guardrailsRoutes(registry: Registry = REGISTRY): Hono<{ Bindings
     const row = PENDING_ID.test(id) ? await loadPending(env.DB, session.ownerId, id) : null;
     if (!row) return message(404, "Not found", "No pending action has that id.");
     const csrf = await csrfToken(env, session);
-    return noStore(
+    const res = noStore(
       htmlResponse(page("Approve an action", await approvalBody(env, row, csrf), { nav: "other" })),
     );
+    // The held email's own frame is local (srcdoc); everything else stays as strict as any page.
+    res.headers.set("Content-Security-Policy", APPROVAL_PAGE_CSP);
+    return res;
   });
 
   routes.post("/approvals/:id", async (c) => {
