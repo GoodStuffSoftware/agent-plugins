@@ -245,10 +245,11 @@ td input{min-height:var(--wb-tap)}
 .mail-note{margin:var(--wb-space-s) 0 0;font-size:.92rem}
 .mail-text{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--wb-surface-2);color:var(--wb-text);border:1px solid var(--wb-border);border-radius:var(--wb-radius);padding:var(--wb-space-m);margin:var(--wb-space-m) 0 0}
 .mail-quote{margin-top:var(--wb-space-s);color:var(--wb-text-muted);border-left:.3rem solid var(--wb-border-strong)}
-.mail-frame{display:block;width:100%;height:30rem;max-height:75vh;margin:var(--wb-space-m) 0 0;border:1px solid var(--wb-border-strong);border-radius:var(--wb-radius);background:#fff;resize:vertical}
+.mail-frame{display:block;width:100%;height:max(20rem,60vh);margin:var(--wb-space-m) 0 0;border:1px solid var(--wb-border-strong);border-radius:var(--wb-radius);background:#fff;resize:vertical}
 .page-intro{color:var(--wb-text-muted);margin:calc(var(--wb-space-s) * -1) 0 var(--wb-space-m)}
 ${CARD_LAYOUTS}
 @media (min-width:34rem){
+.mail-frame{height:max(24rem,70vh)}
 .facts{grid-template-columns:7.5rem 1fr;column-gap:var(--wb-space-m)}
 .facts dt{margin:0;padding:.3rem 0 0}
 .facts dd{margin:0;padding:0 0 var(--wb-space-s);margin-bottom:var(--wb-space-s)}

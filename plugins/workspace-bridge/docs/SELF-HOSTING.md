@@ -278,6 +278,8 @@ Then run `/mcp` inside Claude Code, choose `workspace-bridge` and authenticate. 
 
 Claude desktop: connectors added in claude.ai show up in the desktop app when you sign in with the same account.
 
+Signing in from a second device or a second claude.ai account does not sign out the first. Every approval on the consent page makes a new grant and leaves the earlier ones alone. This matters because every claude.ai account reaches the server with the same client id, redirect URI and owner, so a server that replaced the old grant at each approval would sign one account out whenever you used the other. A grant ends when its refresh token has gone unused for 30 days. The bridge has no page that lists or revokes MCP grants.
+
 For routines, add a second connector at the `/mcp/ro` URL and give the routine only that one. Name it differently:
 
 ```sh

@@ -30,12 +30,14 @@ import { app } from "../src/web/app";
 import { guardrailsRoutes } from "../src/web/guardrails";
 import {
   APPROVAL_PAGE_CSP,
+  fileTypeLabel,
   mailPreviewView,
   PREVIEW_FRAME_CSP,
   previewDocument,
   previewFactRows,
 } from "../src/web/preview-views";
 import { safeHref, sanitizeCss, sanitizeEmailHtml } from "../src/web/sanitize-html";
+import { BASE_CSS } from "../src/web/style";
 import fx from "./fixtures/google/mail-send.json";
 import {
   type GoogleRoute,
@@ -464,6 +466,31 @@ describe("mailPreviewView", () => {
     expect(PREVIEW_FRAME_CSP).toContain("img-src data:");
     expect(PREVIEW_FRAME_CSP).not.toMatch(/https?:|\*/);
     expect(doc).toContain('<meta name="color-scheme" content="light">');
+  });
+
+  it("labels a long MIME type briefly and keeps the full type in the tooltip", () => {
+    const xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+    expect(fileTypeLabel(xlsx, "numbers.xlsx")).toBe("Excel");
+    expect(fileTypeLabel("application/pdf", "plan.pdf")).toBe("PDF");
+    expect(fileTypeLabel("application/x-unknown-thing", "data.parq")).toBe("PARQ");
+    expect(fileTypeLabel("application/octet-stream", "")).toBe("octet-stream");
+    expect(fileTypeLabel("application/vnd.some-very-long-vendor-type", "")).toBe("some-very-l...");
+    expect(fileTypeLabel("", "orig")).toBe("file");
+    const view = buildHeldMailView({
+      ...base,
+      files: [{ name: "numbers.xlsx", type: xlsx, bytes: 2048 }],
+    });
+    const out = mailPreviewView({ view, safeHtml: undefined, safeQuoteHtml: undefined }).value;
+    expect(out).toContain(`title="${xlsx}"`);
+    expect(out).toContain("(Excel, about 2.0 KB)");
+    expect(out).not.toContain(`(${xlsx}`);
+  });
+
+  it("sizes the preview frame by the viewport, taller on a desktop, and keeps the resize handle", () => {
+    expect(BASE_CSS).toMatch(/\.mail-frame\{[^}]*height:max\(20rem,60vh\)/);
+    expect(BASE_CSS).toMatch(/\.mail-frame\{height:max\(24rem,70vh\)\}/);
+    expect(BASE_CSS).toMatch(/\.mail-frame\{[^}]*resize:vertical/);
+    expect(BASE_CSS).not.toMatch(/\.mail-frame\{[^}]*height:30rem/);
   });
 });
 

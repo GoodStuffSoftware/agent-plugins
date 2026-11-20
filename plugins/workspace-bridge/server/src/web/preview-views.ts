@@ -5,7 +5,7 @@
 // Content-Security-Policy, so a miss in the sanitizer still cannot run a script or load anything.
 
 import type { HeldMailView } from "../core/held-view";
-import { html, type SafeHtml } from "./html";
+import { escapeHtml, html, raw, type SafeHtml } from "./html";
 
 /** The CSP the approval page sets on itself: the base policy, plus the one local frame it embeds. */
 export const APPROVAL_PAGE_CSP =
@@ -50,6 +50,40 @@ const people = (label: string, list: readonly string[]): SafeHtml =>
     ? html``
     : html`<dt>${label}</dt><dd>${list.length === 1 ? list[0] : html`<ul>${list.map((x) => html`<li>${x}</li>`)}</ul>`}</dd>`;
 
+const FRIENDLY_TYPES: Readonly<Record<string, string>> = {
+  "application/pdf": "PDF",
+  "application/msword": "Word",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "Word",
+  "application/vnd.ms-excel": "Excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "Excel",
+  "application/vnd.ms-powerpoint": "PowerPoint",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": "PowerPoint",
+  "application/zip": "ZIP",
+  "application/json": "JSON",
+  "text/plain": "Text",
+  "text/csv": "CSV",
+  "text/html": "HTML",
+  "image/jpeg": "JPEG",
+  "image/png": "PNG",
+  "image/gif": "GIF",
+};
+
+/**
+ * A short label for a file's MIME type so a long one (the Office types are 70 characters) does
+ * not wrap: a friendly name for the common types, else the file name's extension, else the part
+ * after the slash, cut to 12 characters. The full type goes in the tooltip.
+ */
+export function fileTypeLabel(mime: string, name: string): string {
+  const type = mime.trim().toLowerCase().split(";")[0]?.trim() ?? "";
+  const friendly = Object.hasOwn(FRIENDLY_TYPES, type) ? FRIENDLY_TYPES[type] : undefined;
+  if (friendly) return friendly;
+  const ext = /\.([a-z0-9]{1,5})$/i.exec(name)?.[1];
+  if (ext) return ext.toUpperCase();
+  if (type === "") return "file";
+  const sub = type.slice(type.lastIndexOf("/") + 1).replace(/^(x-|vnd\.)/, "");
+  return sub.length > 12 ? `${sub.slice(0, 11)}...` : sub;
+}
+
 function files(v: HeldMailView): SafeHtml {
   if (v.files.length === 0 && !v.fileCount) return html``;
   if (v.files.length === 0) {
@@ -57,7 +91,7 @@ function files(v: HeldMailView): SafeHtml {
   }
   return html`<dt>Attachments</dt><dd><ul class="mail-files">${v.files.map(
     (f) =>
-      html`<li>${f.name === "" ? "(unnamed)" : f.name} <span class="muted">(${f.type === "" ? "file" : f.type}, about ${bytesText(f.bytes)}${f.carried ? ", from the original message" : ""})</span></li>`,
+      html`<li>${f.name === "" ? "(unnamed)" : f.name} <span class="muted"${f.type === "" ? "" : raw(` title="${escapeHtml(f.type)}"`)}>(${fileTypeLabel(f.type, f.name)}, about ${bytesText(f.bytes)}${f.carried ? ", from the original message" : ""})</span></li>`,
   )}</ul></dd>`;
 }
 
