@@ -365,7 +365,10 @@ export async function runWaiter(ctx, o = {}) {
   const liveStep = async (all) => {
     const c = rcCfg();
     if (!c || c.liveRelink !== 'idle-only') return;
-    try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
+    // the switch sweep (all) asks for the process list up to three times, with a longer limit: right after a switch the machine is busy, and an
+    // unreadable list (logged as `unknown N`) means nothing may be written (0.5.10; 2026-11-20: 43 sessions, 0 cleared)
+    const retry = all ? { liveTries: 3, liveRetryMs: 4000, cimTimeoutMs: 25000 } : {};
+    try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...retry, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
     catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); }
   };
   /**
