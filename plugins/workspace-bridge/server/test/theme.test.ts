@@ -198,7 +198,7 @@ describe("approval page", () => {
     expect(out).not.toContain("<dt>From</dt>");
   });
 
-  it("shows where a filter forwards to, and keeps the exact arguments open", () => {
+  it("shows where a filter forwards to, and keeps the exact arguments in a collapsed Details", () => {
     const out = approvalView(
       approval({
         tool: "create_filter",
@@ -206,8 +206,9 @@ describe("approval page", () => {
         preview: { summary: "Forwards mail.", action: { forward: "x@example.net" } },
       }),
     ).value;
-    expect(out.split("<details")[0]).toContain("forward: x@example.net");
-    expect(out).toContain('<details class="card" open>');
+    expect(out.split("<details")[0]).toContain("<dt>Forwards it to</dt><dd>x@example.net</dd>");
+    expect(out).toContain('<details class="card">');
+    expect(out).not.toContain('<details class="card" open>');
   });
 
   it("offers no buttons once decided", () => {
