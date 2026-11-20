@@ -31,7 +31,7 @@ function world({ second = false, answered = false } = {}) {
   for (let i = 1; i <= 2; i++) {
     files.push(putRecord(fA.path, i, { lastActivityAt: iso(r.ctx.now() - i * 3600_000), remoteControlUserEnabled: true, bridgeSessionIds: [`s${i}`], remoteControlAutoEligible: false }, clock.tick()));
     mkdirSync(join(projects, keyOf(i)), { recursive: true });
-    const bridge = i === 1 ? JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', i), bridgeSessionId: 'cse_stale', noHistoryBackfill: true, ownerAccountUuid: A, lastSequenceNum: 3 }) + '\n' : '';
+    const bridge = i === 1 ? JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', i), bridgeSessionId: 'cse_prev', lastSequenceNum: 2 }) + '\n' + JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', i), bridgeSessionId: 'cse_stale', noHistoryBackfill: true, ownerAccountUuid: A, lastSequenceNum: 3 }) + '\n' : '';
     writeFileSync(join(projects, keyOf(i), `${uuid('d', i)}.jsonl`), `{"type":"user","message":"hi"}\n${bridge}{"type":"assistant","message":"yo"}\n`);
   }
   if (second) { const fB = addFolder(r.store, B, OB); putRecord(fB.path, 3, {}, clock.tick()); }

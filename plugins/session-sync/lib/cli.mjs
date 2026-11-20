@@ -37,8 +37,8 @@ import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './a
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
-import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass } from './accounts/rcrestore.mjs';
-import { rcRepair } from './accounts/rcrepair.mjs';
+import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass, rcSweep } from './accounts/rcrestore.mjs';
+import { rcRepair, turnEndHook, runTurnEnd } from './accounts/rcrepair.mjs';
 import { spawnPlan, spawnFixStep, spawnLook, spawnLine } from './accounts/rcspawn.mjs';
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
@@ -671,11 +671,46 @@ async function liveRelinkCommand(ctx, args) {
   const lines = [];
   if (!r.ran) lines.push(r.reason === 'disabled' ? 'The live relink is off (rcRestore.enabled or rcRestore.liveRelink). Nothing was changed. A --dry-run still shows what it would do.' : `Nothing done: ${r.reason}.`);
   else {
-    for (const c of dry ? r.wouldClear : r.cleared) lines.push(`${dry ? 'would clear' : 'cleared'} ${c.id.replace(/^local_/, '').slice(0, 8)} "${c.title}" (${c.why === 'foreign' ? 'link minted under another account' : 'noHistoryBackfill link'})`);
+    for (const c of dry ? r.wouldClear : r.cleared) lines.push(`${dry ? 'would clear' : 'cleared'} ${c.id.replace(/^local_/, '').slice(0, 8)} "${c.title}" (${c.why === 'foreign' ? 'link minted under another account' : c.why === 'stale' ? 'link minted before this sign-in' : 'noHistoryBackfill link'})`);
     lines.push(`${dry ? 'Dry run: ' : ''}${dry ? r.wouldClear.length : r.cleared.length} ${dry ? 'would be cleared' : 'cleared'} of ${r.candidates} stale; skipped live ${r.skippedLive}, quiet ${r.quiet}, mid-turn ${r.running}, unknown ${r.unknown}${r.undated ? `, undated (left alone) ${r.undated}` : ''}${r.deferred ? `, ${dry ? 'beyond the limit of one pass' : 'over the limit'} ${r.deferred}` : ''}${dry ? '' : `, raced ${r.raced}`}.`);
   }
   emit(facts, lines);
   return 0;
+}
+
+/**
+ * `accounts rc-sweep [--before <iso>] [--dry-run] [--json]` (0.5.10): the live relink by hand for every session of the signed-in account whose
+ * last link was minted before the cutoff (default: the start of the current sign-in), whatever account minted it, plus the noHistoryBackfill and
+ * foreign links. Skips a session whose CLI runs (or when the process list cannot be read), backs each transcript up first (as rc-restore does),
+ * prints one line per candidate and a summary. Works whatever rcRestore.enabled is.
+ */
+async function rcSweepCommand(ctx, args) {
+  const dry = args.includes('--dry-run');
+  const bi = args.indexOf('--before');
+  let before;
+  if (bi >= 0) {
+    before = Date.parse(args[bi + 1] ?? '');
+    if (!Number.isFinite(before)) { console.error('Usage: accounts rc-sweep [--before <iso date-time>] [--dry-run] [--json]  (--before needs a date-time such as 2026-11-20T18:09:00Z)'); return 2; }
+  }
+  const r = await rcSweep(ctx, { before, dryRun: dry, log });
+  const sessions = r.sessions ?? [];
+  const facts = {
+    ok: r.ran, command: 'rc-sweep', dryRun: dry, ran: r.ran, reason: r.reason ?? null, acct: r.acct,
+    cutoff: Number.isFinite(r.cutoff) ? new Date(r.cutoff).toISOString() : null, records: r.records ?? 0, candidates: r.candidates,
+    cleared: r.cleared.length, wouldClear: r.wouldClear.length, skippedLive: r.skippedLive, quiet: r.quiet, running: r.running, unknown: r.unknown, raced: r.raced, failed: r.failed,
+    undated: r.undated, undatedStale: r.undatedStale ?? 0,
+    sessions: sessions.map((s) => ({ id: s.id, title: s.title, why: s.why, outcome: s.outcome })),
+  };
+  const lines = [];
+  if (!r.ran) lines.push(`Nothing done: ${r.reason}.`);
+  else {
+    const why = (w) => (w === 'foreign' ? 'link minted under another account' : w === 'stale' ? 'link minted before this sign-in' : 'noHistoryBackfill link');
+    for (const s of sessions) lines.push(`${s.outcome} ${s.id.replace(/^local_/, '').slice(0, 8)} "${s.title}" (${why(s.why)})`);
+    lines.push(`${dry ? 'Dry run: ' : ''}cutoff ${facts.cutoff ?? 'none known (only noHistoryBackfill and foreign links count)'}; ${dry ? r.wouldClear.length + ' would be cleared' : r.cleared.length + ' cleared'} of ${r.candidates} stale; skipped live ${r.skippedLive}, quiet ${r.quiet}, mid-turn ${r.running}, unknown ${r.unknown}${r.unknown ? ' (the process list could not be read: nothing was written for those)' : ''}, raced ${r.raced}, failed ${r.failed}${r.undatedStale ? `; ${r.undatedStale} undated link(s) judged by the transcript's modified time` : ''}.`);
+    if (!dry && r.cleared.length) lines.push('Backups are under the accounts folder, rc-restore/backup/<stamp>/. Each cleared session mints a fresh link, named after its title, on its next connect.');
+  }
+  emit(facts, lines);
+  return r.ran && r.failed === 0 && !r.unknown ? 0 : 1;   // unknown: the process list could not be read, so nothing was written
 }
 
 /**
@@ -842,11 +877,20 @@ async function accountsCommand(sub, args) {
   // the file-side steps of the random-Remote-Control-name repair for one session (the skill drives the app-side steps)
   if (sub === 'rc-repair') {
     const idArg = args.find((a) => !a.startsWith('--'));
-    if (!idArg) { console.error('Usage: accounts rc-repair <localSessionId|cliSessionId> [--stop-cli] [--dry-run] [--force] [--verify] [--json]'); return 2; }
-    const r = await rcRepair(ctx, { id: idArg, stopCli: has('--stop-cli'), dryRun: has('--dry-run'), force: has('--force'), verify: has('--verify'), platform: platform(), log });
+    if (!idArg) { console.error('Usage: accounts rc-repair <localSessionId|cliSessionId> [--stop-cli | --at-turn-end] [--dry-run] [--force] [--verify] [--json]'); return 2; }
+    const r = await rcRepair(ctx, { id: idArg, stopCli: has('--stop-cli'), dryRun: has('--dry-run'), force: has('--force'), verify: has('--verify'), atTurnEnd: has('--at-turn-end') && !has('--dry-run') && !has('--verify'), platform: platform(), log });
     const { text, ...facts } = r;
     emit({ command: 'rc-repair', ...facts, text }, [text]);
     return r.ok ? 0 : (r.status === 'verify-failed' ? 1 : 3);
+  }
+
+  // 0.5.10: the live relink by hand for every stale link of the signed-in account (accounts rc-sweep [--before <iso>] [--dry-run] [--json])
+  if (sub === 'rc-sweep') return rcSweepCommand(ctx, args);
+
+  // 0.5.10: the helper the Stop hook starts (rc-turn-end): waits about 2 s, stops that session's CLI, clears its stale link, deletes the request.
+  if (sub === 'rc-turn-end-run') {
+    const r = await runTurnEnd(ctx, { cliSessionId: args[0], platform: platform(), log });
+    return r.ran ? 0 : 1;
   }
 
   // sessions started from claude.ai under another account: detach their spawn record (the app must be stopped), or --dry-run to look
@@ -878,7 +922,7 @@ async function accountsCommand(sub, args) {
 
   // hidden: the helper the SessionStart hook starts (detached, hidden). Only the two long-lived entries may be launched.
   if (sub === 'launch-detached') {
-    const ok = args[0] === 'accounts' && (args[1] === 'wait' || args[1] === 'golive-run');
+    const ok = args[0] === 'accounts' && (args[1] === 'wait' || args[1] === 'golive-run' || (args[1] === 'rc-turn-end-run' && /^[0-9a-f-]{36}$/i.test(args[2] ?? '')));
     const r = ok ? launchDetached(args, { ctx }) : { ok: false, method: 'none', error: 'not a launchable command' };
     log(`accounts launch-detached ${args.slice(1, 2).join('')}: ${r.method}${r.ok ? ` pid ${r.pid ?? '?'}` : ` failed (${r.error})`}`);
     return r.ok ? 0 : 1;
@@ -899,7 +943,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-spawn-fix [--dry-run] [--json]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json]');
   return 2;
 }
 
@@ -1142,6 +1186,19 @@ if (cmd === 'rc-wake') {
     // that gave the wake instruction (that one already spends most of the hook's time on the process listings).
     if (!woke && input.session_id && prompt && !prompt.startsWith('/')) spawnLook(makeCtx(), { log, settings });
   } catch (e) { log(`rc-wake failed: ${e?.message || e}`); }
+  process.exit(0);
+}
+
+// The Stop hook (0.5.10): when the session that just finished its turn has a queued `accounts rc-repair <id> --at-turn-end`, start the
+// helper that stops its CLI and clears the stale link (rcrepair.mjs). With no request (every turn) it is one stat and an exit. Independent of
+// rclone and `enabled`; never throws, never blocks or fails a turn, prints nothing.
+if (cmd === 'rc-turn-end') {
+  try {
+    let input = {};
+    try { if (!process.stdin.isTTY) input = JSON.parse(readFileSync(0, 'utf8') || '{}'); } catch { /* no input */ }
+    const ctx = makeCtx();
+    if (ctx.store) turnEndHook(ctx, input, { log });
+  } catch (e) { try { log(`rc-turn-end failed: ${e?.message || e}`); } catch { /* ignore */ } }
   process.exit(0);
 }
 

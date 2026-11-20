@@ -98,12 +98,13 @@ const BRIDGE_MARK = Buffer.from('"type":"bridge-session"');
 const CHUNK = 256 * 1024;
 
 /**
- * The LAST `{"type":"bridge-session", ...}` entry of a transcript, or null. Reads the file backwards in blocks and decodes only the
- * line that holds the marker; no other line is ever decoded or parsed (the CLI re-appends the entry every turn, so it is near the end).
+ * The `{"type":"bridge-session", ...}` entries of a transcript, newest first, each handed to `visit(entry)` until it returns true. Reads the
+ * file backwards in blocks and decodes only the lines that hold the marker; no other line is ever decoded or parsed (the CLI re-appends the
+ * entry every turn, so the last one is near the end).
  */
-export function lastBridgeEntry(file) {
+export function scanBridgeEntries(file, visit) {
   let fd;
-  try { fd = openSync(file, 'r'); } catch { return null; }
+  try { fd = openSync(file, 'r'); } catch { return; }
   try {
     let pos = fstatSync(fd).size;
     let carry = Buffer.alloc(0);
@@ -119,15 +120,55 @@ export function lastBridgeEntry(file) {
         const ls = data.lastIndexOf(10, i) + 1;
         if (ls === 0 && pos > 0) { unresolved = true; break; }          // the line starts in an earlier block
         let le = data.indexOf(10, i); if (le < 0) le = data.length;
-        try { const o = JSON.parse(data.subarray(ls, le).toString('utf8')); if (o && o.type === 'bridge-session') return o; } catch { /* a partial line */ }
+        let o = null;
+        try { o = JSON.parse(data.subarray(ls, le).toString('utf8')); } catch { /* a partial line */ }
+        if (o && o.type === 'bridge-session' && visit(o) === true) return;
         end = ls > 0 ? ls - 1 : 0;
       }
-      if (unresolved) { carry = data; continue; }
+      if (unresolved) { carry = data.subarray(0, end); continue; }   // only what was not visited yet (entries after `end` were handed to visit already)
       const nl = data.indexOf(10);
       carry = nl < 0 ? data : data.subarray(0, nl);                      // the head of a line that began in an earlier block
     }
-    return null;
   } finally { try { closeSync(fd); } catch { /* ignore */ } }
+}
+
+/** The LAST bridge-session entry of a transcript, or null. */
+export function lastBridgeEntry(file) {
+  let found = null;
+  scanBridgeEntries(file, (o) => { found = o; return true; });
+  return found;
+}
+
+const SUPPRESSION_MARK = Buffer.from('"type":"history-suppression"');
+
+/** Does the transcript carry a `history-suppression` line? A type-token scan of the raw bytes; no line is decoded or kept. */
+export function hasHistorySuppression(file) {
+  let fd;
+  try { fd = openSync(file, 'r'); } catch { return false; }
+  try {
+    const size = fstatSync(fd).size;
+    const buf = Buffer.alloc(CHUNK + SUPPRESSION_MARK.length);
+    for (let pos = 0; pos < size; pos += CHUNK) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, size - pos), pos);   // the blocks overlap by the mark's length, so a mark on a block edge is found
+      if (buf.subarray(0, n).includes(SUPPRESSION_MARK)) return true;
+    }
+    return false;
+  } catch { return false; } finally { try { closeSync(fd); } catch { /* ignore */ } }
+}
+
+/**
+ * Is this `noHistoryBackfill` link the signature of a gone-bounce (the CLI tried to reattach to a saved link that no longer exists and
+ * minted a neutral-named one)? Yes only when the entry before it, ignoring repeats of the link itself, is a DIFFERENT non-empty link (a
+ * reattach target existed) and the transcript carries no history-suppression line. A link that follows a clear line, or the transcript's
+ * first link, or any link of a transcript with a lasting history-suppression flag (every resume mints a `noHistoryBackfill` link there), is
+ * not a bounce: clearing it only makes the next resume mint the same flag again, one orphaned remote session per loop.
+ */
+export function isGoneBounce(file, entry) {
+  if (!entry?.bridgeSessionId) return false;
+  let prev = null;
+  scanBridgeEntries(file, (o) => { if (o.bridgeSessionId === entry.bridgeSessionId) return false; prev = o; return true; });
+  if (!prev || typeof prev.bridgeSessionId !== 'string' || prev.bridgeSessionId === '') return false;
+  return !hasHistorySuppression(file);
 }
 
 /**
@@ -136,14 +177,25 @@ export function lastBridgeEntry(file) {
  * id) needs nothing. The entry's `ownerAccountUuid` is never read: the CLI stamps it from its own cached identity, so on a machine that
  * switched accounts every link carries the old account's uuid, healthy ones included.
  */
-export function relinkReason(entry, foreign = () => false) {
+export function relinkReason(entry, foreign = () => false, stale = () => false, bounce = () => true) {
   if (!entry || !entry.bridgeSessionId) return null;
-  if (entry.noHistoryBackfill === true) return 'noHistoryBackfill';
-  return foreign(entry.bridgeSessionId) === true ? 'foreign' : null;
+  if (entry.noHistoryBackfill === true && bounce() === true) return 'noHistoryBackfill';
+  if (foreign(entry.bridgeSessionId) === true) return 'foreign';
+  return stale(entry.bridgeSessionId) === true ? 'stale' : null;
 }
 
-export function needsRelink(entry, foreign = () => false) {
-  return relinkReason(entry, foreign) !== null;
+export function needsRelink(entry, foreign = () => false, stale = () => false, bounce = () => true) {
+  return relinkReason(entry, foreign, stale, bounce) !== null;
+}
+
+/**
+ * relinkReason against a makeForeign check (rclinks.mjs) for one transcript. 0.5.10: a third reason, 'stale': the link was minted before the
+ * current sign-in began, whatever account minted it (the app retires an account's Remote Control instance at a switch, so such a link is gone
+ * too, and the CLI's reattach to it ends in a link with a default name). The cutoff is the start of the current sign-in, or fc's own override.
+ */
+export function linkReason(fc, entry, transcript, { guard = true } = {}) {
+  return relinkReason(entry, (id) => fc?.foreign(id, transcript) === true, (id) => fc?.staleLink?.(id, transcript) === true,
+    guard ? () => isGoneBounce(transcript, entry) : () => true);   // 0.5.10: a noHistoryBackfill link counts only as a gone-bounce (isGoneBounce); guard:false is the explicit rc-repair
 }
 
 /* ------------------------------------------------------------------ eligibility and the scan */
@@ -199,7 +251,7 @@ export function rcPlan(ctx, o = {}) {
     const tp = findTranscript(projects, r.rec);
     if (!tp) { plan.noTranscript++; continue; }
     const b = lastBridgeEntry(tp);
-    const why = relinkReason(b, (id) => fc.foreign(id, tp));
+    const why = linkReason(fc, b, tp);
     if (why) plan.relink.push({ file: r.path, id: r.rec.sessionId, cliSessionId: r.rec.cliSessionId, title: r.rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why });
   }
   if (o.persist) fc.flush();   // only a pass that writes keeps the ledger: a plan read (dry run, logon check) changes nothing on disk
@@ -284,7 +336,7 @@ export function applyPlan(ctx, plan, o = {}) {
     if (!stopped()) { res.status = 'partial'; res.skipped++; log(`rc-restore: ${a.id}: not cleared, the app started`); break; }
     try {
       const again = lastBridgeEntry(a.transcript);                     // verified right before the write
-      if (!needsRelink(again, (id) => plan.foreignCheck?.foreign(id, a.transcript) === true)) { res.skipped++; continue; }
+      if (linkReason(plan.foreignCheck, again, a.transcript) === null) { res.skipped++; continue; }
       ensureBackupDir();
       copyFileSync(a.transcript, join(backupDir, `${a.cliSessionId}.jsonl`));
       appendClearLine(a.transcript, a.cliSessionId);
@@ -586,7 +638,7 @@ const lc = (s) => String(s ?? '').toLowerCase();
  */
 export function liveRelinkCandidates(ctx, o = {}) {
   const acct = (o.acct ?? readSignedIn(ctx.userData)) || null;
-  const out = { acct, records: 0, noTranscript: 0, candidates: [], foreignCheck: null };
+  const out = { acct, records: 0, noTranscript: 0, guarded: 0, candidates: [], foreignCheck: null };
   if (!acct) return out;
   const now = o.now ?? ctx.now();
   const days = o.days ?? RC_DEFAULTS.days;
@@ -602,8 +654,8 @@ export function liveRelinkCandidates(ctx, o = {}) {
     const tp = findTranscript(projects, rec);
     if (!tp) { out.noTranscript++; continue; }
     const b = lastBridgeEntry(tp);
-    const why = relinkReason(b, (id) => fc.foreign(id, tp));
-    if (!why) continue;
+    const why = linkReason(fc, b, tp);
+    if (!why) { if (b?.bridgeSessionId && b.noHistoryBackfill === true) out.guarded++; continue; }   // a noHistoryBackfill link that is no gone-bounce: left alone (isGoneBounce)
     out.candidates.push({ file: r.path, id: rec.sessionId, cliSessionId: rec.cliSessionId, title: rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why, running: rec.isRunning === true });
   }
   return out;
@@ -611,7 +663,7 @@ export function liveRelinkCandidates(ctx, o = {}) {
 
 /** The one log line of a live pass: `rc-live: cleared N (ids...), skipped live M, quiet Q, raced R` and the rest only when not zero. */
 export function liveLine(res) {
-  const extra = ['running', 'unknown', 'self', 'deferred', 'failed', 'stale'].filter((k) => res[k]).map((k) => `${k} ${res[k]}`);
+  const extra = ['running', 'unknown', 'self', 'deferred', 'failed', 'stale', 'undatedStale'].filter((k) => res[k]).map((k) => `${k} ${res[k]}`);
   return `rc-live: cleared ${res.cleared.length}${res.cleared.length ? ` (${res.cleared.map((c) => c.id.replace(/^local_/, '').slice(0, 8)).join(', ')})` : ''}, skipped live ${res.skippedLive}, quiet ${res.quiet}, raced ${res.raced}${extra.length ? `, ${extra.join(', ')}` : ''}`;
 }
 
@@ -628,7 +680,8 @@ export function liveLine(res) {
  *      hookCliSessionId, liveCliIds (function, Set or null; tests), cimTimeoutMs, log(line) }
  * @returns {Promise<{ran:boolean, reason?:string, dryRun:boolean, acct, candidates:number, cleared:object[], wouldClear:object[],
  *   skippedLive:number, quiet:number, running:number, unknown:number, self:number, raced:number, deferred:number, failed:number, stale:number,
- *   undated:number (links the history could not date: left alone)}>}
+ *   undated:number (links the history could not date: left alone by the foreign check), undatedStale:number (undatable links judged stale by the
+ *   transcript's modified time), guarded:number (noHistoryBackfill links left alone, see isGoneBounce), sessions:[{id, cliSessionId, title, why, link, outcome}] (the verdict of each candidate)}>}
  */
 export async function liveRelinkPass(ctx, o = {}) {
   const s = o.settings ?? RC_DEFAULTS;
@@ -640,57 +693,75 @@ export async function liveRelinkPass(ctx, o = {}) {
   const nowMs = () => o.now ?? ctx.now();
   const quietMs = o.quietMs ?? LIVE_QUIET_MS;
   const max = o.max ?? s.liveMax ?? RC_DEFAULTS.liveMax;
+  // the process list can fail while the machine is busy or the app tears its CLIs down (an account switch). `liveBackoffMs` (an array of waits)
+  // or `liveTries` reads `liveRetryMs` apart: one retry per wait. Unknown after the last try means "a live CLI cannot be ruled out": nothing is
+  // written (never treated as "no CLI"), and the sessions stay candidates for the next pass.
+  const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const waits = Array.isArray(o.liveBackoffMs) ? o.liveBackoffMs : Array(Math.max(0, (o.liveTries ?? 1) - 1)).fill(o.liveRetryMs ?? 3000);
   const readLive = async () => {
     const f = 'liveCliIds' in o ? o.liveCliIds : (() => liveCliIds({ platform: o.platform ?? ctx.platform, timeoutMs: o.cimTimeoutMs }));
-    const v = typeof f === 'function' ? await f() : f;
-    return v == null ? null : new Set([...v].map(lc));
+    for (let i = 0; ; i++) {
+      const v = typeof f === 'function' ? await f() : f;
+      if (v != null) return new Set([...v].map(lc));
+      if (i >= waits.length) { if (waits.length && !dry) log(`rc-live: the process list could not be read after ${i + 1} tries; nothing was written`); return null; }
+      if (!dry) log(`rc-live: the process list could not be read, trying again in ${Math.round(waits[i] / 1000)} s (try ${i + 1} of ${waits.length + 1})`);
+      await sleep(waits[i]);
+    }
   };
-  const scan = liveRelinkCandidates(ctx, { acct: o.acct, now: nowMs(), days: o.days ?? s.days, all: o.all === true, projects: o.projects, rcLog: o.rcLog });
+  const outcomes = new Map();   // per session, the last verdict of this pass: cleared | would-clear | live | quiet | mid-turn | gone | changed | self | deferred | failed | unknown
+  const summary = (c) => ({ id: c.id, cliSessionId: c.cliSessionId, title: c.title, why: c.why, link: c.link });
+  const mark = (c, outcome) => outcomes.set(c.cliSessionId, { ...summary(c), outcome });
+  Object.defineProperty(res, 'sessions', { get: () => [...outcomes.values()], enumerable: true });
+  const scan = liveRelinkCandidates(ctx, { acct: o.acct, now: nowMs(), days: o.days ?? s.days, all: o.all === true, projects: o.projects, rcLog: o.rcLog, signInStart: o.signInStart });
   res.acct = scan.acct;
   if (!scan.acct) return { ...res, reason: 'no-account' };
   res.ran = true;
   let cands = scan.candidates;
-  if (o.hookCliSessionId) cands = cands.filter((c) => (c.cliSessionId === o.hookCliSessionId ? (res.self++, false) : true));
+  if (o.hookCliSessionId) cands = cands.filter((c) => (c.cliSessionId === o.hookCliSessionId ? (res.self++, mark(c, 'self'), false) : true));
   res.candidates = cands.length;
   res.undated = scan.foreignCheck.undated;
+  res.undatedStale = scan.foreignCheck.undatedStale;   // links judged stale by the transcript's modified time because they could not be dated
+  res.records = scan.records;
+  res.guarded = scan.guarded;   // noHistoryBackfill links left alone because they are no gone-bounce (a clear line before them, or a history-suppression line)
+  res.cutoff = scan.foreignCheck.signInStart;           // ms: links minted before it are stale; null when no switch is known (only foreign and noHistoryBackfill links count)
   // the ledger and the history are a cache of what this pass just learned (atomic, add-only): kept by every pass that may write, so a
   // link seen now is dated by when it was first seen even when nothing is cleared this time. A dry run keeps nothing.
   if (!dry) scan.foreignCheck.flush();
   if (!cands.length) return res;   // nothing to look at: the OS is not asked
 
   const live = await readLive();
-  if (live === null) { res.unknown = cands.length; if (!dry) log(liveLine(res)); return res; }
+  if (live === null) { res.unknown = cands.length; for (const c of cands) mark(c, 'unknown'); if (!dry) log(liveLine(res)); return res; }
   const todo = [];
   for (const c of cands) {
-    if (live.has(lc(c.cliSessionId))) { res.skippedLive++; continue; }
+    if (live.has(lc(c.cliSessionId))) { res.skippedLive++; mark(c, 'live'); continue; }
     let m = null; try { m = statSync(c.transcript).mtimeMs; } catch { /* gone */ }
-    if (m === null) { res.stale++; continue; }
-    if (nowMs() - m < quietMs) { res.quiet++; continue; }
-    if (c.running) { res.running++; continue; }
+    if (m === null) { res.stale++; mark(c, 'gone'); continue; }
+    if (nowMs() - m < quietMs) { res.quiet++; mark(c, 'quiet'); continue; }
+    if (c.running) { res.running++; mark(c, 'mid-turn'); continue; }
     todo.push(c);
   }
   const batch = todo.slice(0, Math.max(0, max));
   res.deferred = todo.length - batch.length;
-  const summary = (c) => ({ id: c.id, cliSessionId: c.cliSessionId, title: c.title, why: c.why, link: c.link });
+  for (const c of todo) mark(c, dry ? 'would-clear' : 'deferred');
   if (dry) { res.wouldClear = todo.map(summary); return res; }   // the whole list; a real pass clears the first `max` of it (res.deferred is the rest)
   if (!batch.length) { log(liveLine(res)); return res; }
 
   const lock = await withAccountsLock(ctx, async () => {
     const live2 = await readLive();                                      // right before the writes
-    if (live2 === null) { res.unknown += batch.length; return; }
+    if (live2 === null) { res.unknown += batch.length; for (const c of batch) mark(c, 'unknown'); return; }
     const backupDir = accPath(ctx, 'rc-restore', 'backup', stamp(nowMs()));
     const written = [];
     for (const c of batch) {
-      if (live2.has(lc(c.cliSessionId))) { res.skippedLive++; continue; }
+      if (live2.has(lc(c.cliSessionId))) { res.skippedLive++; mark(c, 'live'); continue; }
       try {
         const again = lastBridgeEntry(c.transcript);
-        if (!again || again.bridgeSessionId !== c.link || !needsRelink(again, (id) => scan.foreignCheck.foreign(id, c.transcript))) { res.stale++; continue; }
-        if (nowMs() - statSync(c.transcript).mtimeMs < quietMs) { res.quiet++; continue; }
+        if (!again || again.bridgeSessionId !== c.link || linkReason(scan.foreignCheck, again, c.transcript) === null) { res.stale++; mark(c, 'changed'); continue; }
+        if (nowMs() - statSync(c.transcript).mtimeMs < quietMs) { res.quiet++; mark(c, 'quiet'); continue; }
         mkdirSync(backupDir, { recursive: true });
         copyFileSync(c.transcript, join(backupDir, `${c.cliSessionId}.jsonl`));
         appendClearLine(c.transcript, c.cliSessionId);
-        written.push(c); res.cleared.push(summary(c));
-      } catch (e) { res.failed++; log(`rc-live: ${c.id}: relink FAILED ${e?.message ?? e}`); }
+        written.push(c); res.cleared.push(summary(c)); mark(c, 'cleared');
+      } catch (e) { res.failed++; mark(c, 'failed'); log(`rc-live: ${c.id}: relink FAILED ${e?.message ?? e}`); }
     }
     if (written.length) {
       const after = await readLive();                                    // a CLI that loaded the pointer before or after the write
@@ -701,6 +772,20 @@ export async function liveRelinkPass(ctx, o = {}) {
   if (!lock.ok) { log('rc-live: skipped, another pass holds the accounts lock'); return { ...res, ran: false, reason: 'locked' }; }
   log(liveLine(res));
   return res;
+}
+
+/**
+ * `accounts rc-sweep` (0.5.10): the live relink applied by hand to every session of the signed-in account (all records, not only the recent
+ * ones), with the stale criterion cut at `before` (ms; default: the start of the current sign-in). Works whatever rcRestore.enabled and
+ * rcRestore.liveRelink are (an explicit command, like rc-repair), clears every session that passes the live gate (no cap), and never writes
+ * while the process list is unknown (three reads). The gates are liveRelinkPass's: no live CLI, transcript quiet, record not mid-turn,
+ * a backup first, the CLI's own clear line.
+ * o: { before (ms), dryRun, acct, now, projects, rcLog, liveCliIds (test seam), sleep, quietMs, log }
+ */
+export function rcSweep(ctx, o = {}) {
+  const settings = { ...RC_DEFAULTS, enabled: true, liveRelink: 'idle-only', liveMax: Number.MAX_SAFE_INTEGER };
+  const { before, ...rest } = o;
+  return liveRelinkPass(ctx, { liveTries: 3, liveRetryMs: 3000, cimTimeoutMs: 25000, ...rest, settings, max: Number.MAX_SAFE_INTEGER, all: true, signInStart: before });
 }
 
 /**

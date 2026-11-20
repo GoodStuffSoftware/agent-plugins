@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+* **session-sync:** `accounts rc-sweep [--before <iso>] [--dry-run] [--json]`, a one-shot relink of every session of the signed-in account whose last Remote Control link was minted before the current sign-in began (or before `--before`), whatever account minted it, plus the `noHistoryBackfill` links that are gone-bounces. It skips a session whose CLI runs, writes nothing while the process list cannot be read (it tries three times), has no cap, backs each transcript up first (as `rc-restore` does) and prints one line per session and a summary. `--dry-run` reads only. It works whatever `rcRestore.enabled` and `rcRestore.liveRelink` are.
+* **session-sync:** `accounts rc-repair <id> --at-turn-end` for the session you are talking in (its CLI holds the link, so it cannot clear its own). It only records a request. A new `Stop` hook of that session sees the request when its turn ends and starts one hidden, detached helper that waits about 2 seconds, runs the `--stop-cli` repair for that session and deletes the request. The hook returns at once and never blocks or fails a turn. The session comes back on your next message, and Remote Control reconnects then with a fresh link named after the session title. No scheduled task or daemon is involved.
+
+### Fixed
+
+* **session-sync:** after an A to B to A account round trip, a session whose last link was minted under A before the round trip got a default `<hostname>-<adjective>-<noun>` name when Remote Control reconnected: the app retires an account's Remote Control instance at every switch, the CLI reattached to the dead link, then minted a neutral-named one. The relink (the switch sweep, the quit and logon relink, the live pass) now clears any link that was minted before the current sign-in began, whatever account minted it. A link counts as stale only when its upper time bound (the next timestamp after it in the transcript, else the transcript's modified time) is older than the sign-in start, using the ledger and the switch history, never `ownerAccountUuid`; a link whose neighbouring timestamps straddle the sign-in start is left alone.
+* **session-sync:** the switch sweep no longer gives up when the process list cannot be read. At the 2026-11-20 switch the app was tearing down its CLIs, the list read as unknown and 43 stale links were left. It now retries with back-off for about 3 minutes (never writing while liveness is unknown), has a very high cap (1000 links) instead of 10, and a waiter that starts within 15 minutes of a switch (or the first time the app is seen running) sweeps at once instead of waiting for the next periodic pass.
+* **session-sync:** the automatic passes clear a `noHistoryBackfill` link only when it is a gone-bounce: the entry before it is a different non-empty link. A link that follows a clear line, a transcript's first link, and any link of a transcript with a `history-suppression` line (every resume mints a `noHistoryBackfill` link there) are left alone, so the relink no longer loops and orphans a remote session each time. An explicit `rc-repair` still clears whatever you name.
+
 ## 0.5.9 - 2026-11-18
 
 ### Added

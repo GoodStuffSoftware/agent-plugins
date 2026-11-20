@@ -37,7 +37,7 @@ const keyOf = (n) => `C:\\synthetic\\project-${n}`.replace(/[^a-zA-Z0-9]/g, '-')
 const transcriptPath = (w, n) => join(w.projects, keyOf(n), `${uuid('d', n)}.jsonl`);
 
 /** A record that was on RC and was active `agoMs` ago; its transcript ends with the given bridge-session entry (or none). */
-function session(w, n, { agoMs = 3600_000, rec = {}, bridge, lines = 5 } = {}) {
+function session(w, n, { agoMs = 3600_000, rec = {}, bridge, lines = 5, prev } = {}) {
   const file = putRecord(w.folder.path, n, {
     lastActivityAt: iso(NOW - agoMs), remoteControlUserEnabled: true, bridgeSessionIds: [`session_${n}`], remoteControlAutoEligible: false, ...rec,
   });
@@ -45,6 +45,8 @@ function session(w, n, { agoMs = 3600_000, rec = {}, bridge, lines = 5 } = {}) {
   mkdirSync(join(w.projects, keyOf(n)), { recursive: true });
   const body = [];
   for (let i = 0; i < lines; i++) body.push(JSON.stringify({ type: i % 2 ? 'assistant' : 'user', message: `line ${i} of ${n}` }));
+  // a noHistoryBackfill link is a gone-bounce only when a different non-empty link came before it (0.5.10, isGoneBounce): give it one
+  if (bridge?.noHistoryBackfill && prev !== false) body.push(JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', n), bridgeSessionId: 'cse_prev', lastSequenceNum: 3 }));
   if (bridge) body.push(JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', n), lastSequenceNum: 7, ...bridge }));
   body.push(JSON.stringify({ type: 'assistant', message: 'tail' }));
   writeFileSync(tp, body.join('\n') + '\n');

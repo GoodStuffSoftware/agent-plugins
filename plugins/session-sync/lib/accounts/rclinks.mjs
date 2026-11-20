@@ -14,6 +14,10 @@
  * A transcript's `bridge-session` lines carry no timestamp, so the first sighting of a link is dated by the `timestamp` of the nearest
  * preceding line (only that one token is read from it; nothing else of that line is decoded or kept). Without a date the transcript's
  * modified time is used when it is older than the last switch. A link whose account cannot be told is never called foreign.
+ *
+ * 0.5.10: "foreign" is not the only way a link is dead. The app retires an account's Remote Control instance at every switch, so a link minted
+ * under the account that is signed in NOW, but before this sign-in began (an A to B and back to A round trip), is gone as well, and the CLI's
+ * owner check lets it through to a "gone" reattach that mints a link with a default name. `staleLink` answers that, whatever the owner.
  */
 
 import { openSync, readSync, fstatSync, closeSync, statSync } from 'node:fs';
@@ -88,6 +92,19 @@ export function switchHistory(ctx, o = {}) {
   }
   if (!list.length) dirty = false;
   return { list, dirty };
+}
+
+/**
+ * When did the current sign-in begin, if that was within `withinMs` of `nowMs`? (ms), else null: no switch recorded (one history entry only),
+ * the last entry names another account, or the switch is older. A watcher that starts just after a switch uses it to sweep at once.
+ * Read only. o: { rcLog }
+ */
+export function recentSwitch(ctx, acct, nowMs, withinMs, o = {}) {
+  const { list } = switchHistory(ctx, { ...o, acct });
+  const last = list[list.length - 1];
+  if (list.length < 2 || !last || last.acct !== lower(acct)) return null;
+  const age = nowMs - last.at;
+  return age >= 0 && age <= withinMs ? last.at : null;
 }
 
 /** The account that was signed in at `tMs`, or null when that cannot be told (before the history, or after a switch nothing recorded). */
@@ -244,6 +261,11 @@ export function makeForeign(ctx, acct, o = {}) {
   const fresh = {};
   let undated = 0;   // links this check could not date (kept: an undatable link is never called foreign)
   const lastSwitch = list.length && list[list.length - 1].acct === cur ? list[list.length - 1].at : null;
+  // when the CURRENT sign-in began: the last history entry, but only when an earlier entry names another account (a history of one entry says
+  // when the log began, not that a switch happened, so nothing is stale by it). o.signInStart (ms) replaces it (accounts rc-sweep --before).
+  const signInStart = Number.isFinite(o.signInStart) ? o.signInStart : (list.length >= 2 && list[list.length - 1].acct === cur ? list[list.length - 1].at : null);
+  const dates = new Map();
+  let undatedStale = 0;   // links whose date could not be told and that were judged by the transcript's modified time instead
   /** 'foreign' | 'own' (minted under the signed-in account, or no link) | 'undated' (cannot be told; not foreign). */
   function classify(bridgeId, transcript) {
     if (!bridgeId) return 'own';
@@ -269,11 +291,40 @@ export function makeForeign(ctx, acct, o = {}) {
     return r;
   }
   const foreign = (bridgeId, transcript) => classify(bridgeId, transcript) === 'foreign';
+  /**
+   * The bounds of the mint time of a link: `lower` (the nearest timestamp before its first line, or the ledger's first sighting, whichever is
+   * later: the link existed no earlier than that) and `upper` (the nearest timestamp after its first line; null when there is none).
+   */
+  function linkBounds(bridgeId, transcript) {
+    if (dates.has(bridgeId)) return dates.get(bridgeId);
+    const b = transcript ? firstSeenBounds(transcript, bridgeId) : { before: null, after: null };
+    const led = Date.parse(links[bridgeId]?.firstSeen ?? '');
+    const lows = [b.before, Number.isFinite(led) ? led : null].filter((x) => x !== null);
+    const out = { lower: lows.length ? Math.max(...lows) : null, upper: b.after };
+    dates.set(bridgeId, out);
+    return out;
+  }
+  /**
+   * Was this link certainly minted before `cutoff` (default: the start of the current sign-in), whatever account minted it? The nearest
+   * timestamp BEFORE the link line is only a lower bound of the mint time (a resumed session writes its link before its next timestamped
+   * line), so a link is stale only when its UPPER bound is below the cutoff: the nearest timestamp after it or, when none follows, the
+   * transcript's modified time (nothing was written since). A link first seen at or after the cutoff, or whose bounds straddle it, is left
+   * alone. No cutoff known: false.
+   */
+  function staleLink(bridgeId, transcript, cutoff = signInStart) {
+    if (!bridgeId || !Number.isFinite(cutoff)) return false;
+    const { lower, upper } = linkBounds(bridgeId, transcript);
+    if (lower !== null && lower >= cutoff) return false;
+    if (upper !== null) return upper < cutoff;
+    let m = null; try { m = statSync(transcript).mtimeMs; } catch { /* gone */ }
+    if (m !== null && m < cutoff) { undatedStale++; return true; }
+    return false;
+  }
   function flush() {
     try {
       if (dirty) writeHistory(ctx, list);
       observeLinks(ctx, fresh);
     } catch { /* a cache: the next pass rebuilds it */ }
   }
-  return { foreign, classify, flush, history: list, get undated() { return undated; } };
+  return { foreign, classify, staleLink, signInStart, flush, history: list, get undated() { return undated; }, get undatedStale() { return undatedStale; } };
 }

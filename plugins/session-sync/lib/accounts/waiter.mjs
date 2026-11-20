@@ -33,12 +33,19 @@ import { PLUGIN_VERSION, codeHash, compareVersions } from './version.mjs';
 import { verifyProcess, WAITER_MARKER } from './procid.mjs';
 import { nullUi, progressInfo } from './progress.mjs';
 import { spawnFixCore, spawnFixStep, spawnLine } from './rcspawn.mjs';
+import { recentSwitch } from './rclinks.mjs';
 import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS, liveRelinkPass } from './rcrestore.mjs';
 import { RC_DEFAULTS } from '../config.mjs';
 
 const asksOp = (rs) => rs.some((r) => r === 'link' || r === 'unlink');
 /** How long the watcher looks for the app's own launch-restore lines after a start (they come within a minute or two). */
 const LAUNCH_LOOK_MS = 10 * 60 * 1000;
+/** The switch sweep's waits when the process list cannot be read: 3, 10, 30, 60 and 60 s, about 3 minutes in all (0.5.10). */
+const SWEEP_BACKOFF_MS = [3000, 10000, 30000, 60000, 60000];
+/** No per-pass cap for the switch sweep (rcRestore.liveMax stays the cap of the periodic pass). */
+const SWEEP_MAX = 1000;
+/** A watcher that starts this soon after a switch sweeps at once. */
+const SWEEP_RECENT_MS = 15 * 60 * 1000;
 const RC_MAX_TRIES = 3;
 
 export const HEARTBEAT_STALE_MS = 5 * 60 * 1000;
@@ -365,8 +372,37 @@ export async function runWaiter(ctx, o = {}) {
   const liveStep = async (all) => {
     const c = rcCfg();
     if (!c || c.liveRelink !== 'idle-only') return;
-    try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
+    // the switch sweep (all) 0.5.10: right after a switch the app tears its CLIs down and the machine is busy, so the process list can come back
+    // unreadable (2026-11-20: `unknown 43`, 0 cleared). Unknown never means "no CLI": nothing is written until the list reads, so the sweep
+    // retries with a back-off for about 3 minutes (RC reconnected 3.5 minutes after that switch), logs each try, and has no per-pass cap (a
+    // deferral would miss the window before RC reconnects).
+    const sweep = all ? { liveBackoffMs: ctx.platform === 'win32' ? (o.sweepBackoffMs ?? SWEEP_BACKOFF_MS) : [], max: SWEEP_MAX, cimTimeoutMs: 25000 } : {};   // off Windows the probe is never available: no back-off to wait out
+    try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...sweep, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
     catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); }
+  };
+  /**
+   * The switch sweep, in the background (its back-off takes minutes; the watcher goes on serving the folders). One at a time, and one per
+   * sign-in: a second trigger for the same switch (the switch event and a new waiter's start-up look) does nothing. `w.sweep` is the promise.
+   */
+  const switchSweep = () => {
+    const c = rcCfg();
+    if (!c || c.liveRelink !== 'idle-only') return;
+    let at = null; try { at = recentSwitch(ctx, readSignedIn(ctx.userData), ctx.now(), Infinity, { rcLog: o.rcOpts?.rcLog }); } catch { /* no history: sweep anyway */ }
+    if (at !== null && w.sweptSwitch === at) return;
+    w.sweptSwitch = at;
+    if (w.sweeping) { w.sweepAgain = true; return; }
+    w.sweeping = true;
+    w.sweep = (async () => {
+      try { do { w.sweepAgain = false; await liveStep(true); } while (w.sweepAgain); }
+      finally { w.sweeping = false; }
+    })();
+  };
+  /** A watcher that starts within SWEEP_RECENT_MS of a switch (the old one was replaced, or the app was just started) sweeps at once, not after liveEveryMs. */
+  const startupSweep = () => {
+    if (!rcCfg()) return;
+    try {
+      if (recentSwitch(ctx, readSignedIn(ctx.userData), ctx.now(), o.sweepRecentMs ?? SWEEP_RECENT_MS, { rcLog: o.rcOpts?.rcLog }) !== null) switchSweep();
+    } catch (e) { o.log?.(`waiter: start-up sweep look failed: ${e?.message ?? e}`); }
   };
   /**
    * Sessions started from claude.ai under another account (rcspawn.mjs). While the app runs: detect and report only ("pending, fixed at the
@@ -403,7 +439,8 @@ export async function runWaiter(ctx, o = {}) {
   };
   // the watcher's own state: events only set flags (S6: an event is a hint, the poll does the same work)
   const w = { dirty: false, dirtyAt: 0, event: false, coolUntil: 0, fullDone: false, settledProbeAt: -Infinity, uiMuteUntil: 0,
-    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0, liveAt: clock(), spawnDone: false, spawnSeen: '' };
+    rcDone: false, rcTries: 0, rcRefreshAt: 0, rcLaunch: null, uiEndedAt: 0, liveAt: clock(), spawnDone: false, spawnSeen: '',
+    sweep: null, sweeping: false, sweepAgain: false, sweptSwitch: null, startupLooked: false };
   const rcRefreshMs = o.rcRefreshMs ?? MARKER_REFRESH_MS;
   const uiGapMs = o.uiGapMs ?? (testPoll ? 0 : 1500);
   /** The accounts are not linked and nothing asks for a link: this watcher only does the Remote Control restore. */
@@ -474,6 +511,7 @@ export async function runWaiter(ctx, o = {}) {
       if (app.running && w.rcLaunch && rcCfg()) rcLaunchLook();
       else if (!app.running && w.rcDone && rcCfg() && clock() - w.rcRefreshAt >= rcRefreshMs) await rcRefresh();
       // the live relink, every liveEveryMs while the app runs (the first look after an app start is the wake hook's)
+      if (app.running && !w.startupLooked) { w.startupLooked = true; startupSweep(); }
       if (!app.running) w.liveAt = clock();
       else if ((rcCfg() || spawnCfg()) && clock() - w.liveAt >= (o.liveEveryMs ?? rcCfg()?.liveEveryMs ?? RC_DEFAULTS.liveEveryMs)) { w.liveAt = clock(); if (rcCfg()) await liveStep(false); spawnLook(); }
 
@@ -493,7 +531,7 @@ export async function runWaiter(ctx, o = {}) {
             if (res?.rectify?.conflicts?.length) o.log?.(`waiter: ${res.rectify.conflicts.length} conversation(s) continued from a stale copy`);
             if (res?.switched) {
               o.log?.(`waiter: the signed-in account changed; the previous account's folders cool for a few seconds`);
-              await liveStep(true);   // the sessions of the account just signed in: clear every stale link while their CLIs are not running yet
+              switchSweep();          // the sessions of the account just signed in: clear every stale link while their CLIs are not running yet (background, with a back-off)
               spawnLook();            // and name the ones started from claude.ai under the account just left (detached at the next stop)
             }
             await toastConflicts(ctx, o.notify);

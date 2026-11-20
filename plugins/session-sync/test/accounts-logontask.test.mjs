@@ -45,7 +45,8 @@ function world({ owed = true } = {}) {
   const tp = join(projects, keyOf(1), `${uuid('d', 1)}.jsonl`);
   mkdirSync(join(projects, keyOf(1)), { recursive: true });
   const link = owed ? { bridgeSessionId: 'cse_stale', noHistoryBackfill: true, ownerAccountUuid: ME } : { bridgeSessionId: 'cse_good', ownerAccountUuid: ME };
-  writeFileSync(tp, [JSON.stringify({ type: 'user', message: 'hi' }), JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 1), lastSequenceNum: 3, ...link }), ''].join('\n'));
+  // 0.5.10: a noHistoryBackfill link is a gone-bounce (cleared) only when a different non-empty link came before it
+  writeFileSync(tp, [JSON.stringify({ type: 'user', message: 'hi' }), ...(owed ? [JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 1), lastSequenceNum: 1, bridgeSessionId: 'cse_prev' })] : []), JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 1), lastSequenceNum: 3, ...link }), ''].join('\n'));
   return { ...r, projects, folder, tp };
 }
 
@@ -118,7 +119,7 @@ test('L4b the app starts between two relinks: the done one stays done, the rest 
   putRecord(w.folder.path, 2, { lastActivityAt: iso(NOW - 7200_000), remoteControlUserEnabled: true, bridgeSessionIds: ['session_2'], remoteControlAutoEligible: false });
   const tp2 = join(w.projects, keyOf(2), `${uuid('d', 2)}.jsonl`);
   mkdirSync(join(w.projects, keyOf(2)), { recursive: true });
-  writeFileSync(tp2, [JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 2), lastSequenceNum: 1, bridgeSessionId: 'cse_stale2', noHistoryBackfill: true, ownerAccountUuid: ME }), ''].join('\n'));
+  writeFileSync(tp2, [JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 2), lastSequenceNum: 1, bridgeSessionId: 'cse_prev' }), JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 2), lastSequenceNum: 1, bridgeSessionId: 'cse_stale2', noHistoryBackfill: true, ownerAccountUuid: ME }), ''].join('\n'));
   const before2 = readFileSync(tp2, 'utf8');
   let calls = 0;
   const lines = [];
@@ -470,7 +471,7 @@ test('L24 CLI end to end: an owed relink is cleared with the app stopped and lef
   putRecord(w.fA.path, 7, { lastActivityAt: iso(Date.now() - 3600_000), remoteControlUserEnabled: true, bridgeSessionIds: ['session_7'] });
   const tp = join(w.home, '.claude', 'projects', 'C--synthetic-project-7', `${uuid('d', 7)}.jsonl`);
   mkdirSync(join(w.home, '.claude', 'projects', 'C--synthetic-project-7'), { recursive: true });
-  writeFileSync(tp, `${JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 7), lastSequenceNum: 2, bridgeSessionId: 'cse_stale', noHistoryBackfill: true, ownerAccountUuid: A })}\n`);
+  writeFileSync(tp, `${JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 7), lastSequenceNum: 1, bridgeSessionId: 'cse_prev' })}\n${JSON.stringify({ type: 'bridge-session', sessionId: uuid('d', 7), lastSequenceNum: 2, bridgeSessionId: 'cse_stale', noHistoryBackfill: true, ownerAccountUuid: A })}\n`);
   const before = readFileSync(tp, 'utf8');
   w.setApp({ running: true });
   const running = w.run(['accounts', 'rc-restore', '--if-app-stopped']);
