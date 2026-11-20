@@ -243,6 +243,7 @@ export function rawDraft(
     cc?: string;
     subject?: string;
     threadId?: string;
+    body?: string;
     /** Extra header lines, such as `["Bcc", "x@example.org"]`. */
     headers?: [string, string][];
   } = {},
@@ -255,7 +256,7 @@ export function rawDraft(
     ...(over.headers ?? []).map(([k, v]) => `${k}: ${v}`),
     "Content-Type: text/plain; charset=UTF-8",
   ];
-  const mime = `${lines.join("\r\n")}\r\n\r\nDraft body\r\n`;
+  const mime = `${lines.join("\r\n")}\r\n\r\n${over.body ?? "Draft body"}\r\n`;
   return {
     id: over.id ?? "d1",
     message: {

@@ -14,10 +14,11 @@
 // records the count and total size of the files, never their content.
 
 import { z } from "zod";
+import { sha256Hex } from "../core/crypto";
 import { ToolError } from "../core/errors";
 import { buildHeldMailView, type HeldMailAction, type HeldMailView } from "../core/held-view";
 import { accountKey } from "../core/ids";
-import { parseAddresses } from "../core/mime";
+import { b64urlToBytes, parseAddresses } from "../core/mime";
 import {
   findNewRecipients,
   heldBecause,
@@ -366,6 +367,36 @@ function heldDraft(
   return p;
 }
 
+// ---- The draft lock ------------------------------------------------------------------------------
+//
+// A held draft send is bound to the draft the owner was shown. `approval.when` stores `draftLock`
+// with the call: "sha256:<hex>" over the exact message `readDraft` returned (the decoded
+// `format=raw` bytes: headers, recipients, body parts and attachments, plus the thread the message
+// is sent in). The handler reads the draft again when the owner approves and sends only if the
+// fingerprint is the same; it sends those very bytes (`sendDraft`), so nothing can change between
+// the check and the send. The Gmail draft id stays the same across edits and the message id inside
+// it changes, so neither proves anything; the content is what is compared. A re-save that changes
+// nothing keeps the fingerprint. `DRAFT_UNLOCKED` marks a draft send that was not held (it runs at
+// once in the same call, so there is no owner preview to bind it to). A call with neither value,
+// but with `checkedRecipients`, is a draft send held before this lock existed.
+
+const DRAFT_UNLOCKED = "unlocked";
+
+/** The fingerprint of the message a draft read returned, as it would be sent. */
+async function draftFingerprint(draft: DraftEnvelope): Promise<string> {
+  const head = new TextEncoder().encode(`wb-draft-1\0${draft.threadId ?? ""}\0`);
+  const body = b64urlToBytes(draft.raw);
+  const all = new Uint8Array(head.length + body.length);
+  all.set(head);
+  all.set(body, head.length);
+  return `sha256:${await sha256Hex(all)}`;
+}
+
+const AGAIN = "Ask for it to be sent again to get a fresh approval.";
+const DRAFT_CHANGED = `The draft changed after it was held. Nothing was sent. ${AGAIN}`;
+const DRAFT_GONE = `The draft was deleted after it was held. Nothing was sent. ${AGAIN}`;
+const DRAFT_LEGACY = `This send was held before drafts were bound to what the owner was shown, so it cannot be approved. Nothing was sent. ${AGAIN}`;
+
 /** A draft's own recipients and subject for the approval summary; empty when it cannot be read. */
 async function draftSummary(
   ctx: ToolContext,
@@ -484,16 +515,29 @@ async function heldMailView(
   });
 }
 
-/** The view of a held draft send: the draft as Gmail has it now (best effort for its text). */
+/**
+ * The view of a held draft send: the draft as Gmail has it now (best effort for its text). The
+ * envelope is the read `when` fingerprinted. The text comes from a later read, so the draft is read
+ * once more afterwards: if it no longer has the locked fingerprint, the text may not be what is
+ * locked, and the page says the body could not be shown (the approval would refuse that draft anyway).
+ */
 async function draftView(
   ctx: ToolContext,
   a: AccountRef,
-  args: ViewArgs & { draftId: string },
+  args: ViewArgs & { draftLock?: string | undefined },
+  draftId: string,
 ): Promise<HeldMailView> {
-  const draft = await heldDraft(ctx, args, a, args.draftId);
+  // `args` itself (not a copy): the read `when` made is kept under it.
+  const draft = await heldDraft(ctx, args, a, draftId);
   let text: { text: string; html?: string | undefined } | undefined;
   try {
-    text = await ctx.use(SEND, a).readDraftText?.(a, idOf(ctx, args.draftId).providerId);
+    const sender = ctx.use(SEND, a);
+    const providerId = idOf(ctx, draftId).providerId;
+    text = await sender.readDraftText?.(a, providerId);
+    if (text && args.draftLock && args.draftLock !== DRAFT_UNLOCKED) {
+      const again = await sender.readDraft(a, providerId, sendCap(ctx));
+      if ((await draftFingerprint(again)) !== args.draftLock) text = undefined;
+    }
   } catch {
     text = undefined;
   }
@@ -574,16 +618,23 @@ const sendMessage = defineTool({
       .array(z.string())
       .optional()
       .describe("Set by the server for a draft send; any value given here is replaced."),
+    draftLock: z
+      .string()
+      .max(100)
+      .optional()
+      .describe("Set by the server for a draft send; any value given here is replaced."),
   }),
   approval: {
     async when(args, ctx) {
-      // The server's field, never the caller's: cleared first, whatever the mode.
+      // The server's fields, never the caller's: cleared first, whatever the mode.
       args.checkedRecipients = undefined;
+      args.draftLock = undefined;
       if (mode(ctx) === "off") return false;
       assertSingleLine("subject", args.subject);
       const ref = args.draftId ?? args.replyToMessageId ?? args.replyThreadId;
       // A draft's recipients as seen now are stored with the call: the send, now or once approved,
       // refuses a draft that gained a recipient since, and sends only the bytes it read and checked.
+      // A held draft send also stores the draft's fingerprint (see "The draft lock").
       if (mode(ctx) === "all") {
         if (args.draftId) {
           const a = await accountFor(ctx, args.account, idOf(ctx, args.draftId).shortId);
@@ -591,6 +642,8 @@ const sendMessage = defineTool({
             .use(SEND, a)
             .readDraft(a, idOf(ctx, args.draftId).providerId, sendCap(ctx));
           args.checkedRecipients = normalizeRecipients(entriesOf(draft));
+          args.draftLock = await draftFingerprint(draft);
+          draftMemo.set(args, Promise.resolve(draft)); // the preview and view reuse this read
         } else {
           await checkBeforeHold(ctx, "send_message", args.account, ref, args.subject, args, true);
         }
@@ -598,13 +651,15 @@ const sendMessage = defineTool({
       }
       const a = await accountFor(ctx, args.account, ref ? idOf(ctx, ref).shortId : undefined);
       let entries: string[];
+      let read: DraftEnvelope | undefined;
       if (args.draftId) {
         // The draft's real To, Cc and Bcc; a failing read is the caller's error, never a free pass.
-        const draft = await ctx
+        read = await ctx
           .use(SEND, a)
           .readDraft(a, idOf(ctx, args.draftId).providerId, sendCap(ctx));
-        entries = entriesOf(draft);
+        entries = entriesOf(read);
         args.checkedRecipients = normalizeRecipients(entries);
+        args.draftLock = DRAFT_UNLOCKED;
       } else {
         try {
           entries = entriesOf(checkRecipients(ctx.env, args));
@@ -613,6 +668,11 @@ const sendMessage = defineTool({
         }
       }
       if (!(await holdsForNew(ctx, args, a, entries))) return false;
+      if (read) {
+        // Held: the owner will be shown this read, and the approval is bound to it.
+        args.draftLock = await draftFingerprint(read);
+        draftMemo.set(args, Promise.resolve(read));
+      }
       // Held: refuse at once what could never go out.
       if (args.draftId) {
         await refusing(ctx, a, "send_message", undefined, async () => {
@@ -640,7 +700,7 @@ const sendMessage = defineTool({
     view: async (args, ctx) => {
       const ref = args.draftId ?? args.replyToMessageId ?? args.replyThreadId;
       const a = await accountFor(ctx, args.account, ref ? idOf(ctx, ref).shortId : undefined);
-      if (args.draftId) return draftView(ctx, a, { ...args, draftId: args.draftId });
+      if (args.draftId) return draftView(ctx, a, args, args.draftId);
       const prepared = await heldPrepared(args, () =>
         ctx.use(SEND, a).prepare(a, {
           kind: "send",
@@ -675,7 +735,25 @@ const sendMessage = defineTool({
 
     if (args.draftId) {
       const draftId = idOf(ctx, args.draftId).providerId;
-      const draft = await sender.readDraft(a, draftId, sendCap(ctx));
+      // The draft lock (see above): a refusal is audited and nothing has been sent.
+      const lock = args.draftLock;
+      const refuse = (message: string): Promise<never> =>
+        refusing(ctx, a, "send_message", undefined, () => {
+          throw new ToolError(message === DRAFT_GONE ? "not_found" : "invalid_argument", message);
+        });
+      if (lock === undefined && args.checkedRecipients !== undefined) await refuse(DRAFT_LEGACY);
+      let draft: DraftEnvelope;
+      try {
+        draft = await sender.readDraft(a, draftId, sendCap(ctx));
+      } catch (e) {
+        if (lock && lock !== DRAFT_UNLOCKED && e instanceof ToolError && e.code === "not_found") {
+          return refuse(DRAFT_GONE);
+        }
+        throw e;
+      }
+      if (lock && lock !== DRAFT_UNLOCKED && lock !== (await draftFingerprint(draft))) {
+        await refuse(DRAFT_CHANGED);
+      }
       const fromHeader = draft.from ? parseAddresses(draft.from)[0] : undefined;
       const { sent } = await guardedSend(
         ctx,

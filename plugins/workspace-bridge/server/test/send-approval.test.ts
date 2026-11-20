@@ -973,6 +973,8 @@ async function approvals(e: Env, ownerId: string, id: string) {
     approve: (env2: Env = e) =>
       fetchPage(env2, { method: "POST", form: { decision: "approve", csrf } }),
     row: () => first<PendingActionRow>(env.DB, "SELECT * FROM pending_actions WHERE id = ?", id),
+    /** The approval page as the owner sees it now. */
+    html: async (env2: Env = e) => (await fetchPage(env2, {})).text(),
   };
 }
 
@@ -1154,6 +1156,172 @@ describe("the approved send", () => {
       id,
     );
     expect(JSON.parse(row?.params ?? "{}").args.checkedRecipients).toEqual(["dan@example.net"]);
+  });
+
+  describe("a held draft is bound to what the owner was shown", () => {
+    const CHANGED = "The draft changed after it was held. Nothing was sent.";
+    const heldDraft = async (mode: string) => {
+      const { ownerId, accountId, key } = await setup();
+      const e = MODE(mode);
+      installGoogleRoutes([
+        { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+        batchRoute(),
+        ...peopleRoutes(),
+      ]);
+      const id = await heldWithGrant(e, ownerId, "send_message", { draftId: `${key}:d1` });
+      return { e, ownerId, accountId, id, page: await approvals(e, ownerId, id) };
+    };
+    const refusalOf = async (
+      h: Awaited<ReturnType<typeof heldDraft>>,
+      calls: GoogleCall[],
+      message: string,
+    ) => {
+      expect(sendCalls(calls)).toHaveLength(0);
+      expect(calls.some((c) => c.method === "DELETE")).toBe(false);
+      const row = await h.page.row();
+      expect(row?.status).toBe("failed");
+      expect(JSON.parse(row?.result ?? "{}").error.message).toContain(message);
+      // The owner's page and the client's get_pending_action both say why.
+      expect(await h.page.html()).toContain(message);
+      const got = await call(h.e, h.ownerId, "get_pending_action", { pendingActionId: h.id });
+      expect(got.json.status).toBe("failed");
+      expect(got.json.result.error.message).toContain(message);
+      const audit = await all<{ result: string }>(
+        env.DB,
+        "SELECT result FROM audit_log WHERE owner_id = ? AND tool = 'send_message' ORDER BY id",
+        h.ownerId,
+      );
+      expect(audit.map((r) => r.result).at(-1)).toBe("refused");
+    };
+
+    it("stores a fingerprint of the draft, taken from the read the preview shows", async () => {
+      const { ownerId, key } = await setup();
+      const calls = installGoogleRoutes([
+        { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+        batchRoute(),
+        ...peopleRoutes(),
+      ]);
+      const id = await heldWithGrant(MODE("all"), ownerId, "send_message", {
+        draftId: `${key}:d1`,
+        draftLock: "sha256:supplied-by-the-caller",
+      });
+      const row = await first<PendingActionRow>(
+        env.DB,
+        "SELECT * FROM pending_actions WHERE id = ?",
+        id,
+      );
+      expect(JSON.parse(row?.params ?? "{}").args.draftLock).toMatch(/^sha256:[0-9a-f]{64}$/);
+      // The raw read at the hold is the one the preview used: the envelope is not read again, and
+      // the body text read for the page is checked against the lock by one more raw read.
+      const raws = calls.filter((c) => c.url.startsWith(DRAFT) && c.url.includes("format=raw"));
+      expect(raws).toHaveLength(2);
+    });
+
+    for (const mode of ["new_recipients", "all"]) {
+      it(`sends the draft when it is unchanged at approval (mode ${mode})`, async () => {
+        const h = await heldDraft(mode);
+        const calls = installGoogleRoutes([
+          { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+          sendRoute(),
+          draftDeleteRoute(),
+        ]);
+        await h.page.approve();
+        expect((await h.page.row())?.status).toBe("executed");
+        expect(sendCalls(calls)).toHaveLength(1);
+      });
+
+      it(`refuses a draft whose body was edited after the hold (mode ${mode})`, async () => {
+        const h = await heldDraft(mode);
+        const calls = installGoogleRoutes([
+          { url: DRAFT, reply: () => googleJson(200, rawDraft({ body: "Send the money to me." })) },
+          sendRoute(),
+          draftDeleteRoute(),
+        ]);
+        await h.page.approve();
+        await refusalOf(h, calls, CHANGED);
+      });
+
+      // Deleted and made again: the new draft has a new id, so the held id is simply gone.
+      it(`refuses a draft that was deleted after the hold (mode ${mode})`, async () => {
+        const h = await heldDraft(mode);
+        const calls = installGoogleRoutes([
+          { url: DRAFT, reply: () => googleJson(404, { error: { code: 404, message: "gone" } }) },
+          sendRoute(),
+          draftDeleteRoute(),
+        ]);
+        await h.page.approve();
+        await refusalOf(h, calls, "The draft was deleted after it was held. Nothing was sent.");
+      });
+    }
+
+    it("refuses a draft whose thread changed after the hold", async () => {
+      const h = await heldDraft("all");
+      const calls = installGoogleRoutes([
+        { url: DRAFT, reply: () => googleJson(200, rawDraft({ threadId: "t_other" })) },
+        sendRoute(),
+        draftDeleteRoute(),
+      ]);
+      await h.page.approve();
+      await refusalOf(h, calls, CHANGED);
+    });
+
+    it("refuses a held draft send that has no fingerprint (held before the lock existed)", async () => {
+      const h = await heldDraft("all");
+      // The row as an older version wrote it: the same args without `draftLock`.
+      const row = await h.page.row();
+      const stored = JSON.parse(row?.params ?? "{}");
+      stored.args.draftLock = undefined;
+      await env.DB.prepare("UPDATE pending_actions SET params = ? WHERE id = ?")
+        .bind(JSON.stringify(stored), h.id)
+        .run();
+      const calls = installGoogleRoutes([
+        { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+        sendRoute(),
+        draftDeleteRoute(),
+      ]);
+      await h.page.approve();
+      await refusalOf(h, calls, "held before drafts were bound to what the owner was shown");
+      expect(calls).toHaveLength(0); // refused before Google was asked anything
+    });
+
+    it("still sends a draft that was not held, without a stored fingerprint check", async () => {
+      const { ownerId, accountId, key } = await setup();
+      await recordKnownRecipients(env.DB, accountId, ["dan@example.net"], "sent");
+      for (const mode of ["off", "new_recipients"]) {
+        installGoogleRoutes([
+          { url: DRAFT, reply: () => googleJson(200, rawDraft()) },
+          sendRoute(),
+          draftDeleteRoute(),
+        ]);
+        const res = await call(MODE(mode), ownerId, "send_message", { draftId: `${key}:d1` });
+        expect(res.isError).toBe(false);
+        expect(res.json.status).toBeUndefined();
+      }
+    });
+
+    it("shows no body when the draft changed while the page was being built", async () => {
+      const { ownerId, key } = await setup();
+      // Reads of the draft: 1 raw (the fingerprint), 2 text for the page, 3 raw again. The edit
+      // lands before the third.
+      installGoogleRoutes([
+        {
+          url: DRAFT,
+          reply: (_req, n) =>
+            googleJson(200, n < 2 ? rawDraft() : rawDraft({ body: "Edited meanwhile." })),
+        },
+        batchRoute(),
+        ...peopleRoutes(),
+      ]);
+      const id = await heldWithGrant(MODE("all"), ownerId, "send_message", {
+        draftId: `${key}:d1`,
+      });
+      const row = await first<PendingActionRow>(
+        env.DB,
+        "SELECT * FROM pending_actions WHERE id = ?",
+        id,
+      );
+      expect(JSON.parse(row?.preview ?? "{}")._view).toMatchObject({ bodyUnavailable: true });
+    });
   });
 
   for (const [mode, readsBeforeSend] of [
