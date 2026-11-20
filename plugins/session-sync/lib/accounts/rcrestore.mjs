@@ -98,12 +98,13 @@ const BRIDGE_MARK = Buffer.from('"type":"bridge-session"');
 const CHUNK = 256 * 1024;
 
 /**
- * The LAST `{"type":"bridge-session", ...}` entry of a transcript, or null. Reads the file backwards in blocks and decodes only the
- * line that holds the marker; no other line is ever decoded or parsed (the CLI re-appends the entry every turn, so it is near the end).
+ * The `{"type":"bridge-session", ...}` entries of a transcript, newest first, each handed to `visit(entry)` until it returns true. Reads the
+ * file backwards in blocks and decodes only the lines that hold the marker; no other line is ever decoded or parsed (the CLI re-appends the
+ * entry every turn, so the last one is near the end).
  */
-export function lastBridgeEntry(file) {
+export function scanBridgeEntries(file, visit) {
   let fd;
-  try { fd = openSync(file, 'r'); } catch { return null; }
+  try { fd = openSync(file, 'r'); } catch { return; }
   try {
     let pos = fstatSync(fd).size;
     let carry = Buffer.alloc(0);
@@ -119,15 +120,55 @@ export function lastBridgeEntry(file) {
         const ls = data.lastIndexOf(10, i) + 1;
         if (ls === 0 && pos > 0) { unresolved = true; break; }          // the line starts in an earlier block
         let le = data.indexOf(10, i); if (le < 0) le = data.length;
-        try { const o = JSON.parse(data.subarray(ls, le).toString('utf8')); if (o && o.type === 'bridge-session') return o; } catch { /* a partial line */ }
+        let o = null;
+        try { o = JSON.parse(data.subarray(ls, le).toString('utf8')); } catch { /* a partial line */ }
+        if (o && o.type === 'bridge-session' && visit(o) === true) return;
         end = ls > 0 ? ls - 1 : 0;
       }
-      if (unresolved) { carry = data; continue; }
+      if (unresolved) { carry = data.subarray(0, end); continue; }   // only what was not visited yet (entries after `end` were handed to visit already)
       const nl = data.indexOf(10);
       carry = nl < 0 ? data : data.subarray(0, nl);                      // the head of a line that began in an earlier block
     }
-    return null;
   } finally { try { closeSync(fd); } catch { /* ignore */ } }
+}
+
+/** The LAST bridge-session entry of a transcript, or null. */
+export function lastBridgeEntry(file) {
+  let found = null;
+  scanBridgeEntries(file, (o) => { found = o; return true; });
+  return found;
+}
+
+const SUPPRESSION_MARK = Buffer.from('"type":"history-suppression"');
+
+/** Does the transcript carry a `history-suppression` line? A type-token scan of the raw bytes; no line is decoded or kept. */
+export function hasHistorySuppression(file) {
+  let fd;
+  try { fd = openSync(file, 'r'); } catch { return false; }
+  try {
+    const size = fstatSync(fd).size;
+    const buf = Buffer.alloc(CHUNK + SUPPRESSION_MARK.length);
+    for (let pos = 0; pos < size; pos += CHUNK) {
+      const n = readSync(fd, buf, 0, Math.min(buf.length, size - pos), pos);   // the blocks overlap by the mark's length, so a mark on a block edge is found
+      if (buf.subarray(0, n).includes(SUPPRESSION_MARK)) return true;
+    }
+    return false;
+  } catch { return false; } finally { try { closeSync(fd); } catch { /* ignore */ } }
+}
+
+/**
+ * Is this `noHistoryBackfill` link the signature of a gone-bounce (the CLI tried to reattach to a saved link that no longer exists and
+ * minted a neutral-named one)? Yes only when the entry before it, ignoring repeats of the link itself, is a DIFFERENT non-empty link (a
+ * reattach target existed) and the transcript carries no history-suppression line. A link that follows a clear line, or the transcript's
+ * first link, or any link of a transcript with a lasting history-suppression flag (every resume mints a `noHistoryBackfill` link there), is
+ * not a bounce: clearing it only makes the next resume mint the same flag again, one orphaned remote session per loop.
+ */
+export function isGoneBounce(file, entry) {
+  if (!entry?.bridgeSessionId) return false;
+  let prev = null;
+  scanBridgeEntries(file, (o) => { if (o.bridgeSessionId === entry.bridgeSessionId) return false; prev = o; return true; });
+  if (!prev || typeof prev.bridgeSessionId !== 'string' || prev.bridgeSessionId === '') return false;
+  return !hasHistorySuppression(file);
 }
 
 /**
@@ -136,15 +177,15 @@ export function lastBridgeEntry(file) {
  * id) needs nothing. The entry's `ownerAccountUuid` is never read: the CLI stamps it from its own cached identity, so on a machine that
  * switched accounts every link carries the old account's uuid, healthy ones included.
  */
-export function relinkReason(entry, foreign = () => false, stale = () => false) {
+export function relinkReason(entry, foreign = () => false, stale = () => false, bounce = () => true) {
   if (!entry || !entry.bridgeSessionId) return null;
-  if (entry.noHistoryBackfill === true) return 'noHistoryBackfill';
+  if (entry.noHistoryBackfill === true && bounce() === true) return 'noHistoryBackfill';
   if (foreign(entry.bridgeSessionId) === true) return 'foreign';
   return stale(entry.bridgeSessionId) === true ? 'stale' : null;
 }
 
-export function needsRelink(entry, foreign = () => false, stale = () => false) {
-  return relinkReason(entry, foreign, stale) !== null;
+export function needsRelink(entry, foreign = () => false, stale = () => false, bounce = () => true) {
+  return relinkReason(entry, foreign, stale, bounce) !== null;
 }
 
 /**
@@ -152,8 +193,9 @@ export function needsRelink(entry, foreign = () => false, stale = () => false) {
  * current sign-in began, whatever account minted it (the app retires an account's Remote Control instance at a switch, so such a link is gone
  * too, and the CLI's reattach to it ends in a link with a default name). The cutoff is the start of the current sign-in, or fc's own override.
  */
-export function linkReason(fc, entry, transcript) {
-  return relinkReason(entry, (id) => fc?.foreign(id, transcript) === true, (id) => fc?.staleLink?.(id, transcript) === true);
+export function linkReason(fc, entry, transcript, { guard = true } = {}) {
+  return relinkReason(entry, (id) => fc?.foreign(id, transcript) === true, (id) => fc?.staleLink?.(id, transcript) === true,
+    guard ? () => isGoneBounce(transcript, entry) : () => true);   // 0.5.10: a noHistoryBackfill link counts only as a gone-bounce (isGoneBounce); guard:false is the explicit rc-repair
 }
 
 /* ------------------------------------------------------------------ eligibility and the scan */
@@ -596,7 +638,7 @@ const lc = (s) => String(s ?? '').toLowerCase();
  */
 export function liveRelinkCandidates(ctx, o = {}) {
   const acct = (o.acct ?? readSignedIn(ctx.userData)) || null;
-  const out = { acct, records: 0, noTranscript: 0, candidates: [], foreignCheck: null };
+  const out = { acct, records: 0, noTranscript: 0, guarded: 0, candidates: [], foreignCheck: null };
   if (!acct) return out;
   const now = o.now ?? ctx.now();
   const days = o.days ?? RC_DEFAULTS.days;
@@ -613,7 +655,7 @@ export function liveRelinkCandidates(ctx, o = {}) {
     if (!tp) { out.noTranscript++; continue; }
     const b = lastBridgeEntry(tp);
     const why = linkReason(fc, b, tp);
-    if (!why) continue;
+    if (!why) { if (b?.bridgeSessionId && b.noHistoryBackfill === true) out.guarded++; continue; }   // a noHistoryBackfill link that is no gone-bounce: left alone (isGoneBounce)
     out.candidates.push({ file: r.path, id: rec.sessionId, cliSessionId: rec.cliSessionId, title: rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why, running: rec.isRunning === true });
   }
   return out;
@@ -639,7 +681,7 @@ export function liveLine(res) {
  * @returns {Promise<{ran:boolean, reason?:string, dryRun:boolean, acct, candidates:number, cleared:object[], wouldClear:object[],
  *   skippedLive:number, quiet:number, running:number, unknown:number, self:number, raced:number, deferred:number, failed:number, stale:number,
  *   undated:number (links the history could not date: left alone by the foreign check), undatedStale:number (undatable links judged stale by the
- *   transcript's modified time), sessions:[{id, cliSessionId, title, why, link, outcome}] (the verdict of each candidate)}>}
+ *   transcript's modified time), guarded:number (noHistoryBackfill links left alone, see isGoneBounce), sessions:[{id, cliSessionId, title, why, link, outcome}] (the verdict of each candidate)}>}
  */
 export async function liveRelinkPass(ctx, o = {}) {
   const s = o.settings ?? RC_DEFAULTS;
@@ -651,16 +693,19 @@ export async function liveRelinkPass(ctx, o = {}) {
   const nowMs = () => o.now ?? ctx.now();
   const quietMs = o.quietMs ?? LIVE_QUIET_MS;
   const max = o.max ?? s.liveMax ?? RC_DEFAULTS.liveMax;
-  // the process list can fail while the machine is busy (an account switch): `liveTries` reads, `liveRetryMs` apart. Unknown after the last try
-  // means "a live CLI cannot be ruled out": nothing is written, and the sessions stay candidates for the next pass.
+  // the process list can fail while the machine is busy or the app tears its CLIs down (an account switch). `liveBackoffMs` (an array of waits)
+  // or `liveTries` reads `liveRetryMs` apart: one retry per wait. Unknown after the last try means "a live CLI cannot be ruled out": nothing is
+  // written (never treated as "no CLI"), and the sessions stay candidates for the next pass.
   const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const waits = Array.isArray(o.liveBackoffMs) ? o.liveBackoffMs : Array(Math.max(0, (o.liveTries ?? 1) - 1)).fill(o.liveRetryMs ?? 3000);
   const readLive = async () => {
     const f = 'liveCliIds' in o ? o.liveCliIds : (() => liveCliIds({ platform: o.platform ?? ctx.platform, timeoutMs: o.cimTimeoutMs }));
     for (let i = 0; ; i++) {
       const v = typeof f === 'function' ? await f() : f;
       if (v != null) return new Set([...v].map(lc));
-      if (i + 1 >= Math.max(1, o.liveTries ?? 1)) return null;
-      await sleep(o.liveRetryMs ?? 3000);
+      if (i >= waits.length) { if (waits.length && !dry) log(`rc-live: the process list could not be read after ${i + 1} tries; nothing was written`); return null; }
+      if (!dry) log(`rc-live: the process list could not be read, trying again in ${Math.round(waits[i] / 1000)} s (try ${i + 1} of ${waits.length + 1})`);
+      await sleep(waits[i]);
     }
   };
   const outcomes = new Map();   // per session, the last verdict of this pass: cleared | would-clear | live | quiet | mid-turn | gone | changed | self | deferred | failed | unknown
@@ -677,6 +722,7 @@ export async function liveRelinkPass(ctx, o = {}) {
   res.undated = scan.foreignCheck.undated;
   res.undatedStale = scan.foreignCheck.undatedStale;   // links judged stale by the transcript's modified time because they could not be dated
   res.records = scan.records;
+  res.guarded = scan.guarded;   // noHistoryBackfill links left alone because they are no gone-bounce (a clear line before them, or a history-suppression line)
   res.cutoff = scan.foreignCheck.signInStart;           // ms: links minted before it are stale; null when no switch is known (only foreign and noHistoryBackfill links count)
   // the ledger and the history are a cache of what this pass just learned (atomic, add-only): kept by every pass that may write, so a
   // link seen now is dated by when it was first seen even when nothing is cleared this time. A dry run keeps nothing.

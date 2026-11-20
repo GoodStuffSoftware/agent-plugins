@@ -35,7 +35,9 @@ function transcript(w, n, bridge = { noHistoryBackfill: true }) {
   const dir = join(w.root, 'projects', 'proj');
   mkdirSync(dir, { recursive: true });
   const f = join(dir, `${sid(n)}.jsonl`);
-  writeFileSync(f, `${JSON.stringify({ type: 'user', text: 'hi' })}\n${JSON.stringify({ type: 'bridge-session', sessionId: sid(n), bridgeSessionId: 'cse_old', lastSequenceNum: 3, ...bridge })}\n`);
+  // 0.5.10: a noHistoryBackfill link is a gone-bounce only when a different non-empty link came before it
+  const before = bridge.noHistoryBackfill ? `${JSON.stringify({ type: 'bridge-session', sessionId: sid(n), bridgeSessionId: 'cse_prev', lastSequenceNum: 3 })}\n` : '';
+  writeFileSync(f, `${JSON.stringify({ type: 'user', text: 'hi' })}\n${before}${JSON.stringify({ type: 'bridge-session', sessionId: sid(n), bridgeSessionId: 'cse_old', lastSequenceNum: 3, ...bridge })}\n`);
   return f;
 }
 
@@ -222,7 +224,7 @@ test('O6 rcQuitStep drops the record when it settles the relink (and when nothin
   assert.equal(existsSync(relinkOwedFile(w.ctx)), false, 'relinked: the record is gone');
   assert.match(readFileSync(tp, 'utf8'), /"bridgeSessionId":"","lastSequenceNum":0\}\n$/);
   // a refused step (the app is running) keeps it
-  writeFileSync(tp, `${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_x', noHistoryBackfill: true })}\n`);
+  writeFileSync(tp, `${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_prev', lastSequenceNum: 3 })}\n${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_x', noHistoryBackfill: true })}\n`);
   writeFileSync(relinkOwedFile(w.ctx), JSON.stringify({ v: 1, count: 1, notified: true }));
   const r2 = await rcQuitStep(w.ctx, { acct: ME, now: w.now, projects: join(w.root, 'projects'), stopped: () => false });
   assert.equal(r2.res.status, 'refused_app_running');
@@ -326,7 +328,7 @@ test('K14 the command end to end: the first prompt of an interactive session get
   // session 1 is on a random-name link (rcPlan would relink it) and no restore pass ran: the first instruction carries the owed sentence
   const projects = join(process.env.HOME, '.claude', 'projects', 'proj');
   mkdirSync(projects, { recursive: true });
-  writeFileSync(join(projects, `${sid(1)}.jsonl`), `${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_old', noHistoryBackfill: true, lastSequenceNum: 1 })}\n`);
+  writeFileSync(join(projects, `${sid(1)}.jsonl`), `${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_prev', lastSequenceNum: 3 })}\n${JSON.stringify({ type: 'bridge-session', sessionId: sid(1), bridgeSessionId: 'cse_old', noHistoryBackfill: true, lastSequenceNum: 1 })}\n`);
   const prompt = (n) => JSON.stringify({ session_id: sid(n), prompt: 'please continue', hook_event_name: 'UserPromptSubmit' });
   const sched = run(prompt(2));
   assert.equal(sched.status, 0, sched.stderr);

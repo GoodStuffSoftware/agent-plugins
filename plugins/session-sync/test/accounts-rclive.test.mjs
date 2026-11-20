@@ -53,6 +53,7 @@ function session(w, n, { link = 'cse_a', nhb = false, at = '2026-11-17T06:10:00.
   const lines = [
     JSON.stringify({ type: 'user', ...(dated ? { timestamp: at } : {}), message: 'hello' }),
     JSON.stringify({ type: 'assistant', ...(dated ? { timestamp: at } : {}), message: 'hi' }),
+    ...(nhb ? [JSON.stringify({ type: 'bridge-session', sessionId: cli(n), bridgeSessionId: 'cse_prev', lastSequenceNum: 3 })] : []),   // 0.5.10: a noHistoryBackfill link is a gone-bounce only when a different non-empty link came before it
     bridge,
     JSON.stringify({ type: 'assistant', ...(dated ? { timestamp: iso(Date.parse(at) + laterMs) } : {}), message: 'later' }),
   ];

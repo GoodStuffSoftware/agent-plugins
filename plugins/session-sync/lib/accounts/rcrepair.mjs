@@ -74,8 +74,9 @@ export async function rcRepair(ctx, o = {}) {
 
   if (rec.isRunning === true && o.atTurnEnd !== true) return refuse('mid-turn', 'That session is mid-turn. Wait until it is idle.', base);   // a request for the end of the turn is made mid-turn by definition
   const entry = lastBridgeEntry(transcript);
-  // stale: noHistoryBackfill, minted under another account, or minted before this sign-in began (read only: nothing is kept)
-  const reason = entry?.bridgeSessionId ? linkReason(makeForeign(ctx, acct, { rcLog: o.rcLog }), entry, transcript) : null;
+  // stale: noHistoryBackfill, minted under another account, or minted before this sign-in began (read only: nothing is kept). An explicit
+  // repair does not apply the automatic passes' gone-bounce guard (isGoneBounce): the user asked for this session.
+  const reason = entry?.bridgeSessionId ? linkReason(makeForeign(ctx, acct, { rcLog: o.rcLog }), entry, transcript, { guard: false }) : null;
   const stale = reason !== null;
   if (!stale && o.force !== true) {
     const why = !entry ? 'has no link line' : !entry.bridgeSessionId ? 'is already cleared' : 'is healthy (not noHistoryBackfill, not minted before this sign-in)';

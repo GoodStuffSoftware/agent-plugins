@@ -94,6 +94,19 @@ export function switchHistory(ctx, o = {}) {
   return { list, dirty };
 }
 
+/**
+ * When did the current sign-in begin, if that was within `withinMs` of `nowMs`? (ms), else null: no switch recorded (one history entry only),
+ * the last entry names another account, or the switch is older. A watcher that starts just after a switch uses it to sweep at once.
+ * Read only. o: { rcLog }
+ */
+export function recentSwitch(ctx, acct, nowMs, withinMs, o = {}) {
+  const { list } = switchHistory(ctx, { ...o, acct });
+  const last = list[list.length - 1];
+  if (list.length < 2 || !last || last.acct !== lower(acct)) return null;
+  const age = nowMs - last.at;
+  return age >= 0 && age <= withinMs ? last.at : null;
+}
+
 /** The account that was signed in at `tMs`, or null when that cannot be told (before the history, or after a switch nothing recorded). */
 export function acctAt(list, tMs, curAcct) {
   let hit = null;
