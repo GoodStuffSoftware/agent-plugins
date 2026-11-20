@@ -671,7 +671,7 @@ async function liveRelinkCommand(ctx, args) {
   const lines = [];
   if (!r.ran) lines.push(r.reason === 'disabled' ? 'The live relink is off (rcRestore.enabled or rcRestore.liveRelink). Nothing was changed. A --dry-run still shows what it would do.' : `Nothing done: ${r.reason}.`);
   else {
-    for (const c of dry ? r.wouldClear : r.cleared) lines.push(`${dry ? 'would clear' : 'cleared'} ${c.id.replace(/^local_/, '').slice(0, 8)} "${c.title}" (${c.why === 'foreign' ? 'link minted under another account' : 'noHistoryBackfill link'})`);
+    for (const c of dry ? r.wouldClear : r.cleared) lines.push(`${dry ? 'would clear' : 'cleared'} ${c.id.replace(/^local_/, '').slice(0, 8)} "${c.title}" (${c.why === 'foreign' ? 'link minted under another account' : c.why === 'stale' ? 'link minted before this sign-in' : 'noHistoryBackfill link'})`);
     lines.push(`${dry ? 'Dry run: ' : ''}${dry ? r.wouldClear.length : r.cleared.length} ${dry ? 'would be cleared' : 'cleared'} of ${r.candidates} stale; skipped live ${r.skippedLive}, quiet ${r.quiet}, mid-turn ${r.running}, unknown ${r.unknown}${r.undated ? `, undated (left alone) ${r.undated}` : ''}${r.deferred ? `, ${dry ? 'beyond the limit of one pass' : 'over the limit'} ${r.deferred}` : ''}${dry ? '' : `, raced ${r.raced}`}.`);
   }
   emit(facts, lines);
@@ -710,7 +710,7 @@ async function rcSweepCommand(ctx, args) {
     if (!dry && r.cleared.length) lines.push('Backups are under the accounts folder, rc-restore/backup/<stamp>/. Each cleared session mints a fresh link, named after its title, on its next connect.');
   }
   emit(facts, lines);
-  return r.ran && r.failed === 0 ? 0 : 1;
+  return r.ran && r.failed === 0 && !r.unknown ? 0 : 1;   // unknown: the process list could not be read, so nothing was written
 }
 
 /**

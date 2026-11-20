@@ -376,7 +376,7 @@ export async function runWaiter(ctx, o = {}) {
     // unreadable (2026-11-20: `unknown 43`, 0 cleared). Unknown never means "no CLI": nothing is written until the list reads, so the sweep
     // retries with a back-off for about 3 minutes (RC reconnected 3.5 minutes after that switch), logs each try, and has no per-pass cap (a
     // deferral would miss the window before RC reconnects).
-    const sweep = all ? { liveBackoffMs: o.sweepBackoffMs ?? SWEEP_BACKOFF_MS, max: SWEEP_MAX, cimTimeoutMs: 25000 } : {};
+    const sweep = all ? { liveBackoffMs: ctx.platform === 'win32' ? (o.sweepBackoffMs ?? SWEEP_BACKOFF_MS) : [], max: SWEEP_MAX, cimTimeoutMs: 25000 } : {};   // off Windows the probe is never available: no back-off to wait out
     try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...sweep, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
     catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); }
   };

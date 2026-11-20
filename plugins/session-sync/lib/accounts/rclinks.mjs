@@ -291,25 +291,31 @@ export function makeForeign(ctx, acct, o = {}) {
     return r;
   }
   const foreign = (bridgeId, transcript) => classify(bridgeId, transcript) === 'foreign';
-  /** When the transcript first named the link: {seen (ms|null), after (ms|null)}. The ledger first (a recorded date), else the transcript. */
-  function linkDate(bridgeId, transcript) {
+  /**
+   * The bounds of the mint time of a link: `lower` (the nearest timestamp before its first line, or the ledger's first sighting, whichever is
+   * later: the link existed no earlier than that) and `upper` (the nearest timestamp after its first line; null when there is none).
+   */
+  function linkBounds(bridgeId, transcript) {
     if (dates.has(bridgeId)) return dates.get(bridgeId);
-    const ms = Date.parse(links[bridgeId]?.firstSeen ?? '');
-    let out;
-    if (Number.isFinite(ms)) out = { seen: ms, after: null };
-    else { const b = transcript ? firstSeenBounds(transcript, bridgeId) : { before: null, after: null }; out = { seen: b.before, after: b.after }; }
+    const b = transcript ? firstSeenBounds(transcript, bridgeId) : { before: null, after: null };
+    const led = Date.parse(links[bridgeId]?.firstSeen ?? '');
+    const lows = [b.before, Number.isFinite(led) ? led : null].filter((x) => x !== null);
+    const out = { lower: lows.length ? Math.max(...lows) : null, upper: b.after };
     dates.set(bridgeId, out);
     return out;
   }
   /**
-   * Was this link minted before `cutoff` (default: the start of the current sign-in), whatever account minted it? A link that cannot be
-   * dated (no timestamp near it, or one on both sides of the cutoff) is stale when the transcript's modified time predates the cutoff:
-   * nothing has been written since. No cutoff known: false.
+   * Was this link certainly minted before `cutoff` (default: the start of the current sign-in), whatever account minted it? The nearest
+   * timestamp BEFORE the link line is only a lower bound of the mint time (a resumed session writes its link before its next timestamped
+   * line), so a link is stale only when its UPPER bound is below the cutoff: the nearest timestamp after it or, when none follows, the
+   * transcript's modified time (nothing was written since). A link first seen at or after the cutoff, or whose bounds straddle it, is left
+   * alone. No cutoff known: false.
    */
   function staleLink(bridgeId, transcript, cutoff = signInStart) {
     if (!bridgeId || !Number.isFinite(cutoff)) return false;
-    const { seen, after } = linkDate(bridgeId, transcript);
-    if (seen !== null && !(after !== null && after >= cutoff && seen < cutoff)) return seen < cutoff;
+    const { lower, upper } = linkBounds(bridgeId, transcript);
+    if (lower !== null && lower >= cutoff) return false;
+    if (upper !== null) return upper < cutoff;
     let m = null; try { m = statSync(transcript).mtimeMs; } catch { /* gone */ }
     if (m !== null && m < cutoff) { undatedStale++; return true; }
     return false;

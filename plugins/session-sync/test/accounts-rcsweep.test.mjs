@@ -51,7 +51,7 @@ const tpOf = (w, n) => join(w.projects, keyOf(n), `${cli(n)}.jsonl`);
  * A session whose transcript was first linked at `at` (ISO; 'none' = a transcript with no timestamp tokens) and whose last link is `link`.
  * `before`: bridge lines written earlier (a different link, a clear line). `suppress`: a history-suppression line.
  */
-function session(w, n, { link = 'cse_a', nhb = false, at = '2026-11-15T10:00:00.000Z', before = [], suppress = false, ageMs = 3600_000, rec = {}, laterMs = 60_000 } = {}) {
+function session(w, n, { link = 'cse_a', nhb = false, at = '2026-11-15T10:00:00.000Z', before = [], suppress = false, ageMs = 3600_000, rec = {}, laterMs = 60_000, later = true } = {}) {
   putRecord(w.folder.path, n, { lastActivityAt: iso(NOW - ageMs), title: `Session ${n}`, remoteControlUserEnabled: true, bridgeSessionIds: [`session_${n}`], ...rec });
   mkdirSync(join(w.projects, keyOf(n)), { recursive: true });
   const dated = Number.isFinite(Date.parse(at));
@@ -62,7 +62,7 @@ function session(w, n, { link = 'cse_a', nhb = false, at = '2026-11-15T10:00:00.
     ...(suppress ? [JSON.stringify({ type: 'history-suppression', cause: 'restored_owner_mismatch' })] : []),
     ...before.map((b) => (b === '' ? CLEAR(cli(n)) : bl(b))),
     bl(link, nhb ? { noHistoryBackfill: true } : {}),
-    JSON.stringify({ type: 'assistant', ...(dated ? { timestamp: iso(Date.parse(at) + laterMs) } : {}), message: 'later' }),
+    ...(later ? [JSON.stringify({ type: 'assistant', ...(dated ? { timestamp: iso(Date.parse(at) + laterMs) } : {}), message: 'later' })] : []),
   ];
   const tp = tpOf(w, n);
   mkdirSync(join(w.projects, keyOf(n)), { recursive: true });
@@ -129,6 +129,39 @@ test('S5 --before moves the cutoff: a link minted before it is cleared, one afte
   session(w2, 1, { link: 'cse_a', at: '2026-11-15T12:00:00.000Z' });                        // minted in the first stint, under ME
   const earlier = await sweep(w2, { before: Date.parse('2026-11-10T00:00:00Z') });
   assert.equal(earlier.cleared.length, 0, 'minted after that cutoff');
+});
+
+test('S3b the lower bound alone never makes a link stale: a link that is the last thing in the transcript is stale only by the modified time', async () => {
+  const w = world();
+  // minted after the sign-in by a resumed session that then went quiet: the nearest timestamp before the line is old, nothing follows it
+  const fresh = session(w, 1, { link: 'cse_fresh', at: '2026-11-15T12:00:00.000Z', later: false, ageMs: 3600_000 });         // modified after T2
+  const old = session(w, 2, { link: 'cse_old', at: '2026-11-15T12:00:00.000Z', later: false, ageMs: NOW - (T2 - 3600_000) });  // modified before T2
+  const r = await sweep(w);
+  assert.deepEqual(r.cleared.map((c) => c.id), [sid(2)]);
+  assert.equal(lastBridgeEntry(fresh).bridgeSessionId, 'cse_fresh');
+  assert.equal(lastBridgeEntry(old).bridgeSessionId, '');
+});
+
+test('S3c a link spared on the first pass is spared on the second (the ledger keeps a lower bound only)', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_x', at: iso(T2 - 600_000), laterMs: 1200_000 });
+  for (let i = 0; i < 3; i++) {
+    const r = await sweep(w);
+    assert.equal(r.cleared.length, 0, `pass ${i + 1}`);
+    assert.equal(r.candidates, 0, `pass ${i + 1}`);
+  }
+  assert.equal(lastBridgeEntry(tp).bridgeSessionId, 'cse_x');
+});
+
+test('S3d a link written after our own clear line is not judged stale again by the old lines before the clear line', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_new', at: '2026-11-15T12:00:00.000Z', before: ['cse_old', ''], laterMs: 5.5 * 86400_000 });   // the line after it is dated after T2
+  const r = await sweep(w);
+  assert.equal(r.candidates, 0);
+  assert.equal(lastBridgeEntry(tp).bridgeSessionId, 'cse_new');
+  const tail = session(w, 2, { link: 'cse_new2', at: '2026-11-15T12:00:00.000Z', before: ['cse_old', ''], later: false, ageMs: 3600_000 });   // nothing follows; modified after T2
+  assert.equal((await sweep(w)).candidates, 0);
+  assert.equal(lastBridgeEntry(tail).bridgeSessionId, 'cse_new2');
 });
 
 /* ------------------------------------------------------------------ the gates */
