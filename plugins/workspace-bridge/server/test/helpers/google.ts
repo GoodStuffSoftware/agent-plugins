@@ -243,11 +243,13 @@ export function rawDraft(
     cc?: string;
     subject?: string;
     threadId?: string;
+    /** The draft's message id; Gmail gives every edit a new one. */
+    messageId?: string;
     body?: string;
     /** Extra header lines, such as `["Bcc", "x@example.org"]`. */
     headers?: [string, string][];
   } = {},
-): { id: string; message: { threadId?: string; raw: string } } {
+): { id: string; message: { id: string; threadId?: string; raw: string } } {
   const lines = [
     `From: ${over.from ?? "work@example.com"}`,
     `To: ${over.to ?? "dan@example.net"}`,
@@ -260,6 +262,7 @@ export function rawDraft(
   return {
     id: over.id ?? "d1",
     message: {
+      id: over.messageId ?? "m_d1",
       ...(over.threadId ? { threadId: over.threadId } : {}),
       raw: base64url(new TextEncoder().encode(mime)),
     },

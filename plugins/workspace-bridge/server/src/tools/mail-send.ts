@@ -18,7 +18,7 @@ import { sha256Hex } from "../core/crypto";
 import { ToolError } from "../core/errors";
 import { buildHeldMailView, type HeldMailAction, type HeldMailView } from "../core/held-view";
 import { accountKey } from "../core/ids";
-import { b64urlToBytes, parseAddresses } from "../core/mime";
+import { parseAddresses } from "../core/mime";
 import {
   findNewRecipients,
   heldBecause,
@@ -370,31 +370,29 @@ function heldDraft(
 // ---- The draft lock ------------------------------------------------------------------------------
 //
 // A held draft send is bound to the draft the owner was shown. `approval.when` stores `draftLock`
-// with the call: "sha256:<hex>" over the exact message `readDraft` returned (the decoded
-// `format=raw` bytes: headers, recipients, body parts and attachments, plus the thread the message
-// is sent in). The handler reads the draft again when the owner approves and sends only if the
+// with the call: "sha256:<hex>" over the exact message `readDraft` returned (Gmail's `format=raw`
+// text: headers, recipients, body parts and attachments, plus the thread the message is sent in).
+// The handler reads the draft again when the owner approves and sends only if the
 // fingerprint is the same; it sends those very bytes (`sendDraft`), so nothing can change between
 // the check and the send. The Gmail draft id stays the same across edits and the message id inside
 // it changes, so neither proves anything; the content is what is compared. A re-save that changes
-// nothing keeps the fingerprint. `DRAFT_UNLOCKED` marks a draft send that was not held (it runs at
-// once in the same call, so there is no owner preview to bind it to). A call with neither value,
-// but with `checkedRecipients`, is a draft send held before this lock existed.
+// nothing keeps the fingerprint (when the bytes are the same). `DRAFT_UNLOCKED` marks a draft send
+// that was not held (it runs at once in the same call, so there is no owner preview to bind it to;
+// it is never stored). A call with neither value, but with `checkedRecipients`, is a draft send
+// held before this lock existed.
 
 const DRAFT_UNLOCKED = "unlocked";
 
 /** The fingerprint of the message a draft read returned, as it would be sent. */
 async function draftFingerprint(draft: DraftEnvelope): Promise<string> {
-  const head = new TextEncoder().encode(`wb-draft-1\0${draft.threadId ?? ""}\0`);
-  const body = b64urlToBytes(draft.raw);
-  const all = new Uint8Array(head.length + body.length);
-  all.set(head);
-  all.set(body, head.length);
-  return `sha256:${await sha256Hex(all)}`;
+  // The base64url text is hashed as it is (padding aside): one encode and one digest, no decode.
+  const text = `wb-draft-1\0${draft.threadId ?? ""}\0${draft.raw.replace(/=+$/, "")}`;
+  return `sha256:${await sha256Hex(text)}`;
 }
 
 const AGAIN = "Ask for it to be sent again to get a fresh approval.";
 const DRAFT_CHANGED = `The draft changed after it was held. Nothing was sent. ${AGAIN}`;
-const DRAFT_GONE = `The draft was deleted after it was held. Nothing was sent. ${AGAIN}`;
+const DRAFT_GONE = `The draft is gone (deleted, or already sent) since it was held. Nothing was sent. ${AGAIN}`;
 const DRAFT_LEGACY = `This send was held before drafts were bound to what the owner was shown, so it cannot be approved. Nothing was sent. ${AGAIN}`;
 
 /** A draft's own recipients and subject for the approval summary; empty when it cannot be read. */
@@ -517,9 +515,10 @@ async function heldMailView(
 
 /**
  * The view of a held draft send: the draft as Gmail has it now (best effort for its text). The
- * envelope is the read `when` fingerprinted. The text comes from a later read, so the draft is read
- * once more afterwards: if it no longer has the locked fingerprint, the text may not be what is
- * locked, and the page says the body could not be shown (the approval would refuse that draft anyway).
+ * envelope is the read `when` fingerprinted. The text comes from a later read; Gmail gives every
+ * edit a new message id (even one that restores earlier content), so the text is shown only when it
+ * was read from the very message that was fingerprinted. Otherwise the page says the body could not
+ * be shown (the approval would refuse a changed draft anyway).
  */
 async function draftView(
   ctx: ToolContext,
@@ -529,14 +528,12 @@ async function draftView(
 ): Promise<HeldMailView> {
   // `args` itself (not a copy): the read `when` made is kept under it.
   const draft = await heldDraft(ctx, args, a, draftId);
-  let text: { text: string; html?: string | undefined } | undefined;
+  let text: { text: string; html?: string | undefined; messageId?: string | undefined } | undefined;
   try {
-    const sender = ctx.use(SEND, a);
-    const providerId = idOf(ctx, draftId).providerId;
-    text = await sender.readDraftText?.(a, providerId);
-    if (text && args.draftLock && args.draftLock !== DRAFT_UNLOCKED) {
-      const again = await sender.readDraft(a, providerId, sendCap(ctx));
-      if ((await draftFingerprint(again)) !== args.draftLock) text = undefined;
+    text = await ctx.use(SEND, a).readDraftText?.(a, idOf(ctx, draftId).providerId);
+    const locked = args.draftLock !== undefined && args.draftLock !== DRAFT_UNLOCKED;
+    if (text && locked && (!draft?.messageId || text.messageId !== draft.messageId)) {
+      text = undefined;
     }
   } catch {
     text = undefined;

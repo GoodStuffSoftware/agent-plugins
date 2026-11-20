@@ -104,7 +104,7 @@ function files(v: HeldMailView): SafeHtml {
 function mailBody(m: MailPreviewData): SafeHtml {
   const v = m.view;
   if (v.bodyUnavailable && v.body === "" && m.safeHtml === undefined) {
-    return html`<p class="muted">The text of this draft could not be read here. It is sent exactly as it is in Gmail.</p>`;
+    return html`<p class="muted">The text of this draft could not be read here. It is sent only if the draft is still exactly as it was when it was held.</p>`;
   }
   if (m.safeHtml !== undefined) {
     const inner = `${m.safeHtml}${m.safeQuoteHtml ? `<div class="quoted">${m.safeQuoteHtml}</div>` : ""}`;

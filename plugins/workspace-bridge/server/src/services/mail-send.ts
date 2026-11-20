@@ -103,6 +103,8 @@ export type DraftEnvelope = {
    * `sendDraft` sends these bytes and nothing else.
    */
   raw: string;
+  /** The id of the draft's message; Gmail gives every edit of a draft a new one. */
+  messageId?: string;
   /** The thread the draft belongs to, kept when the message is sent. */
   threadId?: string;
 };
@@ -131,7 +133,10 @@ export interface SendService {
    * holds (the bytes that are sent are `readDraft`'s `raw`). Optional: a provider without it shows
    * no draft text.
    */
-  readDraftText?(a: AccountRef, draftId: string): Promise<{ text: string; html?: string }>;
+  readDraftText?(
+    a: AccountRef,
+    draftId: string,
+  ): Promise<{ text: string; html?: string; messageId?: string }>;
   /**
    * Sends `draft.raw` (what `readDraft` returned and the caller checked, never a fresh copy of the
    * draft) and then deletes the draft `draftId`.

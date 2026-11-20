@@ -498,11 +498,14 @@ function rawAttachmentTotals(bin: string): AttachmentTotals {
  * the same thing, whatever happens to the draft in between.
  */
 async function readDraft(a: AccountRef, draftId: string, maxBytes: number): Promise<DraftEnvelope> {
-  const d = await gjson<{ id?: string; message?: { threadId?: string; raw?: string } }>(
+  const d = await gjson<{
+    id?: string;
+    message?: { id?: string; threadId?: string; raw?: string };
+  }>(
     a,
     `${BASE}/drafts/${enc(draftId)}`,
     {},
-    { fields: "id,message(threadId,raw)", query: { format: "raw" } },
+    { fields: "id,message(id,threadId,raw)", query: { format: "raw" } },
   );
   const raw = d.message?.raw;
   if (!d.id || !raw) throw malformed();
@@ -537,22 +540,31 @@ async function readDraft(a: AccountRef, draftId: string, maxBytes: number): Prom
     attachmentTotals: rawAttachmentTotals(bin),
     raw,
     ...(d.message?.threadId ? { threadId: d.message.threadId } : {}),
+    ...(d.message?.id ? { messageId: d.message.id } : {}),
   };
 }
 
-/** A draft's text and HTML parts, for the owner's approval page only (never what is sent). */
+/**
+ * A draft's text and HTML parts, for the owner's approval page only (never what is sent), with the
+ * id of the message they were read from: Gmail gives every edit of a draft a new message id, so the
+ * caller can tell whether the text belongs to the revision it fingerprinted.
+ */
 async function readDraftText(
   a: AccountRef,
   draftId: string,
-): Promise<{ text: string; html?: string }> {
-  const d = await gjson<{ message?: { payload?: GmailPart } }>(
+): Promise<{ text: string; html?: string; messageId?: string }> {
+  const d = await gjson<{ message?: { id?: string; payload?: GmailPart } }>(
     a,
     `${BASE}/drafts/${enc(draftId)}`,
     {},
-    { fields: "message(payload)", query: { format: "full" } },
+    { fields: "message(id,payload)", query: { format: "full" } },
   );
   const html = extractHtmlBody(d.message?.payload);
-  return { text: extractBody(d.message?.payload), ...(html === "" ? {} : { html }) };
+  return {
+    text: extractBody(d.message?.payload),
+    ...(html === "" ? {} : { html }),
+    ...(d.message?.id ? { messageId: d.message.id } : {}),
+  };
 }
 
 /**

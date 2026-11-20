@@ -1211,10 +1211,10 @@ describe("the approved send", () => {
         id,
       );
       expect(JSON.parse(row?.params ?? "{}").args.draftLock).toMatch(/^sha256:[0-9a-f]{64}$/);
-      // The raw read at the hold is the one the preview used: the envelope is not read again, and
-      // the body text read for the page is checked against the lock by one more raw read.
+      // The raw read at the hold is the one the preview used: the envelope is not read again; the
+      // body text for the page is a format=full read, matched to it by message id.
       const raws = calls.filter((c) => c.url.startsWith(DRAFT) && c.url.includes("format=raw"));
-      expect(raws).toHaveLength(2);
+      expect(raws).toHaveLength(1);
     });
 
     for (const mode of ["new_recipients", "all"]) {
@@ -1250,7 +1250,11 @@ describe("the approved send", () => {
           draftDeleteRoute(),
         ]);
         await h.page.approve();
-        await refusalOf(h, calls, "The draft was deleted after it was held. Nothing was sent.");
+        await refusalOf(
+          h,
+          calls,
+          "The draft is gone (deleted, or already sent) since it was held.",
+        );
       });
     }
 
@@ -1299,29 +1303,36 @@ describe("the approved send", () => {
       }
     });
 
-    it("shows no body when the draft changed while the page was being built", async () => {
-      const { ownerId, key } = await setup();
-      // Reads of the draft: 1 raw (the fingerprint), 2 text for the page, 3 raw again. The edit
-      // lands before the third.
-      installGoogleRoutes([
-        {
-          url: DRAFT,
-          reply: (_req, n) =>
-            googleJson(200, n < 2 ? rawDraft() : rawDraft({ body: "Edited meanwhile." })),
-        },
-        batchRoute(),
-        ...peopleRoutes(),
-      ]);
-      const id = await heldWithGrant(MODE("all"), ownerId, "send_message", {
-        draftId: `${key}:d1`,
+    // The page text is a later read than the fingerprinted one. An edit in between gives the draft
+    // a new message id, even when the draft is put back to its earlier content (A, B, A), so the
+    // text read from another message is never shown beside the lock.
+    for (const [name, textId, unavailable] of [
+      ["the draft changed while the page was being built", "m_edited", true],
+      ["the draft is unchanged while the page is built", "m_d1", false],
+    ] as const) {
+      it(`${unavailable ? "shows no body" : "shows the body"} when ${name}`, async () => {
+        const { ownerId, key } = await setup();
+        // Reads of the draft: 1 raw (the fingerprint), 2 text for the page.
+        installGoogleRoutes([
+          {
+            url: DRAFT,
+            reply: (_req, n) => googleJson(200, rawDraft(n === 0 ? {} : { messageId: textId })),
+          },
+          batchRoute(),
+          ...peopleRoutes(),
+        ]);
+        const id = await heldWithGrant(MODE("all"), ownerId, "send_message", {
+          draftId: `${key}:d1`,
+        });
+        const row = await first<PendingActionRow>(
+          env.DB,
+          "SELECT * FROM pending_actions WHERE id = ?",
+          id,
+        );
+        const view = JSON.parse(row?.preview ?? "{}")._view;
+        expect(view.bodyUnavailable === true).toBe(unavailable);
       });
-      const row = await first<PendingActionRow>(
-        env.DB,
-        "SELECT * FROM pending_actions WHERE id = ?",
-        id,
-      );
-      expect(JSON.parse(row?.preview ?? "{}")._view).toMatchObject({ bodyUnavailable: true });
-    });
+    }
   });
 
   for (const [mode, readsBeforeSend] of [
