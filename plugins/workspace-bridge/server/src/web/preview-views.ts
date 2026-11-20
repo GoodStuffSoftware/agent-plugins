@@ -7,9 +7,13 @@
 import type { HeldMailView } from "../core/held-view";
 import { escapeHtml, html, raw, type SafeHtml } from "./html";
 
-/** The CSP the approval page sets on itself: the base policy, plus the one local frame it embeds. */
+/**
+ * The CSP the approval page sets on itself: the base policy, plus the one local frame it embeds and
+ * inline `data:` images (a srcdoc frame inherits this policy, so the frame's own `img-src data:`
+ * is not enough; `data:` cannot reach a server).
+ */
 export const APPROVAL_PAGE_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; font-src 'self'; base-uri 'none'; frame-src about:; frame-ancestors 'none'";
+  "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; font-src 'self'; base-uri 'none'; frame-src about:; frame-ancestors 'none'";
 
 /** The CSP inside the iframe's own document (a srcdoc frame also inherits the page's): no loads. */
 export const PREVIEW_FRAME_CSP =
@@ -36,6 +40,8 @@ export interface MailPreviewData {
   safeHtml: string | undefined;
   /** The sanitized HTML of the quoted original, if any. */
   safeQuoteHtml: string | undefined;
+  /** The message has an HTML part that could not be sanitized, so only the text is shown. */
+  htmlFailed?: boolean;
 }
 
 const bytesText = (n: number): string =>
@@ -102,9 +108,18 @@ function mailBody(m: MailPreviewData): SafeHtml {
   }
   if (m.safeHtml !== undefined) {
     const inner = `${m.safeHtml}${m.safeQuoteHtml ? `<div class="quoted">${m.safeQuoteHtml}</div>` : ""}`;
-    return html`<iframe class="mail-frame" sandbox="" referrerpolicy="no-referrer" title="The message body" srcdoc="${previewDocument(inner)}"></iframe>`;
+    // The plain part is what a text-only reader gets; it can differ from the HTML, so it is here too.
+    return html`<iframe class="mail-frame" sandbox="" referrerpolicy="no-referrer" title="The message body" srcdoc="${previewDocument(inner)}"></iframe>${
+      v.body === ""
+        ? ""
+        : html`<details class="mail-plain"><summary>Plain-text version</summary><div class="mail-text">${v.body}</div></details>`
+    }`;
   }
-  return html`<div class="mail-text">${v.body === "" ? html`<span class="muted">(no text)</span>` : v.body}</div>${
+  return html`${
+    m.htmlFailed
+      ? html`<p class="callout"><strong>The HTML version could not be previewed.</strong> The email has an HTML part that is sent as written, but it cannot be shown here safely. Only its plain-text version is shown below. Reject the email if that is not enough to decide.</p>`
+      : ""
+  }<div class="mail-text">${v.body === "" ? html`<span class="muted">(no text)</span>` : v.body}</div>${
     v.quote && v.quote.plain !== ""
       ? html`<div class="mail-text mail-quote">${v.quote.plain}</div>`
       : ""

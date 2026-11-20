@@ -244,6 +244,7 @@ td input{min-height:var(--wb-tap)}
 .mail-files{margin:0}
 .mail-note{margin:var(--wb-space-s) 0 0;font-size:.92rem}
 .mail-text{white-space:pre-wrap;overflow-wrap:anywhere;background:var(--wb-surface-2);color:var(--wb-text);border:1px solid var(--wb-border);border-radius:var(--wb-radius);padding:var(--wb-space-m);margin:var(--wb-space-m) 0 0}
+.mail-plain{margin-top:var(--wb-space-s)}
 .mail-quote{margin-top:var(--wb-space-s);color:var(--wb-text-muted);border-left:.3rem solid var(--wb-border-strong)}
 .mail-frame{display:block;width:100%;height:max(20rem,60vh);margin:var(--wb-space-m) 0 0;border:1px solid var(--wb-border-strong);border-radius:var(--wb-radius);background:#fff;resize:vertical}
 .page-intro{color:var(--wb-text-muted);margin:calc(var(--wb-space-s) * -1) 0 var(--wb-space-m)}

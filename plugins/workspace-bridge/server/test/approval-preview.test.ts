@@ -178,23 +178,23 @@ describe("sanitizeEmailHtml", () => {
     expect(out).not.toContain("alert");
   });
 
-  it("drops iframe, object, embed, link, meta, base, svg and media with their content", async () => {
+  it("drops iframe, embed, link, meta, base and svg with their content", async () => {
     const out = await clean(
       [
         '<iframe src="https://evil.example/f">inside-iframe</iframe>',
-        '<object data="https://evil.example/o">inside-object</object>',
         '<embed src="https://evil.example/e">',
         '<link rel="stylesheet" href="https://evil.example/s.css">',
         '<meta http-equiv="refresh" content="0;url=https://evil.example/m">',
         '<base href="https://evil.example/">',
         '<svg onload="alert(1)"><script>alert(2)</script></svg>',
         '<video src="https://evil.example/v"></video><audio src="https://evil.example/a"></audio>',
+        "<textarea>inside-textarea</textarea><select><option>inside-option</option></select>",
         "<p>kept</p>",
       ].join(""),
     );
     expect(out).not.toContain("evil.example");
     expect(out).not.toContain("inside-");
-    expect(out).not.toMatch(/<(?:iframe|object|embed|link|meta|base|svg|video|audio)/i);
+    expect(out).not.toMatch(/<(?:iframe|object|embed|link|meta|base|svg|video|audio|textarea|select)/i);
     expect(out).toContain("<p>kept</p>");
   });
 
@@ -226,10 +226,85 @@ describe("sanitizeEmailHtml", () => {
     expect(out).toContain('align="center"');
   });
 
-  it("does not throw on broken markup", async () => {
-    await expect(clean("<p><b>unclosed <a href=")).resolves.toBeTypeOf("string");
+  it("does not throw on text that only looks like broken markup", async () => {
     await expect(clean("")).resolves.toBe("");
     await expect(clean("<<<>>>&&&")).resolves.toBeTypeOf("string");
+    await expect(clean("<p>3 < 4 and 5 > 2</p>")).resolves.toContain("3 ");
+  });
+
+  // What the sanitizer must never hand back, whatever the input.
+  const LIVE = /<script|<link|<meta|<iframe|<plaintext|javascript:|evil\.example|\son\w+\s*=/i;
+
+  it("cannot be closed out of a style block by a re-formed end tag", async () => {
+    for (const style of [
+      "<p>a</p><style></sty<stylele><img src=https://evil.example/x.gif><script>alert(1)</script></style><p>b</p>",
+      "<style>p{}</sty<STYLEle><a href=javascript:alert(1)>x</a></style>",
+      "<style>/*x*/</STY<styleLE><link rel=stylesheet href=//evil.example/a.css></style>",
+    ]) {
+      const out = await clean(style);
+      // Whatever is left of the style text is inert; nothing live may be outside it.
+      expect(out.replace(/<style>[^<]*<\/style>/gi, "")).not.toMatch(LIVE);
+      expect(out.match(/<\/style/gi)?.length ?? 0).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("drops plaintext and what follows it", async () => {
+    const out = await clean(
+      "<p>a</p><plaintext><img src=https://evil.example/x.gif onerror=alert(1)><script>alert(2)</script>",
+    );
+    expect(out).not.toMatch(LIVE);
+    expect(out).toContain("<p>a</p>");
+  });
+
+  it("refuses markup that ends inside a tag, an attribute value or a comment", async () => {
+    for (const bad of [
+      '<p>hi</p><img src=https://evil.example/u.gif onerror="x" ',
+      "<p>hi</p><link rel=stylesheet href=https://evil.example/u.css ",
+      "<p>hi</p><script src=https://evil.example/u.js ",
+      '<p>hi</p><a href="javascript:alert(1)" ',
+      '<p>hi</p><meta http-equiv=refresh content="0;url=https://evil.example"',
+      '<a href="https://x.example/><img src=y onerror=alert(1)>',
+      "<p>hi</p><!-- <img src=https://evil.example/x.gif>",
+    ]) {
+      await expect(clean(bad)).rejects.toThrow();
+    }
+  });
+
+  it("cannot be fooled by the sender writing the end marker itself", async () => {
+    await expect(
+      clean("<p>x</p>wbend00000000000000000000000000000000<img src=https://evil.example/u "),
+    ).rejects.toThrow();
+  });
+
+  it("takes character references out of style attributes before the CSS is read", async () => {
+    const out = await clean(
+      '<p style="background:&#117;rl(https://evil.example/x)">a</p><p style="cursor:u&#92;rl(https://evil.example/y)">b</p><p style="background:&#x75;rl(//evil.example/z);&#64;import x">c</p>',
+    );
+    expect(out).not.toMatch(/&#|\burl\s*\(|@import/i);
+  });
+
+  it("keeps the readable content of buttons, objects and other fallback markup", async () => {
+    const out = await clean(
+      "<button>BUTTON-TEXT</button><object><p>OBJECT-TEXT</p></object><canvas>CANVAS-TEXT</canvas><video>VIDEO-TEXT</video>",
+    );
+    expect(out).toContain("BUTTON-TEXT");
+    expect(out).toContain("OBJECT-TEXT");
+    expect(out).toContain("CANVAS-TEXT");
+    expect(out).toContain("VIDEO-TEXT");
+    expect(out).not.toMatch(/<(?:button|object|canvas|video)/i);
+  });
+
+  it("removes a comment outside any element too", async () => {
+    const out = await clean("<!-- <img src=https://evil.example/x.gif> --><p>ok</p>");
+    expect(out).not.toContain("evil.example");
+    expect(out).toContain("<p>ok</p>");
+  });
+
+  it("is stable: a second pass changes nothing", async () => {
+    const once = await clean(
+      '<table align="center"><tr><td style="color:red">x <a href="https://a.example/p" title="t">l</a><img alt="a" src="https://r.example/i.png"></td></tr></table><style>p{color:blue}</style>',
+    );
+    expect(await clean(once)).toBe(once);
   });
 });
 
@@ -375,8 +450,22 @@ describe("mailPreviewView", () => {
       .replace(/&amp;/g, "&");
     expect(doc).toContain("<p>Hi <b>there</b></p>");
     expect(doc).toContain(`http-equiv="Content-Security-Policy" content="${PREVIEW_FRAME_CSP}"`);
-    // The plain body is not repeated beside the frame.
-    expect(out).not.toContain("Line one");
+    // The plain version is under the frame, collapsed, for a text-only reader.
+    expect(out).toContain('<details class="mail-plain"><summary>Plain-text version</summary>');
+    expect(out.indexOf("Line one")).toBeGreaterThan(out.indexOf("</iframe>"));
+  });
+
+  it("says so when the HTML part could not be previewed, and shows the text", () => {
+    const out = render({ htmlFailed: true });
+    expect(out).toContain("The HTML version could not be previewed.");
+    expect(out).toContain("Line one");
+    expect(out).not.toContain("<iframe");
+    expect(render()).not.toContain("could not be previewed");
+  });
+
+  it("lets inline images through both the page CSP and the frame CSP", () => {
+    expect(APPROVAL_PAGE_CSP).toMatch(/img-src [^;]*data:/);
+    expect(PREVIEW_FRAME_CSP).toMatch(/img-src data:/);
   });
 
   it("never lets sanitized HTML break out of the srcdoc attribute", () => {
@@ -767,6 +856,25 @@ describe("the approvals page for a held email", () => {
     // Details block below it quotes the exact arguments, escaped, so the host appears there).
     expect(page).not.toMatch(/<script/i);
     expect(page.slice(0, page.indexOf("<details"))).not.toContain("tracker.example");
+  });
+
+  it("shows the text and a notice when the HTML cannot be sanitized", async () => {
+    const { ownerId } = await setup();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const held = await call(ownerId, "send_message", {
+      to: ["to@example.org"],
+      subject: "News",
+      body: "innocent plain text",
+      htmlBody: '<p>hi</p><img src=https://tracker.example/u.gif onerror="x" ',
+    });
+    const page = await (
+      await (
+        await browser(ownerId)
+      )(`/approvals/${held.json.pendingActionId}`)
+    ).text();
+    expect(page).not.toContain("<iframe");
+    expect(page).toContain("The HTML version could not be previewed.");
+    expect(page).toContain("innocent plain text");
   });
 
   it("shows attachment names and sizes", async () => {

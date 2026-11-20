@@ -238,10 +238,10 @@ async function mailPreviewOf(row: PendingActionRow): Promise<MailPreviewData | u
           : undefined,
     };
   } catch (e) {
-    // A sanitizer failure shows the plain text instead; the HTML is never passed through raw.
+    // A sanitizer failure shows the plain text and a notice instead; the HTML is never passed through raw.
     console.error(internalErrorLine("approval preview", e, {}));
     const { html: _dropped, ...plain } = view;
-    return { view: plain, safeHtml: undefined, safeQuoteHtml: undefined };
+    return { view: plain, safeHtml: undefined, safeQuoteHtml: undefined, htmlFailed: true };
   }
 }
 

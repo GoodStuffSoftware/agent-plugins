@@ -2,8 +2,12 @@
 // Workers (no dependency). An allow list: a tag not on it is dropped and its content kept, the
 // dangerous ones are dropped with their content, and an attribute not on the list is removed.
 // Nothing remote is ever kept: no `img src` that is not an inline image, no `srcset`, no CSS
-// `url()` or `@import`, no `link`, `meta`, `base`, `iframe`, `object`, `embed` or `form`; links lose
+// `url()` or `@import`, no `link`, `meta`, `base`, `iframe`, `embed` or `form`; links lose
 // their `javascript:` and every other scheme but http, https, mailto and tel.
+//
+// It fails closed: markup the rewriter cannot fully parse (an unterminated tag or comment at the
+// end) or output that a second pass would still change makes `sanitizeEmailHtml` throw, and the
+// approval page then says the HTML could not be previewed.
 //
 // This is one layer. The result is shown only in a sandboxed iframe (no scripts, no same origin)
 // under a Content-Security-Policy that forbids every load, so a miss here is still contained
@@ -71,28 +75,28 @@ const ALLOWED_TAGS: ReadonlySet<string> = new Set([
   "wbr",
 ]);
 
-/** Tags removed together with everything inside them. */
+/**
+ * Tags removed together with everything inside them. `button`, `object`, `canvas`, `video`, `audio`
+ * and `map` are not here: their content is ordinary markup a recipient can read (button labels,
+ * fallback text), so the tag goes and the sanitized content stays.
+ */
 const DROPPED_WITH_CONTENT: ReadonlySet<string> = new Set([
   "applet",
-  "audio",
   "base",
-  "button",
-  "canvas",
   "embed",
   "frame",
   "frameset",
   "iframe",
   "input",
   "link",
-  "map",
   "math",
   "meta",
   "noembed",
   "noframes",
   "noscript",
-  "object",
   "option",
   "param",
+  "plaintext",
   "script",
   "select",
   "source",
@@ -101,7 +105,6 @@ const DROPPED_WITH_CONTENT: ReadonlySet<string> = new Set([
   "textarea",
   "title",
   "track",
-  "video",
   "xmp",
 ]);
 
@@ -161,8 +164,12 @@ export function sanitizeCss(css: string): string {
     .replace(/(?:behavior|-moz-binding)\s*:[^;}]*;?/gi, "");
 }
 
-/** A `style` attribute is kept, sanitized, unless sanitizing left an unquoted trace of a load. */
-const safeStyle = (value: string): string => sanitizeCss(value);
+/**
+ * A `style` attribute, sanitized. The rewriter hands over the raw attribute text but a browser
+ * decodes character references before it parses CSS (`&#117;rl(`), so each one is replaced by a
+ * space first; CSS has no use for them.
+ */
+const safeStyle = (value: string): string => sanitizeCss(value.replace(/&#?[a-z0-9]*;?/gi, " "));
 
 const escText = (s: string): string =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -171,14 +178,25 @@ const escText = (s: string): string =>
 const imagePlaceholder = (alt: string | null): string =>
   `<span class="blocked-image">[image${alt ? `: ${escText(alt.slice(0, 120))}` : ""}]</span>`;
 
-/**
- * The sanitized fragment of `markup`, safe to place in a document body (still to be shown only in
- * the sandboxed frame). Never throws on malformed markup.
- */
-export async function sanitizeEmailHtml(markup: string): Promise<string> {
+/** One rewrite. Throws when the markup ends inside a tag, attribute or comment (see below). */
+async function rewriteOnce(markup: string): Promise<string> {
+  // The rewriter passes an unparsed tail (an unterminated tag, quoted attribute or comment at the
+  // very end) through unchanged, and the caller then closes it into live markup. A random marker
+  // is appended: if the rewriter never reports it as text, the tail was not parsed and the whole
+  // input is refused. The marker is random per call, so the sender cannot plant it.
+  const marker = `wbend${crypto.randomUUID().replaceAll("-", "")}`;
+  let seen = "";
   // A <style> element cannot nest, so one buffer serves them all.
   let styleText = "";
   const rewriter = new HTMLRewriter()
+    .onDocument({
+      text(chunk) {
+        seen += chunk.text;
+      },
+      comments(c) {
+        c.remove();
+      },
+    })
     .on("*", {
       element(el) {
         const tag = el.tagName.toLowerCase();
@@ -200,9 +218,10 @@ export async function sanitizeEmailHtml(markup: string): Promise<string> {
             return;
           }
         }
+        // All off first, so a kept `title` cannot erase the one set from an `href`.
+        for (const [rawName] of attrs) el.removeAttribute(rawName);
         for (const [rawName, value] of attrs) {
           const name = rawName.toLowerCase();
-          el.removeAttribute(rawName);
           if (name === "style") {
             const css = safeStyle(value);
             if (css.trim() !== "") el.setAttribute("style", css);
@@ -225,9 +244,6 @@ export async function sanitizeEmailHtml(markup: string): Promise<string> {
           el.setAttribute("target", "_blank");
         }
       },
-      comments(c) {
-        c.remove();
-      },
     })
     .on("style", {
       text(chunk) {
@@ -235,12 +251,25 @@ export async function sanitizeEmailHtml(markup: string): Promise<string> {
         styleText += chunk.text;
         chunk.remove();
         if (chunk.lastInTextNode) {
-          chunk.after(sanitizeCss(styleText).replace(/<\/?style/gi, ""), { html: true });
+          // No `<` survives, so no `</style` can be formed from what is left.
+          chunk.after(sanitizeCss(styleText).replaceAll("<", ""), { html: true });
           styleText = "";
         }
       },
     });
-  const out = await rewriter.transform(new Response(markup)).text();
+  const out = await rewriter.transform(new Response(`${markup}${marker}`)).text();
+  if (!seen.endsWith(marker)) throw new Error("html sanitizer: markup ends inside a tag or comment");
   // The rewriter keeps a doctype; a fragment has no use for it.
-  return out.replace(/<!doctype[^>]*>/gi, "");
+  return out.replaceAll(marker, "").replace(/<!doctype[^>]*>/gi, "");
+}
+
+/**
+ * The sanitized fragment of `markup`, safe to place in a document body (still to be shown only in
+ * the sandboxed frame). Throws, and the caller shows no HTML, when the rewriter cannot parse the
+ * markup or when a second pass would still change the result (something got through the first).
+ */
+export async function sanitizeEmailHtml(markup: string): Promise<string> {
+  const once = await rewriteOnce(markup);
+  if ((await rewriteOnce(once)) !== once) throw new Error("html sanitizer: output is not stable");
+  return once;
 }
