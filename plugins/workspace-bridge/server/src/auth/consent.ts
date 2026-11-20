@@ -241,6 +241,11 @@ async function consentPost(req: Request, env: Env): Promise<Response> {
       metadata: {},
       scope: granted,
       props,
+      // Two claude.ai accounts reach this server with the same client id (a metadata-document
+      // URL), redirect URI and owner. The library's default revokes the owner's earlier grants
+      // for that client at each approval, so authorizing from one account would sign the other out.
+      // Grants end instead by the refresh token's idle TTL (REFRESH_TOKEN_TTL).
+      revokeExistingGrants: false,
     });
     return redirect(redirectTo, approved.headers);
   } catch (e) {

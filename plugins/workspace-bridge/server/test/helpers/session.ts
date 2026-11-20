@@ -171,7 +171,7 @@ export class Browser {
 export async function redeem(
   client: McpClient,
   approval: Response,
-): Promise<{ access_token: string; scope: string }> {
+): Promise<{ access_token: string; refresh_token: string; scope: string }> {
   expect(approval.status).toBe(302);
   const location = new URL(approval.headers.get("Location") ?? "");
   expect(location.origin + location.pathname).toBe(REDIRECT_URI);

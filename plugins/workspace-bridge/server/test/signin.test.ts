@@ -397,6 +397,38 @@ describe("consent", () => {
     expect(adminTokens.scope).toBe("admin");
   });
 
+  it("keeps an earlier grant usable when the same owner authorizes the same client again", async () => {
+    // Two claude.ai accounts reach one bridge with the same CIMD client id, redirect URI and owner.
+    // The library's default would revoke the first grant at the second approval, and the first
+    // account would have to sign in again. `revokeExistingGrants: false` keeps both.
+    const browser = new Browser();
+    const client = await mcpClient("full");
+    const first = await redeem(
+      client,
+      await browser.submit(await browser.signinAndConsent(google, client, OWNER)),
+    );
+    const second = await redeem(client, await browser.submit(await browser.consent(client)));
+    expect(second.refresh_token).not.toBe(first.refresh_token);
+
+    for (const tokens of [first, second]) {
+      const res = await initialize("full", tokens.access_token);
+      expect(res.status).toBe(200);
+      await res.body?.cancel();
+    }
+    // The first grant's refresh token still works: this is what the first account's next refresh does.
+    const refreshed = await exports.default.fetch(
+      new Request(`${ISSUER}/oauth/token`, {
+        method: "POST",
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          client_id: client.clientId,
+          refresh_token: first.refresh_token,
+        }),
+      }),
+    );
+    expect(refreshed.status).toBe(200);
+  });
+
   it("refuses a POST without the session's CSRF token, and the form still works after", async () => {
     const browser = new Browser();
     const client = await mcpClient("full");
