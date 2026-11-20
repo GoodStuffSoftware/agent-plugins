@@ -258,7 +258,8 @@ async function rewriteOnce(markup: string): Promise<string> {
       },
     });
   const out = await rewriter.transform(new Response(`${markup}${marker}`)).text();
-  if (!seen.endsWith(marker)) throw new Error("html sanitizer: markup ends inside a tag or comment");
+  if (!seen.endsWith(marker))
+    throw new Error("html sanitizer: markup ends inside a tag or comment");
   // The rewriter keeps a doctype; a fragment has no use for it.
   return out.replaceAll(marker, "").replace(/<!doctype[^>]*>/gi, "");
 }

@@ -194,7 +194,9 @@ describe("sanitizeEmailHtml", () => {
     );
     expect(out).not.toContain("evil.example");
     expect(out).not.toContain("inside-");
-    expect(out).not.toMatch(/<(?:iframe|object|embed|link|meta|base|svg|video|audio|textarea|select)/i);
+    expect(out).not.toMatch(
+      /<(?:iframe|object|embed|link|meta|base|svg|video|audio|textarea|select)/i,
+    );
     expect(out).toContain("<p>kept</p>");
   });
 
