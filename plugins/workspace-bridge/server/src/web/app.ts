@@ -18,7 +18,9 @@ app.use("*", async (c, next) => {
 });
 
 // Error pages use the same layout as every other page (`notice` is `page()` around a small card).
-app.notFound(() => withSecurityHeaders(notice(404, "Not found", "There is nothing at this address.")));
+app.notFound(() =>
+  withSecurityHeaders(notice(404, "Not found", "There is nothing at this address.")),
+);
 app.onError((err) => {
   console.error(`page error: ${err instanceof Error ? err.name : "unknown"}`);
   return withSecurityHeaders(

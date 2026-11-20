@@ -39,7 +39,11 @@ export interface MailPreviewData {
 }
 
 const bytesText = (n: number): string =>
-  n < 1024 ? `${n} B` : n < 1_048_576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1_048_576).toFixed(1)} MB`;
+  n < 1024
+    ? `${n} B`
+    : n < 1_048_576
+      ? `${(n / 1024).toFixed(1)} KB`
+      : `${(n / 1_048_576).toFixed(1)} MB`;
 
 const people = (label: string, list: readonly string[]): SafeHtml =>
   list.length === 0
@@ -100,7 +104,9 @@ export interface FactRow {
 }
 
 const record = (v: unknown): Record<string, unknown> | undefined =>
-  v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  v !== null && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined;
 
 /** A preview field as lines of text: a string, a number, yes or no, a list of those, or an object's entries. */
 export function valuesOf(v: unknown): string[] {

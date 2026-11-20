@@ -393,7 +393,10 @@ type ReplyArgs = {
 };
 
 /** The reply as it will be built, or undefined when the original cannot be read. */
-async function replyPrepared(ctx: ToolContext, args: ReplyArgs): Promise<PreparedMessage | undefined> {
+async function replyPrepared(
+  ctx: ToolContext,
+  args: ReplyArgs,
+): Promise<PreparedMessage | undefined> {
   return heldPrepared(args, async () => {
     const id = idOf(ctx, args.messageId);
     const a = await accountFor(ctx, args.account, id.shortId);
@@ -419,7 +422,11 @@ async function replySummary(ctx: ToolContext, args: ReplyArgs): Promise<Record<s
 }
 
 /** The From line of a message: the send-as address it will go out from, with its display name. */
-async function fromLine(ctx: ToolContext, a: AccountRef, from: string | undefined): Promise<string> {
+async function fromLine(
+  ctx: ToolContext,
+  a: AccountRef,
+  from: string | undefined,
+): Promise<string> {
   try {
     const f = await ctx.sendAs.assertFrom(a, from);
     return f.displayName ? `${f.displayName} <${f.email}>` : f.email;
@@ -643,7 +650,9 @@ const sendMessage = defineTool({
           ...(args.subject === undefined ? {} : { subject: args.subject }),
           ...(args.body === undefined ? {} : { body: args.body }),
           ...(args.htmlBody === undefined ? {} : { htmlBody: args.htmlBody }),
-          ...(args.replyThreadId ? { replyThreadId: idOf(ctx, args.replyThreadId).providerId } : {}),
+          ...(args.replyThreadId
+            ? { replyThreadId: idOf(ctx, args.replyThreadId).providerId }
+            : {}),
           ...(args.replyToMessageId
             ? { replyToMessageId: idOf(ctx, args.replyToMessageId).providerId }
             : {}),

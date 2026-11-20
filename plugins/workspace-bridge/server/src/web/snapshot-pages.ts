@@ -99,6 +99,23 @@ const approval = (over: Partial<ApprovalViewData> = {}): ApprovalViewData => ({
       "A recipient is new to this mailbox: never written to from it, not in its contacts.",
   },
   previewJson: '{\n  "from": "alex@example.com",\n  "to": ["jordan@newco.example.com"]\n}',
+  mail: {
+    view: {
+      v: 1,
+      kind: "mail",
+      action: "send",
+      from: "Alex <alex@example.com>",
+      to: ["jordan@newco.example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Quarterly planning notes",
+      body: "Hi Jordan,\n\nHere are the notes from our planning call.\nTalk Thursday?\n\nAlex",
+      files: [{ name: "planning-notes.pdf", type: "application/pdf", bytes: 48_213 }],
+      truncated: [],
+    },
+    safeHtml: undefined,
+    safeQuoteHtml: undefined,
+  },
   args: '{"to":["jordan@newco.example.com"],"subject":"Quarterly planning notes"}',
   resultJson: null,
   held: {

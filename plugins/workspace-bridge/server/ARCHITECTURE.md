@@ -238,6 +238,9 @@ Paths are under `plugins/workspace-bridge/server/`. M is the milestone that crea
 | `src/web/public.ts`             | M4a     | `/` and `/privacy` with the contact from var `OWNER_CONTACT`; `/health`.                                                                                                                                                                |
 | `src/web/accounts.ts`           | M7      | `/accounts`: list, link, unlink and revoke (M7a); component toggles, default account, relink, re-link minimal, re-encrypt (M7b).                                                                                                        |
 | `src/web/guardrails.ts`         | M14     | `/approvals/:id`: approve once, approve and allow addresses or an exact non-freemail domain (written to the held send's account before the approved run), reject; kill switch; audit view. Every POST needs the owner session and CSRF. |
+| `src/core/held-view.ts`         | M14     | The stored view of a held email (`_view` inside the pending `preview` JSON, no schema change): From, recipients, subject, text and HTML (capped, clips named in `truncated`), quoted original, file names. Built at hold time by a tool's `approval.view`; stripped from tool answers and `get_pending_action`. |
+| `src/web/preview-views.ts`      | M14     | Pure markup of the approval preview: the mail header block and body (HTML only in `<iframe sandbox="" srcdoc>` with its own CSP), key fields of the other held kinds, `APPROVAL_PAGE_CSP`. |
+| `src/web/sanitize-html.ts`      | M14     | Allow-list sanitizer for email HTML on `HTMLRewriter` (no dependency): drops scripts, handlers, `javascript:` URLs and every remote load (`img`, `srcset`, CSS `url()`/`@import`, `link`, `iframe`, `object`, `embed`, `form`, `meta`, `base`). |
 | `src/core/crypto.ts`            | M4a, M6 | M4a: random ids, SHA-256, HMAC, constant-time compare. M6: AES-256-GCM `seal`/`open` (AAD, per-row key version), `currentKeyVersion`.                                                                                                   |
 | `src/core/db.ts`                | M4a, M6 | Typed D1 helpers and row types. M6: core rows, `insertAccount`, `getAccount`, `listAccounts`, `upsertToken`, `getToken`, `incrementCounter`; M7b: `listOwnerTokens`.                                                                    |
 | `src/core/errors.ts`            | M5      | `ToolError`, codes, `toToolResult`, `okResult` (s.3.3). Google error mapping lives in `providers/google/http.ts` (M9).                                                                                                                  |
@@ -301,6 +304,7 @@ export interface ToolDef<S extends z.ZodObject = z.ZodObject> {
   untrusted?: boolean;               // output carries third-party text
   approval?: { when(args: z.output<S>, ctx: ToolContext): boolean | Promise<boolean>;   // also the cheap, Google-free checks: a throw refuses before anything is queued
                preview(args: z.output<S>, ctx: ToolContext): unknown;
+               view?(args: z.output<S>, ctx: ToolContext): unknown;   // the held email for the owner's page only (core/held-view.ts); stored as `preview._view`, never returned to a client; a failure is logged and the hold stands
                onHeld?(args: z.output<S>, ctx: ToolContext, held: HeldAction): void | Promise<void> };   // after the pending action exists (held audit row)
   handler(args: z.output<S>, ctx: ToolContext): Promise<unknown>;   // JSON-serialisable
 }
