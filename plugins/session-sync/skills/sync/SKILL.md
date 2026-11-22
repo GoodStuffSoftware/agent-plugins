@@ -42,6 +42,8 @@ Both commands log to `~/.claude/session-sync/sync.log` and raise a desktop notif
 2. Tail the log for the actual rclone error.
 3. `rateLimitExceeded` on Google Drive means the shared client_id quota — see the setup skill.
 
+A push line such as `deferred N file(s) ...` is not a failure: those files were changing while the copy ran, the rest was sent, and the next push retries them (`status` lists them under `deferredFiles`).
+
 Report honestly: a sync that reports success while transferring nothing is the failure mode worth catching. If the log shows `skip (missing)` or zero transfers, say so rather than calling it done.
 
 

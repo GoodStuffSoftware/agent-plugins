@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* **session-sync:** a push now succeeds while Claude sessions are running. A file that changes or vanishes while rclone copies it (a live transcript, a `.claude.json`, a Windows file held open) used to fail the whole run with "source file is being updated" or "sizes differ", and the whole-run retries then repeated a 30-minute copy that could never settle. The main pass now runs with a single rclone retry and a JSON log, each volatile file is classified from the log, and only real failures (network, quota, auth, a missing remote) return `ok: false` and retry. Each volatile file is then copied to a private snapshot and uploaded once. A transcript (`.jsonl`) sent from a snapshot is cut at its last complete line and uploaded with an mtime 5 s older than the local file; a transcript that grew while it was copied counts as not yet current and is sent again next pass. A file that still cannot be settled (changing again, locked, gone) is deferred to the next pass and the manifest never advances past it, so the next push picks it up.
+* **session-sync:** the older mtime on a trimmed transcript snapshot (5 s less than the local file) keeps a pull's `--update` from treating the shorter remote prefix as equal to the longer local file, so a prefix never overwrites a longer local file. The deferred push worker also runs up to 3 follow-up passes (30 s apart) while files stay deferred.
+
+### Added
+
+* **session-sync:** deferred files are reported three ways: `~/.claude/session-sync/deferred-files.json` (written after a pass that deferred something, removed after a clean one), a `deferred N file(s) ...` line in `sync.log` (and in the manual `push` output), and a `deferredFiles { at, count, byReason, names }` field in `status` (names capped at 20).
+
 ## 0.5.10 - 2026-11-20
 
 ### Added

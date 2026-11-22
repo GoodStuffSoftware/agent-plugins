@@ -234,6 +234,29 @@ test('a request left behind by a dead worker (machine shut down mid-window) is p
       'the push owed from the previous session must actually happen');
   } finally { cleanup(home, remote); }
 });
+test('status reports deferredFiles from deferred-files.json', { skip: skipReason }, () => {
+  const { home, remote, stateDir } = sandbox();
+  try {
+    writeFileSync(join(stateDir, 'deferred-files.json'), JSON.stringify({
+      at: '2026-11-22T10:00:00.000Z',
+      count: 2,
+      byReason: { 'changed-while-copying': 2 },
+      files: [
+        { label: 'projects', path: 'a/live-1.jsonl', reason: 'changed-while-copying' },
+        { label: 'projects', path: 'a/live-2.jsonl', reason: 'changed-while-copying' },
+      ],
+    }));
+    const r = run(['status'], home, remote);
+    const s = JSON.parse(r.stdout);
+    assert.equal(s.deferredFiles.count, 2);
+    assert.deepEqual(s.deferredFiles.byReason, { 'changed-while-copying': 2 });
+    assert.deepEqual(s.deferredFiles.names, ['projects/a/live-1.jsonl', 'projects/a/live-2.jsonl']);
+    // Absent file: the field is omitted entirely.
+    rmSync(join(stateDir, 'deferred-files.json'));
+    assert.equal(JSON.parse(run(['status'], home, remote).stdout).deferredFiles, undefined);
+  } finally { cleanup(home, remote); }
+});
+
 
 test('config debounceMinutes and notifyMode round-trip through the config command', { skip: skipReason }, () => {
   const { home, remote } = sandbox();
