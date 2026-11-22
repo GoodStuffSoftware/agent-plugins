@@ -55,6 +55,8 @@ node lib/cli.mjs auto-pull   # pull only if another machine is ahead
 node lib/cli.mjs config      # current settings
 ```
 
+**Pushing while Claude runs.** A push never needs Claude closed. A file that changes or vanishes while rclone copies it (a live transcript, `.claude.json`, a file Windows holds open) does not fail the push and does not trigger a whole-run retry. Each such file is copied to a private snapshot and uploaded once; a transcript is cut at its last complete line, so Drive never holds a half-written line, and the snapshot's remote mtime is 5 seconds older than the local file so a later pull never overwrites a longer local transcript with the shorter prefix. A file that still cannot be settled is deferred to the next push (the manifest does not advance past it). Deferred files are listed in `~/.claude/session-sync/deferred-files.json`, in `status` (`deferredFiles`), in `sync.log` (`deferred N file(s) ...`) and in the manual `push` output; the file is removed after a push that deferred nothing. Real failures (network, quota, auth) still fail the push and retry.
+
 ### Choosing where backups go
 
 The default is `gdrive:Claude/live` — a `Claude/live` folder on an rclone remote named
