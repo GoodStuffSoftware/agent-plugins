@@ -12,13 +12,13 @@
 
 import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync, unlinkSync, copyFileSync, truncateSync, utimesSync, openSync, readSync, closeSync } from 'node:fs';
 import { relative, dirname, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { resolveAll, SESSION_DIRS } from './paths.mjs';
-import { planIncremental, commitManifest } from './manifest.mjs';
+import { planIncremental, commitManifest, loadManifest } from './manifest.mjs';
 import { classifyReplacement, lostCount } from './transcript.mjs';
-import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote, isLocalRemote } from './rclone.mjs';
+import { runRclone, copyFlags, findRclone, findRcloneConf, hasRemote, isLocalRemote, parseRcloneLog, formatRcloneLine, classifyCopyErrors } from './rclone.mjs';
 import { notify } from './notify.mjs';
 import { makeCtx, loadState, accPath, readJson, journalRead, ACC } from './accounts/state.mjs';
 import { listFolders, groupOf, homeOf, RECORD, TOMB, UUID, OURTMP } from './accounts/folders.mjs';
@@ -27,6 +27,9 @@ const MARKER = '.last-push';
 const MANIFEST_FILE = join(homedir(), '.claude', 'session-sync', 'manifest.json');
 const CONFLICT_ROOT = join(homedir(), '.claude', 'session-sync', 'conflicts');
 const FIRST_SUCCESS_MARKER = join(homedir(), '.claude', 'session-sync', '.first-success-notified');
+// The files the last push could not copy because they were changing under it.
+// Informational only (the manifest is what makes the next pass retry them).
+const DEFERRED_FILES = join(homedir(), '.claude', 'session-sync', 'deferred-files.json');
 
 /**
  * Gate a ROUTINE (non-failure) toast behind `notifyMode`.
@@ -226,18 +229,118 @@ function withExcludes(args, excludes) {
   return out;
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// A transcript snapshot cut at its last complete line gets a remote mtime this
+// much OLDER than the local file, so a pull (rclone --update, newer wins) can
+// never see the shorter prefix as equal-or-newer than the longer local file.
+const PARTIAL_TAIL_SKEW_MS = 5000;
+
+/** Byte length of file[0,size) up to and including its last "\n"; 0 when it has none. */
+function lengthThroughLastNewline(file, size) {
+  const fd = openSync(file, 'r');
+  try {
+    const CHUNK = 64 * 1024;
+    const buf = Buffer.alloc(CHUNK);
+    let end = size;
+    while (end > 0) {
+      const start = Math.max(0, end - CHUNK);
+      const n = readSync(fd, buf, 0, end - start, start);
+      for (let i = n - 1; i >= 0; i--) if (buf[i] === 0x0a) return start + i + 1;
+      end = start;
+    }
+    return 0;
+  } finally { closeSync(fd); }
+}
+
+/**
+ * Copy one file that is changing under us into `stageRoot` as a consistent,
+ * self-contained snapshot, ready to upload. Returns
+ *   { status: 'gone' }                         the file no longer exists
+ *   { status: 'unstable' }                     it kept changing for every attempt
+ *   { status: 'ok', sig, complete }            snapshot is in stageRoot/<rel>
+ * `sig` is the "size:mtime" the manifest should hold once the snapshot is on
+ * the remote. `complete` is false when a JSONL transcript was cut at its last
+ * complete line (the writer was mid-line): the snapshot is still safe to upload
+ * (it ends on a line boundary) but the file is not up to date, so the caller
+ * must not advance the manifest for it.
+ *
+ * Plain files must hold still across the copy (same size and mtime before and
+ * after). JSONL files are append-only: bytes past the size we stat'ed first are
+ * dropped, a file that came out SHORTER than that stat is retried, and the
+ * snapshot is trimmed to the last "\n". The snapshot keeps the file's mtime
+ * (minus a skew when it was trimmed, see PARTIAL_TAIL_SKEW_MS).
+ */
+export async function snapshotFile(root, rel, stageRoot, { attempts = 3, pauseMs = 150, copy = copyFileSync } = {}) {
+  const parts = rel.split('/');
+  const abs = join(root, ...parts);
+  const dest = join(stageRoot, ...parts);
+  const jsonl = rel.toLowerCase().endsWith('.jsonl');
+  const gone = (e) => e && (e.code === 'ENOENT' || e.code === 'ENOTDIR');
+  mkdirSync(dirname(dest), { recursive: true });
+  for (let i = 0; i < attempts; i++) {
+    if (i) await sleep(pauseMs);
+    try {
+      const st1 = statSync(abs);
+      copy(abs, dest);
+      const st2 = statSync(abs);
+      let len = statSync(dest).size;
+      let complete = true;
+      if (jsonl) {
+        if (len > st1.size) { truncateSync(dest, st1.size); len = st1.size; }
+        if (len < st1.size) continue;                       // shrank or was replaced: not append-only, retry
+        const cut = lengthThroughLastNewline(dest, len);
+        if (len > 0 && cut === 0) continue;                 // no complete line yet
+        if (cut < len) { truncateSync(dest, cut); complete = false; }
+      } else if (st2.size !== st1.size || st2.mtimeMs !== st1.mtimeMs || len !== st1.size) {
+        continue;                                           // changed while we copied it
+      }
+      const mtimeMs = complete ? st1.mtimeMs : st1.mtimeMs - PARTIAL_TAIL_SKEW_MS;
+      utimesSync(dest, st1.atimeMs / 1000, mtimeMs / 1000);
+      return { status: 'ok', sig: `${st1.size}:${Math.floor(st1.mtimeMs)}`, complete };
+    } catch (e) {
+      if (gone(e)) { rmSync(dest, { force: true }); return { status: 'gone' }; }
+      // anything else (a sharing violation, a read error): treat it as "still changing" and retry
+    }
+  }
+  rmSync(dest, { force: true });
+  return { status: 'unstable' };
+}
+
+/** One log line naming the deferred files, capped: "deferred 3 file(s) to the next pass (2 unstable, 1 partial-tail): a, b, c". */
+export function summarizeDeferred(deferred, cap = 20) {
+  if (!deferred?.length) return '';
+  const by = {};
+  for (const d of deferred) by[d.reason] = (by[d.reason] || 0) + 1;
+  const reasons = Object.entries(by).map(([r, n]) => `${n} ${r}`).join(', ');
+  const names = deferred.slice(0, cap).map((d) => `${d.label}/${d.path}`).join(', ');
+  const more = deferred.length - cap;
+  return `deferred ${deferred.length} file(s) to the next pass (${reasons}): ${names}${more > 0 ? ` (+${more} more)` : ''}`;
+}
+
+/** The deferred-files record the last push left, or null (none, or unreadable). */
+export function readDeferredFiles(file = DEFERRED_FILES) {
+  try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; }
+}
+
 /**
  * PUSH — local -> remote. Read-only against local files, so it is safe to run
  * while Claude is open; it does not need the app closed.
  *
- * `map` and `manifestFile` are test-only escape hatches: production callers
+ * A file that changes or vanishes WHILE rclone copies it never fails the run
+ * and never causes a whole-run retry: it is snapshotted and sent on its own, or
+ * deferred to the next pass (see settleVolatile). Real failures still return
+ * ok:false.
+ *
+ * `map`, `manifestFile`, `deferredFile`, `snapshotOpts` and `runner` (an
+ * rclone runner) are test-only escape hatches: production callers
  * never pass them, so buildMap(remote)/MANIFEST_FILE (real ~/.claude,
  * real state dir) are used exactly as before. Tests pass a throwaway map and
  * manifest path so they can drive a real push() end-to-end (real rclone,
  * against a local-folder "remote") without ever touching the user's actual
  * home directory.
  */
-export async function push(remote, { quiet = false, onLog = () => {}, force = false, map: mapOverride = null, manifestFile = MANIFEST_FILE, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER } = {}) {
+export async function push(remote, { quiet = false, onLog = () => {}, force = false, map: mapOverride = null, manifestFile = MANIFEST_FILE, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER, deferredFile = DEFERRED_FILES, snapshotOpts = {}, runner = runRclone } = {}) {
   const { map, resolved } = mapOverride ? { map: mapOverride, resolved: { missing: [] } } : buildMap(remote);
   const paced = !isLocalRemote(remote);   // API pacing is pointless on a local disk
   if (resolved.missing.length) {
@@ -261,6 +364,12 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
 
   const t0 = Date.now();
   let failed = 0;
+  // Files that changed or vanished while rclone copied them (Claude is writing
+  // to them right now). They never fail the run: see settleVolatile below.
+  const prevAll = loadManifest(manifestFile)[remote] || {};
+  const deferred = [];            // { label, path, reason } left for the next pass
+  let vanished = 0, staged = 0;
+  const stageDirs = [];
   for (const m of todo) {
     let args;
     // A filtered entry (account-link home-only filter) always goes through
@@ -286,24 +395,68 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
       // never appear in the list. (Its match is by basename, so it is if
       // anything stricter than the rclone patterns.)
       const listFile = writeFileList(list);
-      args = ['copy', m.local, m.remote, ...copyFlags({ paced }), '--files-from', listFile, '--no-traverse'];
+      args = ['copy', m.local, m.remote, ...copyFlags({ paced, retries: 1 }), '--use-json-log', '--files-from', listFile, '--no-traverse'];
     } else {
-      args = withExcludes(['copy', m.local, m.remote, ...copyFlags({ paced })], m.excludes);
+      args = withExcludes(['copy', m.local, m.remote, ...copyFlags({ paced, retries: 1 }), '--use-json-log'], m.excludes);
     }
-    const { code, stderr } = await runRclone(args, { onLine: (l) => l && onLog(`  ${l}`) });
-    if (code !== 0) { failed++; onLog(`ERROR (${code}): ${m.label}${stderr ? ' — ' + stderr.trim().split('\n')[0] : ''}`); }
-    else onLog(`ok: ${m.label}${list ? ` (${list.length} file(s))` : m.full ? ' (full)' : ` (${m.files.length} file(s))`}`);
+    const { code, stdout, stderr } = await runner(args, { onLine: (l) => l && onLog(`  ${formatRcloneLine(l)}`) });
+    if (code === 0) {
+      onLog(`ok: ${m.label}${list ? ` (${list.length} file(s))` : m.full ? ' (full)' : ` (${m.files.length} file(s))`}`);
+      continue;
+    }
+
+    // rclone could not copy something. Whole-run retries are for REAL failures
+    // only (network, auth, quota); a file that changed or vanished under the
+    // copy is settled here, per file, and never fails the run.
+    const scan = nextForRemote[m.label] || {};
+    const sent = list ? new Set(list) : null;
+    const events = parseRcloneLog(`${stdout}\n${stderr}`);
+    const cls = classifyCopyErrors(events, {
+      known: (rel) => (sent ? sent.has(rel) : Object.hasOwn(scan, rel)),
+      localState: (rel) => {
+        try {
+          const st = statSync(join(m.local, ...rel.split('/')));
+          return `${st.size}:${Math.floor(st.mtimeMs)}` === scan[rel] ? 'same' : 'changed';
+        } catch (e) { return (e.code === 'ENOENT' || e.code === 'ENOTDIR') ? 'gone' : 'changed'; }
+      },
+    });
+    if (cls.fatal.length || !cls.perFile.size) {
+      failed++;
+      const why = cls.fatal[0] || (stderr ? formatRcloneLine(stderr.trim().split('\n')[0]) : '');
+      onLog(`ERROR (${code}): ${m.label}${why ? ' — ' + why : ''}`);
+      continue;
+    }
+
+    let r;
+    try {
+      r = await settleVolatile(m, cls.perFile, scan, prevAll[m.label], { paced, onLog, stageDirs, snapshotOpts, runner });
+      deferred.push(...r.deferred);
+      vanished += r.vanished;
+      staged += r.staged;
+      if (r.failed) { failed++; continue; }
+    } catch (e) {
+      failed++;
+      onLog(`ERROR: ${m.label} — could not settle the changing files: ${e.message}`);
+      continue;
+    }
+    onLog(`ok: ${m.label} (${cls.perFile.size} file(s) were changing: ${r.vanished} gone, ${r.staged} sent from a snapshot, ${r.deferred.length} deferred)`);
   }
+  for (const d of stageDirs) rmSync(d, { recursive: true, force: true });
 
   const mins = ((Date.now() - t0) / 60000).toFixed(1);
+  if (deferred.length) onLog(summarizeDeferred(deferred));
   if (failed) {
     if (!quiet) notify('Claude backup FAILED', `Sync did not complete after ${mins} min. Your data is still safe locally.`, { persist: true, tag: 'sync' });
     return { ok: false, failed, mins };
   }
 
   // Only now is the new state a valid baseline. Committing it after a partial
-  // failure would make the next run skip files that never landed.
+  // failure would make the next run skip files that never landed. Deferred
+  // files were put back to their previous mark (or removed from the scan) by
+  // settleVolatile, so the baseline never advances past a file that is not on
+  // the remote in full.
   const committed = commitManifest(manifestFile, remote, nextForRemote);
+  recordDeferred(deferredFile, deferred);
   if (!committed) {
     // saveManifest() swallows its own write errors (disk full, AV lock, a
     // permissions hiccup) and returns false rather than throwing — this used
@@ -312,8 +465,63 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
     onLog(`warning: manifest commit did not persist to ${manifestFile} — the next sync will re-diff more than it needs to`);
   }
   await writeMarker(remote, onLog);
-  if (!quiet) notifyRoutine(notifyMode, 'Claude backed up', `Conversations and memory are current (${mins} min). Safe to pick up on another machine.`, { tag: 'sync' }, { markerFile: firstRunMarker });
-  return { ok: true, failed: 0, mins, committed };
+  if (!quiet) notifyRoutine(notifyMode, 'Claude backed up', `Conversations and memory are current (${mins} min${deferred.length ? `; ${deferred.length} file(s) still being written will follow next time` : ''}). Safe to pick up on another machine.`, { tag: 'sync' }, { markerFile: firstRunMarker });
+  return { ok: true, failed: 0, mins, committed, deferred, vanished, staged };
+}
+
+/** Persist (or clear) the list of files the last push deferred. Never throws. */
+function recordDeferred(file, deferred) {
+  try {
+    if (!deferred.length) { rmSync(file, { force: true }); return; }
+    const byReason = {};
+    for (const d of deferred) byReason[d.reason] = (byReason[d.reason] || 0) + 1;
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), count: deferred.length, byReason, files: deferred.slice(0, 200) }, null, 2));
+  } catch { /* informational only */ }
+}
+
+/**
+ * Deal with the files rclone named as changed or gone while it copied them.
+ *
+ *   gone       dropped from the baseline (the next scan sees it as removed).
+ *   otherwise  snapshotFile() into a stage folder, then ONE upload of the
+ *              snapshots. A snapshot that kept changing is DEFERRED; so is a
+ *              transcript that had to be cut at its last complete line (the
+ *              cut copy IS uploaded, but the file is not current). A deferred
+ *              file goes back to its previous baseline mark, or out of the
+ *              baseline if it had none, so the next pass sends it again.
+ *
+ * Mutates `scan` (the label's slice of the new baseline). Any failure of the
+ * snapshot upload is a real failure: { failed: true }.
+ */
+async function settleVolatile(m, perFile, scan, prev, { paced, onLog, stageDirs, snapshotOpts, runner }) {
+  const out = { deferred: [], vanished: 0, staged: 0, failed: false };
+  const rewind = (rel) => { if (prev && Object.hasOwn(prev, rel)) scan[rel] = prev[rel]; else delete scan[rel]; };
+  const stage = mkdtempSync(join(tmpdir(), 'session-sync-stage-'));
+  stageDirs.push(stage);
+
+  const ready = [];
+  for (const [rel, info] of perFile) {
+    const s = info.state === 'gone' ? { status: 'gone' } : await snapshotFile(m.local, rel, stage, snapshotOpts);
+    if (s.status === 'gone') { out.vanished++; delete scan[rel]; }
+    else if (s.status === 'unstable') { out.deferred.push({ label: m.label, path: rel, reason: 'unstable' }); rewind(rel); }
+    else ready.push({ rel, s });
+  }
+  if (!ready.length) return out;
+
+  const listFile = writeFileList(ready.map((x) => x.rel));
+  const up = await runner(['copy', stage, m.remote, ...copyFlags({ paced }), '--files-from', listFile, '--no-traverse'], { onLine: (l) => l && onLog(`  ${l}`) });
+  if (up.code !== 0) {
+    onLog(`ERROR (${up.code}): ${m.label} — uploading the snapshots${up.stderr ? ': ' + up.stderr.trim().split('\n')[0] : ''}`);
+    out.failed = true;
+    return out;
+  }
+  for (const { rel, s } of ready) {
+    out.staged++;
+    if (s.complete) scan[rel] = s.sig;
+    else { out.deferred.push({ label: m.label, path: rel, reason: 'partial-tail' }); rewind(rel); }
+  }
+  return out;
 }
 
 /**
@@ -335,8 +543,8 @@ export async function pull(remote, opts = {}) {
   }
 }
 
-async function pullImpl(remote, { quiet = false, onLog = () => {}, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER } = {}) {
-  const { map } = buildMap(remote);
+async function pullImpl(remote, { quiet = false, onLog = () => {}, notifyMode = 'all', firstRunMarker = FIRST_SUCCESS_MARKER, map: mapOverride = null } = {}) {
+  const { map } = mapOverride ? { map: mapOverride } : buildMap(remote);
   const paced = !isLocalRemote(remote);
   if (!quiet) notify('Restoring your conversations…', 'Pulling the latest from your remote. Please wait before asking anything — history is still loading.', { persist: true, tag: 'sync' });
 

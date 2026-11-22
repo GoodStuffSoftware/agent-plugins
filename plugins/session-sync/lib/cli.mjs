@@ -27,7 +27,7 @@
  *   --quiet       Suppress ALL notifications for this run, hook or not.
  */
 
-import { push, pull, preflight, remoteNewer, remoteRecordList } from './sync.mjs';
+import { push, pull, preflight, remoteNewer, remoteRecordList, readDeferredFiles } from './sync.mjs';
 import { notify, registerWindowsSender } from './notify.mjs';
 import { loadConfig, saveConfig, validateRemote, describeConfig, CONFIG_FILE, ACCOUNT_LINK_MODES, LIVE_RELINK_MODES, SPAWN_FIX_MODES } from './config.mjs';
 import { acquireLock } from './lock.mjs';
@@ -166,7 +166,7 @@ async function deferredPushWorker() {
       writeFileSync(LAST_PUSH, new Date().toISOString());
       await accountsDailyRemoteCheck();
       const settled = settleDeferred(DEFER_FILE, claimedAt);
-      log(`deferred push ok (${r.mins} min)${settled ? '' : ' — a newer request arrived mid-push, running again for it'}`);
+      log(`deferred push ok (${r.mins} min)${r.deferred?.length ? `, ${r.deferred.length} file(s) still changing were left for the next pass (see deferred-files.json)` : ''}${settled ? '' : ' — a newer request arrived mid-push, running again for it'}`);
       if (settled) return;
       continue;
     }
@@ -1243,6 +1243,9 @@ if (cmd === 'push' || cmd === 'pull' || cmd === 'auto-pull') {
 try {
   if (cmd === 'status') {
     const p = preflight(REMOTE);
+    // Files the last push left for the next pass because they were being written (names capped).
+    const d = readDeferredFiles(join(STATE_DIR, 'deferred-files.json'));
+    if (d?.count) p.deferredFiles = { at: d.at, count: d.count, byReason: d.byReason, names: (d.files || []).slice(0, 20).map((f) => `${f.label}/${f.path}`) };
     console.log(JSON.stringify(p, null, 2));
     process.exit(p.ready ? 0 : 1);
   }
@@ -1287,7 +1290,7 @@ try {
     await accountsSync('push');
     const r = await push(REMOTE, { quiet, onLog: log, notifyMode: CFG.notifyMode });
     if (r.ok) { ensureState(); writeFileSync(LAST_PUSH, new Date().toISOString()); await accountsDailyRemoteCheck(); }
-    log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)`);
+    log(`push ${r.ok ? 'ok' : 'FAILED'} (${r.mins} min)${r.deferred?.length ? `, ${r.deferred.length} file(s) still changing were left for the next pass` : ''}`);
     process.exit(r.ok || !strict ? 0 : 1);
   }
 
