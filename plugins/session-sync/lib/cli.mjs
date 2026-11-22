@@ -68,6 +68,7 @@ const DEBOUNCE_MS = Math.max(0, Number(CFG.debounceMinutes) || 0) * 60000;
 // take the sync lock, or that failed. Env-overridable so tests can exercise
 // the retry path in seconds instead of minutes; never set in production.
 const DEFER_RETRY_MS = Math.max(50, Number(process.env.CLAUDE_SESSION_SYNC_DEFER_RETRY_MS) || 30000);
+const DEFER_FOLLOWUPS = 3;   // extra passes after a push that deferred still-changing files
 const DEFER_MAX_ATTEMPTS = Math.max(1, Number(process.env.CLAUDE_SESSION_SYNC_DEFER_MAX_ATTEMPTS) || 40);
 
 // A hook invocation carries this; a manual run (the sync/status skills, or a
@@ -133,6 +134,7 @@ async function deferredPushWorker() {
   if (waitMs > 0) log(`deferred push: waiting ${Math.round(waitMs / 1000)}s for the debounce window to lapse`);
   await sleep(waitMs);
 
+  let followUps = 0;
   for (let attempt = 1; attempt <= DEFER_MAX_ATTEMPTS; attempt++) {
     if (!readDeferred(DEFER_FILE)) {
       log('deferred push: nothing owed any more (another push already covered it)');
@@ -165,6 +167,14 @@ async function deferredPushWorker() {
       ensureState();
       writeFileSync(LAST_PUSH, new Date().toISOString());
       await accountsDailyRemoteCheck();
+      if (r.deferred?.length && followUps < DEFER_FOLLOWUPS) {
+        // Files were still changing: keep the request and run once more shortly (bounded), so their tails do not wait for the next session.
+        followUps++;
+        log(`deferred push ok (${r.mins} min), ${r.deferred.length} file(s) still changing — one more pass in ${Math.round(DEFER_RETRY_MS / 1000)}s (${followUps}/${DEFER_FOLLOWUPS})`);
+        refreshDeferred(DEFER_FILE, { runAt: Date.now() + DEFER_RETRY_MS, pid: process.pid });
+        await sleep(DEFER_RETRY_MS);
+        continue;
+      }
       const settled = settleDeferred(DEFER_FILE, claimedAt);
       log(`deferred push ok (${r.mins} min)${r.deferred?.length ? `, ${r.deferred.length} file(s) still changing were left for the next pass (see deferred-files.json)` : ''}${settled ? '' : ' — a newer request arrived mid-push, running again for it'}`);
       if (settled) return;
@@ -1245,7 +1255,7 @@ try {
     const p = preflight(REMOTE);
     // Files the last push left for the next pass because they were being written (names capped).
     const d = readDeferredFiles(join(STATE_DIR, 'deferred-files.json'));
-    if (d?.count) p.deferredFiles = { at: d.at, count: d.count, byReason: d.byReason, names: (d.files || []).slice(0, 20).map((f) => `${f.label}/${f.path}`) };
+    if (d?.count) p.deferredFiles = { at: d.at, count: d.count, byReason: d.byReason, names: (Array.isArray(d.files) ? d.files : []).slice(0, 20).map((f) => `${f.label}/${f.path}`) };
     console.log(JSON.stringify(p, null, 2));
     process.exit(p.ready ? 0 : 1);
   }

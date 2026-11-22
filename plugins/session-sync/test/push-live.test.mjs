@@ -169,9 +169,9 @@ test('snapshotFile: a growing transcript is cut at what was stat\'ed, then at it
 test('snapshotFile: a transcript that ends on a newline is complete and keeps its exact mtime', { skip }, async () => {
   const fx = fixture();
   try {
-    const f = fx.put('p/s.jsonl', 'l1\nl2\n', -50);
+    fx.put('p/s.jsonl', 'l1\nl2\n', -50);
     const stage = join(fx.root, 'stage');
-    const r = await snapshotFile(fx.local, 'p/s.jsonl', stage, { copy: (a, b) => { copyFileSync(a, b); appendFileSync(f, 'l3\n'); } });
+    const r = await snapshotFile(fx.local, 'p/s.jsonl', stage);
     assert.equal(r.complete, true);
     assert.equal(readFileSync(join(stage, 'p', 's.jsonl'), 'utf8'), 'l1\nl2\n');
     assert.equal(Math.floor(statSync(join(stage, 'p', 's.jsonl')).mtimeMs / 1000), Math.floor(Number(r.sig.split(':')[1]) / 1000));
@@ -337,6 +337,49 @@ test('the real rclone leaves nothing half-written on the remote and no stage fol
     assert.equal(fx.remoteText('a.txt'), 'two!');
     assert.equal(readdirSync(tmpdir()).filter((n) => n.startsWith('session-sync-stage-')).length, before);
     assert.deepEqual(readdirSync(fx.remoteDir).filter((n) => n.includes('.partial')), []);
+  } finally { cleanup(fx); }
+});
+
+test('a stage folder is removed even when push() throws after a file was settled', { skip }, async () => {
+  const fx = fixture();
+  try {
+    fx.put('a.txt', 'one', -50);
+    const local2 = join(fx.root, 'home2');
+    mkdirSync(local2, { recursive: true });
+    writeFileSync(join(local2, 'b.txt'), 'b');
+    const map = [...fx.map, { local: local2, remote: join(fx.root, 'remote2'), excludes: [], label: 'second' }];
+    const before = readdirSync(tmpdir()).filter((n) => n.startsWith('session-sync-stage-')).length;
+    const s = scripted(
+      copyThenFail(fx, 'a.txt', [SIZES('a.txt')], () => fx.put('a.txt', 'two!', 0)),   // entry 1: settles a.txt (stage dir created)
+      undefined,                                                                       // entry 1: the snapshot upload (real)
+      async () => { throw new Error('spawn failed'); },                                // entry 2: rclone cannot run
+    );
+    await assert.rejects(push(fx.remoteDir, { ...fx.base, map, runner: s.runner }), /spawn failed/);
+    assert.equal(readdirSync(tmpdir()).filter((n) => n.startsWith('session-sync-stage-')).length, before, 'no stage folder is left behind');
+  } finally { cleanup(fx); }
+});
+
+test('a nothing-to-push pass clears a stale deferred-files.json', { skip }, async () => {
+  const fx = fixture();
+  try {
+    fx.put('a.txt', 'one', -50);
+    assert.ok((await push(fx.remoteDir, fx.base)).ok);
+    writeFileSync(fx.deferredFile, JSON.stringify({ at: 'x', count: 1, byReason: { unstable: 1 }, files: [{ label: LABEL, path: 'gone.txt', reason: 'unstable' }] }));
+    const r = await push(fx.remoteDir, fx.base);
+    assert.equal(r.skipped, true);
+    assert.equal(existsSync(fx.deferredFile), false);
+  } finally { cleanup(fx); }
+});
+
+test('snapshotFile: a transcript that grew while it was copied is not complete, even when it was cut at a line boundary', { skip }, async () => {
+  const fx = fixture();
+  try {
+    const f = fx.put('p/s.jsonl', 'l1\nl2\n');
+    const stage = join(fx.root, 'stage');
+    const r = await snapshotFile(fx.local, 'p/s.jsonl', stage, { copy: (a, b) => { copyFileSync(a, b); appendFileSync(f, 'l3\n'); } });
+    assert.equal(r.status, 'ok');
+    assert.equal(r.complete, false, 'a strict prefix of the live file must never be marked current');
+    assert.equal(readFileSync(join(stage, 'p', 's.jsonl'), 'utf8'), 'l1\nl2\n');
   } finally { cleanup(fx); }
 });
 

@@ -287,7 +287,8 @@ export async function snapshotFile(root, rel, stageRoot, { attempts = 3, pauseMs
       let len = statSync(dest).size;
       let complete = true;
       if (jsonl) {
-        if (len > st1.size) { truncateSync(dest, st1.size); len = st1.size; }
+        if (len > st1.size) { truncateSync(dest, st1.size); len = st1.size; complete = false; }   // grew while we copied it
+        if (st2.size !== st1.size) complete = false;                                        // ... or right after
         if (len < st1.size) continue;                       // shrank or was replaced: not append-only, retry
         const cut = lengthThroughLastNewline(dest, len);
         if (len > 0 && cut === 0) continue;                 // no complete line yet
@@ -355,6 +356,7 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
     // Nothing changed. Say so and stop — no scan, no transfer, no toast.
     const gone = plan.reduce((n, p) => n + (p.removed?.length || 0), 0);
     onLog(`nothing to push — no local changes since last sync${gone ? ` (${gone} file(s) removed locally; left on the remote)` : ''}`);
+    recordDeferred(deferredFile, []);   // nothing is pending any more: drop a stale deferred list
     return { ok: true, failed: 0, mins: '0.0', skipped: true };
   }
 
@@ -370,6 +372,7 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
   const deferred = [];            // { label, path, reason } left for the next pass
   let vanished = 0, staged = 0;
   const stageDirs = [];
+  try {
   for (const m of todo) {
     let args;
     // A filtered entry (account-link home-only filter) always goes through
@@ -441,7 +444,10 @@ export async function push(remote, { quiet = false, onLog = () => {}, force = fa
     }
     onLog(`ok: ${m.label} (${cls.perFile.size} file(s) were changing: ${r.vanished} gone, ${r.staged} sent from a snapshot, ${r.deferred.length} deferred)`);
   }
-  for (const d of stageDirs) rmSync(d, { recursive: true, force: true });
+  } finally {
+    // Always, including when rclone cannot even be spawned: stage dirs hold full copies of live transcripts.
+    for (const d of stageDirs) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } }
+  }
 
   const mins = ((Date.now() - t0) / 60000).toFixed(1);
   if (deferred.length) onLog(summarizeDeferred(deferred));
@@ -504,7 +510,7 @@ async function settleVolatile(m, perFile, scan, prev, { paced, onLog, stageDirs,
   for (const [rel, info] of perFile) {
     const s = info.state === 'gone' ? { status: 'gone' } : await snapshotFile(m.local, rel, stage, snapshotOpts);
     if (s.status === 'gone') { out.vanished++; delete scan[rel]; }
-    else if (s.status === 'unstable') { out.deferred.push({ label: m.label, path: rel, reason: 'unstable' }); rewind(rel); }
+    else if (s.status === 'unstable') { out.deferred.push({ label: m.label, path: rel, reason: 'unstable', ...(info.msg ? { msg: String(info.msg).slice(0, 200) } : {}) }); rewind(rel); }
     else ready.push({ rel, s });
   }
   if (!ready.length) return out;
