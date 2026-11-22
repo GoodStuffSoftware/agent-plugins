@@ -83,6 +83,18 @@ export function hasRemote(remoteName, confPath = findRcloneConf()) {
 /**
  * Flags for copying a tree Claude may be writing RIGHT NOW.
  *
+ *  `retries` is rclone's WHOLE-RUN retry count. push() passes 1: rclone cannot
+ *      retry only the files that failed, so with 3 one volatile file re-ran the
+ *      whole 15 to 70 minute pass up to three times (observed 2026-11-21).
+ *      push() retries the failed files itself, from a stable snapshot.
+ *
+ *  --local-no-check-updated is NOT enough on its own (rclone v1.74.0, checked):
+ *      a file that only GROWS is cut off at the size rclone stat'ed (a clean
+ *      prefix, no error), but a file REWRITTEN shorter still fails with
+ *      "corrupted on transfer: sizes differ", and a file that vanished fails
+ *      with "failed to open source object". That is what failed every push on
+ *      2026-11-20/21, so the per-file handling below exists.
+ *
  *  --local-no-check-updated  transcripts are append-only and grow mid-copy;
  *      without this rclone aborts with "source file is being updated" /
  *      "corrupted on transfer: md5 hashes differ". A slightly-short copy is
@@ -94,12 +106,12 @@ export function hasRemote(remoteName, confPath = findRcloneConf()) {
  *      2-hourly sync for a day. Pacing keeps us under it. The real fix is your
  *      own client_id — see the setup skill. (2026-08-30)
  */
-export function copyFlags({ paced = true } = {}) {
+export function copyFlags({ paced = true, retries = 3 } = {}) {
   const f = [
     '--update',
     '--local-no-check-updated',
     '--ignore-checksum',
-    '--retries', '3',
+    '--retries', String(retries),
     '--low-level-retries', '10',
     '--log-level', 'ERROR',
   ];
@@ -123,6 +135,78 @@ export function runRclone(args, { rclone = findRclone(), conf = findRcloneConf()
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
+}
+
+/**
+ * Parse `rclone --use-json-log` output into events { level, msg, object }.
+ * A line that is not JSON becomes { level: 'raw', msg: line }: anything we do
+ * not understand later counts as a real failure, never as a skippable file.
+ */
+export function parseRcloneLog(text) {
+  const events = [];
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s) continue;
+    try {
+      const j = JSON.parse(s);
+      if (j && typeof j === 'object' && typeof j.msg === 'string') {
+        events.push({ level: String(j.level || 'error'), msg: j.msg, object: typeof j.object === 'string' ? j.object : '' });
+        continue;
+      }
+    } catch { /* not JSON */ }
+    events.push({ level: 'raw', msg: s, object: '' });
+  }
+  return events;
+}
+
+/** One short log line per rclone JSON event (the src(...)/dst(...) descriptions are noise). */
+export function formatRcloneLine(line) {
+  return parseRcloneLog(line)
+    .map((e) => `${e.level === 'raw' ? '' : e.level.toUpperCase() + ' '}${e.object ? e.object + ': ' : ''}${e.msg}`
+      .replace(/\b(src|dst)\([^)]*\)/g, '$1').slice(0, 400))
+    .join('\n');
+}
+
+// rclone's end-of-attempt lines ("Attempt 1/1 failed with 3 errors and: ...") name no object.
+const SUMMARY_LINE = /^(Attempt \d+\/\d+ |Failed to \w+ with \d+ errors?)/;
+// Errors that say the SOURCE file misbehaved while it was read (as opposed to the remote refusing it).
+const SOURCE_SIDE = /sizes differ|hashes? differ|source file is being updated|failed to open source object|being used by another process/i;
+// A local-remote copy writes to "<name>.<8 hex>.partial" and reports errors under that name.
+const PARTIAL_SUFFIX = /\.[0-9a-f]{8}\.partial$/;
+
+/**
+ * Split a failed copy's errors into files that misbehaved and real failures.
+ *
+ * A file is a "volatile file" (skip it now, send it later) only when rclone
+ * names it as the object of the error AND it is one we asked rclone to copy AND
+ * either its local state changed since the scan (changed size or mtime, or
+ * gone) or the error is a source-side one. Everything else (no object, an
+ * object we did not send, a remote-side error such as a quota or auth failure,
+ * unparseable output) is fatal, so a real failure still fails the run.
+ *
+ * @param events      parseRcloneLog() output
+ * @param known       (rel) => true for a path this copy was meant to send
+ * @param localState  (rel) => 'gone' | 'changed' | 'same', judged against the scan
+ * @returns {{ perFile: Map<string, {state: string, msg: string}>, fatal: string[] }}
+ */
+export function classifyCopyErrors(events, { known, localState }) {
+  const perFile = new Map();
+  const fatal = [];
+  for (const e of events) {
+    if (e.level !== 'error' && e.level !== 'critical' && e.level !== 'fatal' && e.level !== 'raw') continue;
+    if (!e.object) {
+      if (e.level === 'error' && SUMMARY_LINE.test(e.msg)) continue;
+      fatal.push(e.msg);
+      continue;
+    }
+    let rel = e.object.replace(/\\/g, '/');
+    if (!known(rel) && known(rel.replace(PARTIAL_SUFFIX, ''))) rel = rel.replace(PARTIAL_SUFFIX, '');
+    if (e.level !== 'error' || !known(rel)) { fatal.push(`${e.object}: ${e.msg}`); continue; }
+    const state = localState(rel);
+    if (state === 'same' && !SOURCE_SIDE.test(e.msg)) { fatal.push(`${rel}: ${e.msg}`); continue; }
+    if (!perFile.has(rel)) perFile.set(rel, { state, msg: e.msg });
+  }
+  return { perFile, fatal };
 }
 
 function isFile(p) {
