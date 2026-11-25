@@ -444,7 +444,7 @@ test('L26 rcSettings: liveRelink off or idle-only (anything else falls back), li
 /* ------------------------------------------------------------------ the waiter */
 
 /** One watcher run, ~40 steps of an injected clock, the app running (or not), the live relink replaced by a recorder. */
-async function watchRun({ app, rc, liveEveryMs, liveRelinkFn, steps = 40 }) {
+async function watchRun({ app, rc, liveEveryMs, liveRelinkFn, steps = 40, extra = {} }) {
   const { runWaiter } = await import('../lib/accounts/waiter.mjs');
   const { emptyState, saveState, resetMutations } = await import('../lib/accounts/state.mjs');
   const { unlinkSync } = await import('node:fs');
@@ -458,7 +458,7 @@ async function watchRun({ app, rc, liveEveryMs, liveRelinkFn, steps = 40 }) {
     await runWaiter(w.ctx, {
       watchLockfile: false, gapMs: 150, pollMs: 1, probeEveryMs: 1, watch: true, reason: 'watch', notify: () => {},
       clock: () => (t += 100), sleep: async () => { if (++sleeps >= steps) { try { unlinkSync(join(w.acc, 'waiter.claim')); } catch { /* gone */ } } },
-      rcRestore: rc, rcOpts: { projects: w.projects }, liveEveryMs, log: (l) => logs.push(l), liveRelinkFn,
+      rcRestore: rc, rcOpts: { projects: w.projects }, liveEveryMs, log: (l) => logs.push(l), liveRelinkFn, ...extra,
     });
   } finally { delete process.env.SESSION_SYNC_TEST_APP_STATE; resetMutations(); }
   return logs;
@@ -678,4 +678,45 @@ test('S5 a bounced session (idle, live CLI, noHistoryBackfill link minted after 
   session(noHistory, 1, { link: 'cse_nhb1', nhb: true });
   const r2 = await pass(noHistory, { switchSweep: true, liveCliIds: () => new Set([cli(1)]) });
   assert.deepEqual(r2.bounced, []);                    // no switch known: nothing is called a bounce of it
+});
+
+test('S6 a bounce whose own clear line already followed it (the CLI writes one 4 to 25 s later) is still reported while its CLI is live and idle', async () => {
+  const w = world();
+  const a = session(w, 1, { link: 'cse_nhb1', nhb: true });
+  appendFileSync(a, CLEAR(cli(1)) + '\n');
+  const b = session(w, 2, { link: 'cse_nhb2', nhb: true, rec: { isRunning: true } });
+  appendFileSync(b, CLEAR(cli(2)) + '\n');
+  const c = session(w, 3, { link: 'cse_ok3' });                        // a titled link, then a clear line (an ordinary repair): not a bounce
+  appendFileSync(c, CLEAR(cli(3)) + '\n');
+  const d = session(w, 4, { link: 'cse_nhb4', nhb: true, at: '2026-11-10T12:00:00.000Z' });   // minted before the switch: the sweep clears it, not a bounce
+  appendFileSync(d, CLEAR(cli(4)) + '\n');
+  for (const tp of [a, b, c, d]) setMtime(tp, NOW - 3600_000);
+  const r = await pass(w, { switchSweep: true, liveCliIds: () => new Set([cli(1), cli(2), cli(3), cli(4)]) });
+  assert.deepEqual(r.bounced.map((x) => x.cliSessionId), [cli(1)]);
+  const gone = await pass(w, { switchSweep: true, liveCliIds: () => new Set() });
+  assert.deepEqual(gone.bounced, []);                                  // no live CLI: nothing to repair
+});
+
+test('S7 a pre-switch link whose transcript is written after the pass first saw it (a CLI that started meanwhile) is not cleared', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_old', at: '2026-11-10T12:00:00.000Z' });
+  setMtime(tp, NOW - 30_000);
+  let reads = 0;
+  const r = await pass(w, { switchSweep: true, liveCliIds: () => { if (++reads === 2) setMtime(tp, NOW - 2_000); return new Set(); } });
+  assert.equal(r.cleared.length, 0);
+  assert.equal(r.quiet, 1);
+  assert.equal(lastBridgeEntry(tp).bridgeSessionId, 'cse_old');
+});
+
+test('S8 the waiter sweeps a recent switch with switchSweep and all sessions, queues the repair of a bounced session, and leaves the periodic pass without switchSweep', async () => {
+  const { turnEndFile } = await import('../lib/accounts/rcrepair.mjs');
+  const calls = [];
+  let wRef = null;
+  const rec = async (ctx, o) => { wRef = ctx; calls.push({ all: o.all, switchSweep: o.switchSweep }); return { sessions: [], bounced: [{ id: sid(1), cliSessionId: cli(1), link: 'cse_x' }] }; };
+  await watchRun({ app: true, rc: { enabled: true, days: 3, liveRelink: 'idle-only' }, liveEveryMs: 86_400_000, liveRelinkFn: rec, steps: 12, extra: { sweepRecentMs: 30 * 86400_000 } });
+  assert.ok(calls.some((c) => c.all === true && c.switchSweep === true), 'the switch sweep ran with switchSweep');
+  assert.ok(existsSync(turnEndFile(wRef, cli(1))), 'the bounced session got its turn-end repair request');
+  calls.length = 0;
+  await watchRun({ app: true, rc: { enabled: true, days: 3, liveRelink: 'idle-only' }, liveEveryMs: 1000, liveRelinkFn: rec, steps: 12 });
+  assert.ok(calls.length > 0 && calls.every((c) => c.all === false && c.switchSweep === undefined), 'the periodic pass is no switch sweep');
 });

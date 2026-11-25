@@ -9,7 +9,7 @@
 
 ### Added
 
-* **session-sync:** a session that still came back with a random name (idle, its CLI live, newest link minted after the switch with `noHistoryBackfill`) gets the same repair `accounts rc-repair <id> --at-turn-end` records. The Stop hook of that session runs it at the end of its own turn, so a CLI that is mid-turn is never stopped.
+* **session-sync:** a session that still came back with a random name (idle, its CLI live, newest link minted after the switch with `noHistoryBackfill`, also when the CLI's own clear line already follows it) gets the same repair `accounts rc-repair <id> --at-turn-end` records. The Stop hook of that session runs it at the end of its own turn, so a CLI that is mid-turn is never stopped.
 
 ### Known limits
 

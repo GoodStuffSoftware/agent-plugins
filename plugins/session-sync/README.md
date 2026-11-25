@@ -222,7 +222,7 @@ Two copies of the plugin can run on one machine (your plugin cache, and the Clau
 **Live relink (0.5.7, while Claude runs).** A random-name link no longer has to wait for a restart. For a session whose Claude Code CLI is not running, the plugin clears the stale link in place (the same clearing line, after the same backup), so the next time that session connects, the app makes a fresh titled link. It never stops a process and it never touches a session that is, or might be, in use. A session is cleared only when all of these hold, checked again right before the write:
 
 * its CLI is not running (a hidden PowerShell process listing; if the listing fails or any command line cannot be read, nothing is cleared);
-* its transcript has not been written to for 120 seconds and the session is not in the middle of a turn;
+* its transcript has not been written to for 120 seconds and the session is not in the middle of a turn (0.5.12: the sweep at an account switch does not ask this of a link minted before the switch, because the app's own CLI teardown at the switch touches every transcript; the live-CLI check still applies, and a transcript written after the pass first saw it is left for the next pass);
 * it is not the session the hook itself runs in;
 * its link is a `noHistoryBackfill` gone-bounce, was minted under another account (see above), or was minted before the current sign-in began, whatever account minted it (0.5.10, see "Relink after a round trip" below).
 

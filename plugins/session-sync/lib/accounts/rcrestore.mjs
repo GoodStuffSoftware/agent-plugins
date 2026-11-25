@@ -172,6 +172,23 @@ export function isGoneBounce(file, entry) {
 }
 
 /**
+ * 0.5.12: the gone-bounce whose own clear line already followed it. The CLI appends a clear line 4 to 25 s after a bounce, so the last bridge
+ * entry is empty while the live CLI still holds the random-named link in memory. Newest first: skip empty entries, take the first link, skip
+ * repeats of it, and the next entry must be a DIFFERENT non-empty link (a reattach target existed), with the link marked noHistoryBackfill
+ * and no history-suppression line. Returns that link's entry, or null.
+ */
+export function bounceBeforeClear(file) {
+  let link = null; let prev; let seen = false;
+  scanBridgeEntries(file, (o) => {
+    if (!link) { if (o.bridgeSessionId) link = o; return false; }
+    if (o.bridgeSessionId === link.bridgeSessionId) return false;
+    prev = o; seen = true; return true;
+  });
+  if (!link || link.noHistoryBackfill !== true || !seen || typeof prev.bridgeSessionId !== 'string' || prev.bridgeSessionId === '') return null;
+  return hasHistorySuppression(file) ? null : link;
+}
+
+/**
  * Why does this saved link need clearing? 'noHistoryBackfill' (a random-name bounce link), 'foreign' (minted under another account, per
  * `foreign(bridgeSessionId)`, which comes from the link ledger and the switch history), or null. A link that is already cleared (empty
  * id) needs nothing. The entry's `ownerAccountUuid` is never read: the CLI stamps it from its own cached identity, so on a machine that
@@ -638,7 +655,7 @@ const lc = (s) => String(s ?? '').toLowerCase();
  */
 export function liveRelinkCandidates(ctx, o = {}) {
   const acct = (o.acct ?? readSignedIn(ctx.userData)) || null;
-  const out = { acct, records: 0, noTranscript: 0, guarded: 0, candidates: [], foreignCheck: null };
+  const out = { acct, records: 0, noTranscript: 0, guarded: 0, candidates: [], bounceTrail: [], foreignCheck: null };
   if (!acct) return out;
   const now = o.now ?? ctx.now();
   const days = o.days ?? RC_DEFAULTS.days;
@@ -655,6 +672,11 @@ export function liveRelinkCandidates(ctx, o = {}) {
     if (!tp) { out.noTranscript++; continue; }
     const b = lastBridgeEntry(tp);
     const why = linkReason(fc, b, tp);
+    if (!why && b && !b.bridgeSessionId) {
+      // 0.5.12: the last entry is a clear line; was it the CLI's own, right after a bounce minted after the switch? (liveRelinkPass checks the CLI is live and idle)
+      const p = bounceBeforeClear(tp);
+      if (p && fc?.staleLink?.(p.bridgeSessionId, tp) !== true && fc?.foreign?.(p.bridgeSessionId, tp) !== true) out.bounceTrail.push({ id: rec.sessionId, cliSessionId: rec.cliSessionId, title: rec.title ?? '', link: p.bridgeSessionId, running: rec.isRunning === true });
+    }
     if (!why) { if (b?.bridgeSessionId && b.noHistoryBackfill === true) out.guarded++; continue; }   // a noHistoryBackfill link that is no gone-bounce: left alone (isGoneBounce)
     // 0.5.12: was the link minted before the switch (another account, or before this sign-in began)? The switch sweep may clear such a link
     // inside the quiet window (liveRelinkPass); a link minted after the switch (a bounce, a fresh mint) keeps the quiet gate.
@@ -734,10 +756,13 @@ export async function liveRelinkPass(ctx, o = {}) {
   // the ledger and the history are a cache of what this pass just learned (atomic, add-only): kept by every pass that may write, so a
   // link seen now is dated by when it was first seen even when nothing is cleared this time. A dry run keeps nothing.
   if (!dry) scan.foreignCheck.flush();
-  if (!cands.length) return res;   // nothing to look at: the OS is not asked
+  if (!cands.length && !scan.bounceTrail.length) return res;   // nothing to look at: the OS is not asked
 
   const live = await readLive();
-  if (live === null) { res.unknown = cands.length; for (const c of cands) mark(c, 'unknown'); if (!dry) log(liveLine(res)); return res; }
+  if (live === null) { res.unknown = cands.length; for (const c of cands) mark(c, 'unknown'); if (!dry && cands.length) log(liveLine(res)); return res; }
+  // 0.5.12: bounced sessions whose clear line already followed the bounce: idle, the CLI live (it holds the random-named link in memory)
+  if (res.cutoff != null) for (const t of scan.bounceTrail) if (live.has(lc(t.cliSessionId)) && !t.running && t.cliSessionId !== o.hookCliSessionId) res.bounced.push({ id: t.id, cliSessionId: t.cliSessionId, title: t.title, link: t.link });
+  if (!cands.length) return res;
   const todo = [];
   for (const c of cands) {
     if (live.has(lc(c.cliSessionId))) {
@@ -749,6 +774,7 @@ export async function liveRelinkPass(ctx, o = {}) {
     let m = null; try { m = statSync(c.transcript).mtimeMs; } catch { /* gone */ }
     if (m === null) { res.stale++; mark(c, 'gone'); continue; }
     if (nowMs() - m < quietMs && !(switchSweep && c.preSwitch)) { res.quiet++; mark(c, 'quiet'); continue; }
+    c.seenMtime = m;
     if (c.running) { res.running++; mark(c, 'mid-turn'); continue; }
     todo.push(c);
   }
@@ -768,7 +794,10 @@ export async function liveRelinkPass(ctx, o = {}) {
       try {
         const again = lastBridgeEntry(c.transcript);
         if (!again || again.bridgeSessionId !== c.link || linkReason(scan.foreignCheck, again, c.transcript) === null) { res.stale++; mark(c, 'changed'); continue; }
-        if (nowMs() - statSync(c.transcript).mtimeMs < quietMs && !(switchSweep && c.preSwitch)) { res.quiet++; mark(c, 'quiet'); continue; }
+        const m2 = statSync(c.transcript).mtimeMs;
+        // 0.5.12: a pre-switch link inside a switch sweep is not held to the quiet window, but a transcript written since this pass first saw it (a CLI that
+        // started meanwhile, a long batch) is: left for the next pass
+        if (switchSweep && c.preSwitch ? m2 !== c.seenMtime : nowMs() - m2 < quietMs) { res.quiet++; mark(c, 'quiet'); continue; }
         mkdirSync(backupDir, { recursive: true });
         copyFileSync(c.transcript, join(backupDir, `${c.cliSessionId}.jsonl`));
         appendClearLine(c.transcript, c.cliSessionId);
