@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.12 - 2026-11-25
+
+### Fixed
+
+* **session-sync:** after an account switch, no Remote Control session comes back with a random name (`<project>-<adjective>-<noun>`) or a link without history. The cause: the switch sweep skipped sessions as "quiet" (transcript written in the last 120 s) because the app's own CLI teardown at the switch touches every transcript, and the next pass came only after those sessions had resumed with a link minted under the previous account. The switch sweep now clears a link minted before the switch (another account, or before the current sign-in began) even inside the quiet window, as long as no CLI process runs for that session (that check is unchanged and is the real safety condition). A link minted after the switch keeps the quiet gate.
+* **session-sync:** the switch sweep now retries every 15 s for up to 3 minutes and stops early when nothing is left to clear, so a session skipped on the first pass (quiet, process list unreadable, a CLI still exiting, accounts lock held) is cleared before it can resume. A newer switch starts a sweep of its own and ends the older retry loop.
+
+### Added
+
+* **session-sync:** a session that still came back with a random name (idle, its CLI live, newest link minted after the switch with `noHistoryBackfill`) gets the same repair `accounts rc-repair <id> --at-turn-end` records. The Stop hook of that session runs it at the end of its own turn, so a CLI that is mid-turn is never stopped.
+
+### Known limits
+
+* A link that went A to B to A, whose transcript was touched after the switch, may not be a candidate at all.
+* A session with a live CLI is retried by the sweep but never cleared by it; the bounce repair above covers the idle ones.
+
 ## 0.5.11 - 2026-11-22
 
 ### Fixed
