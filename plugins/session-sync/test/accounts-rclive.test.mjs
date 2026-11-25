@@ -581,3 +581,101 @@ test('L33 the ledger learns the links a pass sees even when nothing is cleared (
   assert.deepEqual(Object.keys(readLedger(w.ctx).links).sort(), ['cse_busy', 'cse_live']);
   assert.equal(readLedger(w.ctx).links.cse_busy.acct, ME);
 });
+
+/* ------------------------------------------------------------------ 0.5.12: the switch sweep, its retries, bounced sessions */
+
+test('S1 switch sweep: a pre-switch link with a transcript touched 30 s ago and no CLI is cleared; the plain pass keeps its quiet gate', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_old', at: '2026-11-10T12:00:00.000Z' });
+  setMtime(tp, NOW - 30_000);
+  const plain = await pass(w);
+  assert.equal(plain.quiet, 1);
+  assert.equal(plain.cleared.length, 0);
+  const r = await pass(w, { switchSweep: true });
+  assert.deepEqual(r.cleared.map((c) => c.why), ['foreign']);
+  assert.equal(r.quiet, 0);
+  assert.equal(lastBridgeEntry(tp).bridgeSessionId, '');
+});
+
+test('S2 switch sweep: the same session with a live CLI is skipped and left byte for byte', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_old', at: '2026-11-10T12:00:00.000Z' });
+  setMtime(tp, NOW - 30_000);
+  const before = readFileSync(tp, 'utf8');
+  const r = await pass(w, { switchSweep: true, liveCliIds: () => new Set([cli(1)]) });
+  assert.equal(r.skippedLive, 1);
+  assert.equal(r.cleared.length, 0);
+  assert.equal(readFileSync(tp, 'utf8'), before);
+});
+
+test('S3 switch sweep: a link minted after the switch keeps the quiet gate; an unknown process list still writes nothing', async () => {
+  const w = world();
+  const tp = session(w, 1, { link: 'cse_nhb', nhb: true });          // minted 2026-11-17, after the switch
+  setMtime(tp, NOW - 30_000);
+  const old = session(w, 2, { link: 'cse_old', at: '2026-11-10T12:00:00.000Z' });
+  setMtime(old, NOW - 30_000);
+  const before = readFileSync(tp, 'utf8');
+  const r = await pass(w, { switchSweep: true });
+  assert.equal(r.quiet, 1);
+  assert.deepEqual(r.cleared.map((c) => c.id), [sid(2)]);
+  assert.equal(readFileSync(tp, 'utf8'), before);
+  const w2 = world();
+  const t2 = session(w2, 1, { link: 'cse_old', at: '2026-11-10T12:00:00.000Z' });
+  setMtime(t2, NOW - 30_000);
+  const b2 = readFileSync(t2, 'utf8');
+  const u = await pass(w2, { switchSweep: true, liveCliIds: () => null });
+  assert.equal(u.unknown, 1);
+  assert.equal(readFileSync(t2, 'utf8'), b2);
+});
+
+test('S4 sweepWithRetry: stops at once when nothing is left, retries while something waits, stops at the window and when told to', async () => {
+  const { sweepWithRetry, sweepLeft } = await import('../lib/accounts/waiter.mjs');
+  const quiet = { sessions: [{ outcome: 'quiet' }] };
+  const done = { sessions: [{ outcome: 'cleared' }, { outcome: 'changed' }] };
+  assert.equal(sweepLeft(quiet), true);
+  assert.equal(sweepLeft(done), false);
+  assert.equal(sweepLeft({ sessions: [] }), false);
+  assert.equal(sweepLeft(null), false);
+  assert.equal(sweepLeft({ reason: 'locked', sessions: [] }), true);
+  const run = async (results, extra = {}) => {
+    let t = 0; const sleeps = []; let i = 0;
+    const r = await sweepWithRetry(async () => results[Math.min(i++, results.length - 1)], { retryMs: 15_000, windowMs: 180_000, now: () => t, sleep: async (ms) => { sleeps.push(ms); t += ms; }, ...extra });
+    return { ...r, sleeps, t };
+  };
+  const a = await run([done]);
+  assert.equal(a.passes, 1);
+  assert.deepEqual(a.sleeps, []);
+  const b = await run([quiet, quiet, done]);
+  assert.equal(b.passes, 3);
+  assert.deepEqual(b.sleeps, [15_000, 15_000]);
+  assert.equal(b.left, false);
+  const c = await run([quiet]);                      // never done: stops at the 3 minute cap
+  assert.equal(c.left, true);
+  assert.equal(c.passes, 13);
+  assert.ok(c.t <= 180_000, `slept ${c.t} ms`);
+  let calls = 0;
+  const d = await run([quiet], { stop: () => ++calls > 2 });
+  assert.ok(d.passes <= 2);
+});
+
+test('S5 a bounced session (idle, live CLI, noHistoryBackfill link minted after the switch) is reported and its repair queued once; mid-turn, pre-switch and no-switch ones are not', async () => {
+  const { queueBouncedRepairs, turnEndFile } = await import('../lib/accounts/rcrepair.mjs');
+  const w = world();
+  const a = session(w, 1, { link: 'cse_nhb1', nhb: true });
+  session(w, 2, { link: 'cse_nhb2', nhb: true, rec: { isRunning: true } });
+  session(w, 3, { link: 'cse_old', at: '2026-11-10T12:00:00.000Z' });
+  const live = new Set([cli(1), cli(2), cli(3)]);
+  const before = readFileSync(a, 'utf8');
+  const r = await pass(w, { switchSweep: true, liveCliIds: () => live });
+  assert.deepEqual(r.bounced.map((b) => b.cliSessionId), [cli(1)]);
+  assert.equal(readFileSync(a, 'utf8'), before);       // nothing is written to a live session's transcript
+  const logs = [];
+  assert.deepEqual(queueBouncedRepairs(w.ctx, r.bounced, { log: (l) => logs.push(l) }), [cli(1)]);
+  assert.ok(existsSync(turnEndFile(w.ctx, cli(1))));
+  assert.match(logs[0], /rc-bounce/);
+  assert.deepEqual(queueBouncedRepairs(w.ctx, r.bounced), []);   // a request is not replaced
+  const noHistory = world({ history: false });
+  session(noHistory, 1, { link: 'cse_nhb1', nhb: true });
+  const r2 = await pass(noHistory, { switchSweep: true, liveCliIds: () => new Set([cli(1)]) });
+  assert.deepEqual(r2.bounced, []);                    // no switch known: nothing is called a bounce of it
+});

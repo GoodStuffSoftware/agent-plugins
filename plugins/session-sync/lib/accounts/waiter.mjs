@@ -35,6 +35,7 @@ import { nullUi, progressInfo } from './progress.mjs';
 import { spawnFixCore, spawnFixStep, spawnLine } from './rcspawn.mjs';
 import { recentSwitch } from './rclinks.mjs';
 import { rcQuitStep, rcDoneText, RC_START_TEXT, readLaunchOutcome, defaultAppLog, MARKER_REFRESH_MS, liveRelinkPass } from './rcrestore.mjs';
+import { queueBouncedRepairs } from './rcrepair.mjs';
 import { RC_DEFAULTS } from '../config.mjs';
 
 const asksOp = (rs) => rs.some((r) => r === 'link' || r === 'unlink');
@@ -46,6 +47,38 @@ const SWEEP_BACKOFF_MS = [3000, 10000, 30000, 60000, 60000];
 const SWEEP_MAX = 1000;
 /** A watcher that starts this soon after a switch sweeps at once. */
 const SWEEP_RECENT_MS = 15 * 60 * 1000;
+/** 0.5.12: after a switch the sweep runs again every SWEEP_RETRY_MS until nothing is left to clear, for at most SWEEP_WINDOW_MS in all (RC reconnects about 3.5 minutes after a switch). */
+export const SWEEP_RETRY_MS = 15 * 1000;
+export const SWEEP_WINDOW_MS = 3 * 60 * 1000;
+/** A candidate with one of these verdicts may be clearable on a later pass (a quiet window passes, a list reads, a CLI exits); cleared, changed and gone ones are done. */
+const SWEEP_RETRY_VERDICTS = new Set(['quiet', 'unknown', 'mid-turn', 'failed', 'deferred', 'live']);
+
+/** Is anything left for another sweep pass? The result of liveRelinkPass: a session still waiting, or a pass that found the accounts lock held. */
+export const sweepLeft = (res) => !!res && (res.reason === 'locked' || (res.sessions ?? []).some((x) => SWEEP_RETRY_VERDICTS.has(x.outcome)));
+
+/**
+ * The switch sweep with retries (0.5.12): run `pass()` (one liveRelinkPass result), and again every retryMs while sweepLeft, until the window
+ * (windowMs from the start, back-off waits included) is used up or `stop()` says so (a newer switch starts a sweep of its own). The first pass always runs.
+ * o: { retryMs, windowMs, sleep(ms), now(), stop() }
+ * @returns {Promise<{passes:number, left:boolean}>}
+ */
+export async function sweepWithRetry(pass, o = {}) {
+  const retryMs = o.retryMs ?? SWEEP_RETRY_MS;
+  const windowMs = o.windowMs ?? SWEEP_WINDOW_MS;
+  const sleep = o.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = o.now ?? Date.now;
+  const t0 = now();
+  let passes = 0; let left = false;
+  for (;;) {
+    const res = await pass();
+    passes++;
+    left = sweepLeft(res);
+    if (!left || o.stop?.() === true || now() - t0 + retryMs > windowMs) break;
+    await sleep(retryMs);
+    if (o.stop?.() === true) break;
+  }
+  return { passes, left };
+}
 const RC_MAX_TRIES = 3;
 
 export const HEARTBEAT_STALE_MS = 5 * 60 * 1000;
@@ -376,9 +409,13 @@ export async function runWaiter(ctx, o = {}) {
     // unreadable (2026-11-20: `unknown 43`, 0 cleared). Unknown never means "no CLI": nothing is written until the list reads, so the sweep
     // retries with a back-off for about 3 minutes (RC reconnected 3.5 minutes after that switch), logs each try, and has no per-pass cap (a
     // deferral would miss the window before RC reconnects).
-    const sweep = all ? { liveBackoffMs: ctx.platform === 'win32' ? (o.sweepBackoffMs ?? SWEEP_BACKOFF_MS) : [], max: SWEEP_MAX, cimTimeoutMs: 25000 } : {};   // off Windows the probe is never available: no back-off to wait out
-    try { await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...sweep, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) }); }
-    catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); }
+    const sweep = all ? { liveBackoffMs: ctx.platform === 'win32' ? (o.sweepBackoffMs ?? SWEEP_BACKOFF_MS) : [], max: SWEEP_MAX, cimTimeoutMs: 25000, switchSweep: true } : {};   // off Windows the probe is never available: no back-off to wait out
+    try {
+      const res = await (o.liveRelinkFn ?? liveRelinkPass)(ctx, { days: c.days, ...sweep, ...(o.rcOpts ?? {}), settings: c, all, log: (l) => o.log?.(l) });
+      // 0.5.12: a session that came back from a switch with a random name (idle, its CLI live): the repair is queued for the end of its own turn, never run mid-turn
+      if (res?.bounced?.length) queueBouncedRepairs(ctx, res.bounced, { log: (l) => o.log?.(l) });
+      return res;
+    } catch (e) { o.log?.(`waiter: live relink failed: ${e?.message ?? e}`); return null; }
   };
   /**
    * The switch sweep, in the background (its back-off takes minutes; the watcher goes on serving the folders). One at a time, and one per
@@ -393,7 +430,12 @@ export async function runWaiter(ctx, o = {}) {
     if (w.sweeping) { w.sweepAgain = true; return; }
     w.sweeping = true;
     w.sweep = (async () => {
-      try { do { w.sweepAgain = false; await liveStep(true); } while (w.sweepAgain); }
+      try {
+        do {
+          w.sweepAgain = false;
+          await sweepWithRetry(() => liveStep(true), { retryMs: o.sweepRetryMs, windowMs: o.sweepWindowMs, sleep: o.sweepSleep, now: o.sweepNow, stop: () => w.sweepAgain });
+        } while (w.sweepAgain);
+      }
       finally { w.sweeping = false; }
     })();
   };

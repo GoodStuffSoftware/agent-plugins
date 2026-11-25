@@ -229,3 +229,25 @@ export async function runTurnEnd(ctx, o = {}) {
   log(`rc-turn-end: ${id.slice(0, 8)}: ${r.ok ? r.status : `refused (${r.reason})`}${keep ? ', request kept for the next turn' : ''}`);
   return { ran: true, result: r, kept: keep };
 }
+
+/**
+ * 0.5.12: queue the `rc-repair --at-turn-end` of sessions that came back from an account switch with a random name (a gone-bounce link minted
+ * after the switch, an idle session, its CLI live: liveRelinkPass `bounced`). Only records the same request the command records, so the stop
+ * happens at the end of that session's own turn (its Stop hook) and never mid-turn; a request already there is left alone (it keeps its launch
+ * count). After the repair the next link follows a clear line, which isGoneBounce never calls a bounce, so a session is not repaired twice.
+ * Never throws.
+ * @returns {string[]} the CLI session ids queued now
+ */
+export function queueBouncedRepairs(ctx, bounced, o = {}) {
+  const queued = [];
+  for (const b of Array.isArray(bounced) ? bounced : []) {
+    try {
+      const cli = String(b?.cliSessionId ?? '').toLowerCase();
+      if (!SAFE_ID.test(cli) || existsSync(turnEndFile(ctx, cli))) continue;
+      writeTurnEndRequest(ctx, { cliSessionId: cli, session: b.id ?? null, now: o.now ?? ctx.now() });
+      queued.push(cli);
+      o.log?.(`rc-bounce: ${String(b.id ?? cli).replace(/^local_/, '').slice(0, 8)} came back with a random name (link ${b.link}); repair queued for the end of its turn`);
+    } catch (e) { try { o.log?.(`rc-bounce: queue failed ${e?.message ?? e}`); } catch { /* never throws */ } }
+  }
+  return queued;
+}

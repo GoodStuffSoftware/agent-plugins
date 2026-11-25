@@ -656,7 +656,11 @@ export function liveRelinkCandidates(ctx, o = {}) {
     const b = lastBridgeEntry(tp);
     const why = linkReason(fc, b, tp);
     if (!why) { if (b?.bridgeSessionId && b.noHistoryBackfill === true) out.guarded++; continue; }   // a noHistoryBackfill link that is no gone-bounce: left alone (isGoneBounce)
-    out.candidates.push({ file: r.path, id: rec.sessionId, cliSessionId: rec.cliSessionId, title: rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why, running: rec.isRunning === true });
+    // 0.5.12: was the link minted before the switch (another account, or before this sign-in began)? The switch sweep may clear such a link
+    // inside the quiet window (liveRelinkPass); a link minted after the switch (a bounce, a fresh mint) keeps the quiet gate.
+    // (a 'foreign' or 'stale' reason says so already; a noHistoryBackfill link is dated by its bounds only: no ledger entry is made for it here)
+    const preSwitch = why !== 'noHistoryBackfill' || fc?.staleLink?.(b.bridgeSessionId, tp) === true;
+    out.candidates.push({ file: r.path, id: rec.sessionId, cliSessionId: rec.cliSessionId, title: rec.title ?? '', transcript: tp, link: b.bridgeSessionId, why, preSwitch, running: rec.isRunning === true });
   }
   return out;
 }
@@ -672,26 +676,29 @@ export function liveLine(res) {
  * so a clear line appended while it runs does nothing, and one appended while it does not makes the next cold resume mint a titled link).
  * A session is cleared only when ALL hold, in this order:
  *   1 candidate (liveRelinkCandidates)  2 not the session this hook runs in  3 no live CLI for that conversation (liveCliIds; unknown
- *   clears nothing)  4 transcript untouched for LIVE_QUIET_MS  5 record not mid-turn (isRunning is not "no CLI": 3 is the real check)
+ *   clears nothing)  4 transcript untouched for LIVE_QUIET_MS (0.5.12: not asked of a link minted before the switch when o.switchSweep: the app's
+ *   own CLI teardown at a switch touches every transcript, and 3 is the real safety condition)  5 record not mid-turn (isRunning is not "no CLI": 3 is the real check)
  *   6 right before the write: the list of CLIs read again, the last entry and the age read again, the transcript backed up, the CLI's own
  *   clear line appended, then the list read once more: a CLI that appeared meanwhile is logged `raced` (benign: retried next pass).
  * No process is ever stopped. At most `liveMax` sessions per pass.
- * o: { settings (rcSettings), dryRun (read only; runs even when the feature is off), all, days, max, quietMs, now, acct, projects, rcLog,
+ * o: { settings (rcSettings), dryRun (read only; runs even when the feature is off), all, days, max, quietMs, switchSweep, now, acct, projects, rcLog,
  *      hookCliSessionId, liveCliIds (function, Set or null; tests), cimTimeoutMs, log(line) }
  * @returns {Promise<{ran:boolean, reason?:string, dryRun:boolean, acct, candidates:number, cleared:object[], wouldClear:object[],
  *   skippedLive:number, quiet:number, running:number, unknown:number, self:number, raced:number, deferred:number, failed:number, stale:number,
  *   undated:number (links the history could not date: left alone by the foreign check), undatedStale:number (undatable links judged stale by the
- *   transcript's modified time), guarded:number (noHistoryBackfill links left alone, see isGoneBounce), sessions:[{id, cliSessionId, title, why, link, outcome}] (the verdict of each candidate)}>}
+ *   transcript's modified time), guarded:number (noHistoryBackfill links left alone, see isGoneBounce), bounced:[{id, cliSessionId, title, link}]
+ *   (0.5.12: idle sessions whose live CLI holds a gone-bounce link minted after the switch), sessions:[{id, cliSessionId, title, why, link, outcome}] (the verdict of each candidate)}>}
  */
 export async function liveRelinkPass(ctx, o = {}) {
   const s = o.settings ?? RC_DEFAULTS;
   const dry = o.dryRun === true;
   const log = o.log ?? (() => {});
-  const res = { ran: false, dryRun: dry, acct: null, candidates: 0, cleared: [], wouldClear: [], skippedLive: 0, quiet: 0, running: 0, unknown: 0, self: 0, raced: 0, deferred: 0, failed: 0, stale: 0, undated: 0 };
+  const res = { ran: false, dryRun: dry, acct: null, candidates: 0, cleared: [], wouldClear: [], skippedLive: 0, quiet: 0, running: 0, unknown: 0, self: 0, raced: 0, deferred: 0, failed: 0, stale: 0, undated: 0, bounced: [] };
   if (!dry && (s.enabled === false || s.liveRelink !== 'idle-only')) return { ...res, reason: 'disabled' };
   if (!ctx.store || !ctx.userData) return { ...res, reason: 'no-store' };
   const nowMs = () => o.now ?? ctx.now();
   const quietMs = o.quietMs ?? LIVE_QUIET_MS;
+  const switchSweep = o.switchSweep === true;   // 0.5.12: the quiet gate is not applied to a link minted before the switch (the app's own CLI teardown at the switch touched the transcript)
   const max = o.max ?? s.liveMax ?? RC_DEFAULTS.liveMax;
   // the process list can fail while the machine is busy or the app tears its CLIs down (an account switch). `liveBackoffMs` (an array of waits)
   // or `liveTries` reads `liveRetryMs` apart: one retry per wait. Unknown after the last try means "a live CLI cannot be ruled out": nothing is
@@ -733,10 +740,15 @@ export async function liveRelinkPass(ctx, o = {}) {
   if (live === null) { res.unknown = cands.length; for (const c of cands) mark(c, 'unknown'); if (!dry) log(liveLine(res)); return res; }
   const todo = [];
   for (const c of cands) {
-    if (live.has(lc(c.cliSessionId))) { res.skippedLive++; mark(c, 'live'); continue; }
+    if (live.has(lc(c.cliSessionId))) {
+      res.skippedLive++; mark(c, 'live');
+      // 0.5.12: an idle session whose CLI minted a gone-bounce link AFTER the switch: its random name stays until the link is cleared and the CLI restarts
+      if (c.why === 'noHistoryBackfill' && !c.preSwitch && !c.running && res.cutoff != null) res.bounced.push({ id: c.id, cliSessionId: c.cliSessionId, title: c.title, link: c.link });
+      continue;
+    }
     let m = null; try { m = statSync(c.transcript).mtimeMs; } catch { /* gone */ }
     if (m === null) { res.stale++; mark(c, 'gone'); continue; }
-    if (nowMs() - m < quietMs) { res.quiet++; mark(c, 'quiet'); continue; }
+    if (nowMs() - m < quietMs && !(switchSweep && c.preSwitch)) { res.quiet++; mark(c, 'quiet'); continue; }
     if (c.running) { res.running++; mark(c, 'mid-turn'); continue; }
     todo.push(c);
   }
@@ -756,7 +768,7 @@ export async function liveRelinkPass(ctx, o = {}) {
       try {
         const again = lastBridgeEntry(c.transcript);
         if (!again || again.bridgeSessionId !== c.link || linkReason(scan.foreignCheck, again, c.transcript) === null) { res.stale++; mark(c, 'changed'); continue; }
-        if (nowMs() - statSync(c.transcript).mtimeMs < quietMs) { res.quiet++; mark(c, 'quiet'); continue; }
+        if (nowMs() - statSync(c.transcript).mtimeMs < quietMs && !(switchSweep && c.preSwitch)) { res.quiet++; mark(c, 'quiet'); continue; }
         mkdirSync(backupDir, { recursive: true });
         copyFileSync(c.transcript, join(backupDir, `${c.cliSessionId}.jsonl`));
         appendClearLine(c.transcript, c.cliSessionId);
