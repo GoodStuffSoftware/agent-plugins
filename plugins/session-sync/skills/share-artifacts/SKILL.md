@@ -6,6 +6,8 @@ description: Share artifacts between the two linked claude.ai accounts by sendin
 
 An artifact belongs to the account whose session published it. The other account gets in only through a share invite with **Editor** access: it is SENT from a browser signed in to claude.ai as the owner, and ACCEPTED from a browser signed in as the receiver. session-sync queues every new artifact (a hook on the `Artifact` tool) and, when a browser reachable from the session's account can make progress, asks one session to run this procedure. This is an agent procedure: you drive the UI, send, accept when you can, and record the outcome. The user taps a link only for what no browser of ours could accept.
 
+Editor access lets the other account open and edit an artifact. It gives no live comment watch: the accounts are in different claude.ai organizations, and a watch on an artifact owned by the other account cannot run. Only switching back to the owning account restores it. Do not re-share to fix it.
+
 ## Rules (read first)
 
 - **Drive the UI only.** Never call claude.ai APIs (fetch, curl, scripts) with the user's cookies or tokens. Reading the page's own network log is fine.

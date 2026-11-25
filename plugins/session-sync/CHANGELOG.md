@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.13 - 2026-11-25
+
+Docs only. No code change.
+
+### Docs
+
+* **session-sync:** the accounts skill, the share-artifacts skill and the README now say that Editor access does not give the other account live Artifact comment watches (the accounts are in different claude.ai organizations), so after an account switch those watches stay off until the app switches back to the owner. Re-sharing does not fix it. Detection is agent-companion's (0.31.69 and later); the accounts skill points to its `artifact-watch.mjs scan` command for sessions that still need to resume.
+
 ## 0.5.12 - 2026-11-25
 
 ### Fixed
