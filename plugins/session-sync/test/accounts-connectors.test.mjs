@@ -274,16 +274,81 @@ test('C11 the hook step is throttled to once per 15 minutes per switch, and a ti
   writeConnectorMarker(w.ctx, { at: SWITCH + 2 * HOUR, from: ME, to: OTHER });
   assert.equal(readConnectorMarker(w.ctx).lastCheckAt, undefined);
   assert.equal(connectorCheckStep(w.ctx, hook).ran, true);
-  // a zero budget stops before any task: everything stays pending and nothing is marked checked
+  // a zero budget still checks the first task (progress is guaranteed); the rest stays pending
   const w2 = world();
   writeConnectorMarker(w2.ctx, { at: SWITCH, from: OTHER, to: ME });
   task(w2, 'a-task');
-  run(w2, 'a-task', { at: SWITCH - 3 * HOUR, avail: BASE });
-  run(w2, 'a-task', { at: SWITCH + 60_000, avail: BASE });
+  task(w2, 'b-task');
+  for (const id of ['a-task', 'b-task']) {
+    run(w2, id, { at: SWITCH - 3 * HOUR, avail: BASE });
+    run(w2, id, { at: SWITCH + 60_000, avail: BASE });
+  }
   const r = connectorCheck(w2.ctx, { projects: w2.projects, budgetMs: 0 });
-  assert.deepEqual(r.pending, ['a-task']);
-  assert.deepEqual(readConnectorMarker(w2.ctx).checked, {});
+  assert.deepEqual(r.pending, ['b-task']);
+  assert.deepEqual(Object.keys(readConnectorMarker(w2.ctx).checked), ['a-task']);
+  assert.deepEqual(readConnectorMarker(w2.ctx).cut, ['b-task'], 'the cut task goes first next time');
   assert.equal(r.retired, null);
+  // a lastCheckAt in the future (clock set back) does not throttle
+  const m = readConnectorMarker(w.ctx);
+  m.lastCheckAt = iso(w.ctx.now() + 5 * HOUR);
+  writeFileSync(markerFile(w.ctx), JSON.stringify(m));
+  assert.equal(connectorCheckStep(w.ctx, hook).ran, true);
+});
+
+/** A fake clock that moves `step` ms per reading, so a budget cuts at a repeatable place whatever the machine speed. */
+const stepClock = (step) => { let t = 0; return () => (t += step); };
+
+test('C13 a budget cuts between tasks and inside the baseline pass: every run progresses, partial work is kept, and the end result equals an unbudgeted check', () => {
+  const ids = ['t1', 't2', 't3', 't4'];
+  const build = () => {
+    const w = world();
+    writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+    for (const id of ids) {
+      task(w, id);
+      run(w, id, { at: SWITCH - 3 * HOUR, avail: [...BASE, ...GR], called: [GR[0]] });
+      run(w, id, { at: SWITCH + 60_000, avail: id === 't3' ? BASE : [...BASE, ...GR] });
+    }
+    return w;
+  };
+  let sawPartial = false; let sawCut = false;
+  for (const budget of [1, 3, 5, 8, 12, 20, 35, 60, 100]) {
+    const w = build();
+    let runs = 0; let last = -1;
+    for (; runs < 12; runs += 1) {
+      const before = Object.keys(readConnectorMarker(w.ctx)?.checked ?? {}).length;
+      const r = connectorCheck(w.ctx, { projects: w.projects, budgetMs: budget, clock: stepClock(1) });
+      const mk = readConnectorMarker(w.ctx);
+      if (mk?.partial) sawPartial = true;
+      if (mk?.cut) sawCut = true;
+      if (r.retired) { last = runs; break; }
+      assert.ok(Object.keys(mk.checked).length > before, `budget ${budget}, run ${runs}: at least one more task checked`);
+    }
+    assert.ok(last >= 0, `budget ${budget}: retired within 12 runs`);
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(flagsFile(w.ctx), 'utf8')).tasks), ['t3'], `budget ${budget}: same flags as an unbudgeted check`);
+  }
+  assert.ok(sawCut, 'some budget cut between tasks');
+  assert.ok(sawPartial, 'some budget cut inside the baseline pass and kept the post-switch half');
+});
+
+test('C14 a newer switch recorded while the check runs: no flags, notice, toast or marker change for the old one', () => {
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  task(w, 'grocery-run-price-check');
+  task(w, 'second-task');
+  run(w, 'grocery-run-price-check', { at: SWITCH - 3 * HOUR, avail: [...BASE, ...GR], called: [GR[1]] });
+  run(w, 'grocery-run-price-check', { at: SWITCH + 60_000, avail: BASE });
+  const toasts = [];
+  let n = 0;
+  const clock = () => { n += 1; if (n === 3) writeConnectorMarker(w.ctx, { at: SWITCH + 24 * HOUR, from: ME, to: OTHER }); return 0; };
+  const r = connectorCheck(w.ctx, { projects: w.projects, throttleMs: 15 * 60_000, budgetMs: 100000, clock, toast: (t, b) => toasts.push(b) });
+  assert.equal(r.dropped, 'newer-switch');
+  assert.equal(toasts.length, 0);
+  assert.equal(existsSync(noticeFile(w.ctx)), false);
+  assert.equal(existsSync(flagsFile(w.ctx)), false);
+  const m = readConnectorMarker(w.ctx);
+  assert.equal(m.switchAt, iso(SWITCH + 24 * HOUR));
+  assert.deepEqual(m.checked, {});
+  assert.equal(m.lastCheckAt, undefined);
 });
 
 test('C12 a new switch clears the notice and flags of an older switch', () => {
@@ -300,4 +365,13 @@ test('C12 a new switch clears the notice and flags of an older switch', () => {
   assert.equal(existsSync(noticeFile(w.ctx)), false, 'the notice never describes the older switch');
   assert.equal(existsSync(flagsFile(w.ctx)), false);
   assert.equal(takeConnectorReport(w.ctx), null);
+  // the current switch's own notice survives a later check of that switch
+  run(w, 'grocery-run-price-check', { at: SWITCH + 24 * HOUR - HOUR, avail: [...BASE, ...GR], called: [GR[1]] });
+  run(w, 'grocery-run-price-check', { at: SWITCH + 24 * HOUR + 60_000, avail: BASE });
+  w.ctx.setNow(SWITCH + 25 * HOUR);
+  check(w);
+  assert.equal(existsSync(noticeFile(w.ctx)), true, 'the notice for the current switch is written');
+  check(w);
+  assert.match(readFileSync(noticeFile(w.ctx), 'utf8'), new RegExp(iso(SWITCH + 24 * HOUR).replace(/\./g, '\.')));
+  assert.match(takeConnectorReport(w.ctx), /grocery-run-price-check/);
 });

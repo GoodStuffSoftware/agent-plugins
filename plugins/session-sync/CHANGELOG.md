@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.15 - 2026-11-26
+
+### Fixed
+
+* **session-sync:** the SessionStart connector check now holds a session start for about 1 second, all scans included (0.5.14 counted the budget only after the first scan, and the first task always ran in full). Chosen over a detached background process: the check stays in-process, so it needs no lock file, no extra process and no second reporting path; the budget bounds it instead. The deadline starts at the entry of the check and is checked per run-record file and per 64 KB of a transcript; in the hook a transcript is read at most 4 MB (the baseline can miss a connector that was called only later in a very long run; the prompt-named connectors still count) and a run record over 2 MB is skipped. The one exception is the first task of a run: it is never cut (its reads are capped, so it stays short), which is what guarantees progress. `accounts connector-check` is unchanged (no budget).
+* **session-sync:** a task cut by the budget no longer loses its work or starves. Tasks cut last time go first at the next run, and a task whose post-switch tool list was read but whose baseline was cut keeps that half in the marker (`partial`), so every run checks at least one more task.
+* **session-sync:** a check that started before a newer switch was recorded no longer writes flags, the notice or a toast for the old switch (the marker is re-read before each write, and the result is dropped when the switch time changed).
+* **session-sync:** a `lastCheckAt` in the future (clock set back) no longer throttles the hook; the check is due.
+
 ## 0.5.14 - 2026-11-26
 
 ### Added

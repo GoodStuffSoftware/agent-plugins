@@ -32,6 +32,8 @@ const PRE_SCAN_CAP = 256 * 1024 * 1024;         // bytes of one pre-switch trans
 const PRE_RUNS = 3;                             // pre-switch runs whose called connectors make up the baseline
 export const HOOK_THROTTLE_MS = 15 * 60 * 1000;  // the SessionStart hook checks at most this often
 export const HOOK_BUDGET_MS = 1000;              // and holds a session start no longer than about this (the rest stays pending)
+export const HOOK_SCAN_CAP = 4 * 1024 * 1024;     // hook mode: bytes of one transcript read (a transcript is never streamed whole at a session start)
+const HOOK_RECORD_CAP = 2 * 1024 * 1024;        // hook mode: a run record larger than this is skipped
 const POST_SCAN_LINES = 400;                    // the tool list sits in the first lines of a run
 
 export const markerFile = (ctx) => accPath(ctx, 'connector-check.json');
@@ -131,14 +133,15 @@ export function compareTask({ called = [], preAvail = [], postAvail = [], prompt
 
 /* ------------------------------------------------------------------ transcripts (streamed; only names are read) */
 
-/** Stream a file's lines to fn(line, n); fn returning true stops. Reads in 64 KB chunks, never loads the file. */
-function streamLines(file, fn, capBytes = Infinity) {
+/** Stream a file's lines to fn(line, n); fn returning true stops. Reads in 64 KB chunks, never loads the file. over() is checked per chunk: true stops and the call returns 'cut'. */
+function streamLines(file, fn, capBytes = Infinity, over = () => false) {
   let fd;
-  try { fd = openSync(file, 'r'); } catch { return; }
+  try { fd = openSync(file, 'r'); } catch { return null; }
   try {
     const buf = Buffer.alloc(64 * 1024);
     let rest = ''; let n = 0; let total = 0;
     for (;;) {
+      if (over()) return 'cut';
       const got = readSync(fd, buf, 0, buf.length, null);
       if (!got) break;
       total += got;
@@ -146,22 +149,23 @@ function streamLines(file, fn, capBytes = Infinity) {
       let i;
       while ((i = rest.indexOf('\n')) >= 0) {
         const line = rest.slice(0, i); rest = rest.slice(i + 1); n += 1;
-        if (line && fn(line, n) === true) return;
+        if (line && fn(line, n) === true) return null;
       }
-      if (total > capBytes) return;
+      if (total > capBytes) return null;
     }
     if (rest) fn(rest, n + 1);
+    return null;
   } finally { closeSync(fd); }
 }
 
 /**
- * Read a run's transcript. wantCalls: also collect the connector tools the run called (reads the whole file); otherwise it stops at the
- * tool list. Returns { avail: [names] | null (no tool list yet), called: [names] }.
+ * Read a run's transcript. wantCalls: also collect the connector tools the run called (reads the whole file up to capBytes); otherwise it stops at the
+ * tool list. over(): a deadline, checked per 64 KB chunk. Returns { avail: [names] | null (no tool list yet), called: [names], cut: true when over() stopped it }.
  */
-export function scanTranscript(file, { wantCalls = false } = {}) {
+export function scanTranscript(file, { wantCalls = false, capBytes = PRE_SCAN_CAP, over } = {}) {
   let avail = null;
   const called = new Set();
-  streamLines(file, (line, n) => {
+  const r = streamLines(file, (line, n) => {
     if (avail === null && line.includes('"deferred_tools_delta"')) {
       try {
         const a = JSON.parse(line)?.attachment;
@@ -176,8 +180,8 @@ export function scanTranscript(file, { wantCalls = false } = {}) {
     }
     if (!wantCalls && (avail !== null || n >= POST_SCAN_LINES)) return true;
     return false;
-  }, wantCalls ? PRE_SCAN_CAP : Infinity);
-  return { avail, called: [...called] };
+  }, wantCalls ? capBytes : Infinity, over);
+  return { avail, called: [...called], cut: r === 'cut' };
 }
 
 /** `<projects>/<project key>/<cliSessionId>.jsonl`: the key derived from the cwd first, then every project folder. */
@@ -209,77 +213,112 @@ function enabledTasks(folders) {
   return out;
 }
 
-/** Runs of the wanted tasks from the session records of every folder whose mtime is in [loMs, hiMs): Map(taskId -> run[]). */
-function collectRuns(folders, wanted, loMs, hiMs, into, seen) {
+/** Every session record file of every folder: [{p, m}] (m = mtime). One stat each; over() is checked per file. */
+function listRecords(folders, over) {
+  const out = []; const seen = new Set();
   for (const f of folders) {
     let names; try { names = readdirSync(f.path); } catch { continue; }
     for (const n of names) {
       if (!/^local_[0-9a-f-]{36}\.json$/i.test(n)) continue;
+      if (over()) return out;
       const p = join(f.path, n);
-      if (seen.has(p)) continue;   // by path: a stub copy of a run in another folder has no cliSessionId, the full copy does
-      let m; try { m = statSync(p).mtimeMs; } catch { continue; }
-      if (m < loMs || m >= hiMs) continue;
-      let text; try { text = readFileSync(p, 'utf8'); } catch { continue; }
-      if (!text.includes('"scheduledTaskId"')) continue;
-      let r; try { r = JSON.parse(text); } catch { continue; }
-      if (!wanted.has(r?.scheduledTaskId)) continue;
+      if (seen.has(p)) continue;
       seen.add(p);
-      if (!/^[0-9a-f-]{36}$/i.test(r.cliSessionId ?? '')) continue;
-      const created = msOf(r.createdAt);
-      if (!Number.isFinite(created)) continue;
-      const names2 = {};
-      for (const s of Array.isArray(r.remoteMcpServersConfig) ? r.remoteMcpServersConfig : []) if (s?.uuid && s?.name) names2[String(s.uuid).toLowerCase()] = String(s.name);
-      if (!into.has(r.scheduledTaskId)) into.set(r.scheduledTaskId, []);
-      into.get(r.scheduledTaskId).push({ created, cliSessionId: r.cliSessionId, cwd: r.cwd, names: names2 });
+      let m; try { m = statSync(p).mtimeMs; } catch { continue; }
+      out.push({ p, m });
     }
   }
+  return out;
+}
+
+/** One run record as { taskId, created, cliSessionId, cwd, names } or null (not a scheduled-task run, or unusable). maxBytes: skip a larger file. */
+function parseRecord(p, maxBytes) {
+  try {
+    if (maxBytes && statSync(p).size > maxBytes) return null;
+    const text = readFileSync(p, 'utf8');
+    if (!text.includes('"scheduledTaskId"')) return null;
+    const r = JSON.parse(text);
+    if (typeof r?.scheduledTaskId !== 'string' || !/^[0-9a-f-]{36}$/i.test(r.cliSessionId ?? '')) return null;
+    const created = msOf(r.createdAt);
+    if (!Number.isFinite(created)) return null;
+    const names = {};
+    for (const s of Array.isArray(r.remoteMcpServersConfig) ? r.remoteMcpServersConfig : []) if (s?.uuid && s?.name) names[String(s.uuid).toLowerCase()] = String(s.name);
+    return { taskId: r.scheduledTaskId, created, cliSessionId: r.cliSessionId, cwd: r.cwd, names };
+  } catch { return null; }
 }
 
 /* ------------------------------------------------------------------ the check */
 
 /**
- * Check the tasks of a marker that are not yet checked. Read only. Returns { results: [{taskId, status: 'pending'|'ok'|'flagged', findings}] }.
- * o: { projects, now }
+ * Check the tasks of a marker that are not yet checked. Read only. Returns { results: [{taskId, status: 'pending'|'ok'|'flagged', findings}],
+ * partial, cut, enabled }. o: { projects, budgetMs, startedAt, clock (a test clock) }. With budgetMs (the SessionStart hook) every step is bounded: the deadline counts
+ * from startedAt (the entry of the check), it is checked per file and per 64 KB of a transcript, and a transcript is read up to HOOK_SCAN_CAP
+ * bytes. Progress is guaranteed: the deadline only applies once one task has been handled in the run (so the first task is never cut; its reads
+ * are capped, so it stays short), tasks cut last time (marker.cut) go first, and a task whose post-switch tool list was read but whose baseline
+ * was cut keeps that in `partial` (stored in the marker) so the next run starts from it.
  */
 export function checkTasks(ctx, marker, o = {}) {
   const projects = o.projects ?? join(claudeHome(), 'projects');
   const sinceMs = Date.parse(marker.switchAt);
   const folders = ctx.store ? listFolders(ctx.store) : [];
   const tasks = enabledTasks(folders);
-  const todo = new Map([...tasks].filter(([id]) => !marker.checked?.[id]));
-  const wanted = new Set(todo.keys());
-  const runs = new Map(); const seen = new Set();
-  collectRuns(folders, wanted, sinceMs, Infinity, runs, seen);   // records touched since the switch: every post run, and a pre run still being written
-  const results = [];
-  const needPre = [];
-  const post = new Map();
-  const deadline = Number.isFinite(o.budgetMs) ? Date.now() + o.budgetMs : Infinity;
-  const over = () => Date.now() >= deadline;
-  for (const id of wanted) {
-    if (over()) { results.push({ taskId: id, status: 'pending', findings: [] }); continue; }
-    const first = (runs.get(id) ?? []).filter((r) => r.created >= sinceMs).sort((a, b) => a.created - b.created)[0];
-    const file = first ? findTranscript(projects, first) : null;
-    const scan = file ? scanTranscript(file) : null;
-    if (!scan || scan.avail === null) { results.push({ taskId: id, status: 'pending', findings: [] }); continue; }
-    post.set(id, { run: first, avail: scan.avail });
-    needPre.push(id);
-  }
-  if (needPre.length) collectRuns(folders, new Set(needPre), sinceMs - LOOKBACK_MS, sinceMs, runs, seen);
-  for (const id of needPre) {
-    if (over()) { results.push({ taskId: id, status: 'pending', findings: [] }); continue; }
+  const budgeted = Number.isFinite(o.budgetMs);
+  const deadline = budgeted ? (o.startedAt ?? (o.clock ?? Date.now)()) + o.budgetMs : Infinity;
+  let handled = 0;   // tasks handled (decided, or found to have no run yet) in this run
+  const over = () => handled > 0 && (o.clock ?? Date.now)() >= deadline;
+  const cap = budgeted ? HOOK_SCAN_CAP : PRE_SCAN_CAP;
+  const maxRec = budgeted ? HOOK_RECORD_CAP : 0;
+  const cutBefore = new Set(Array.isArray(marker.cut) ? marker.cut : []);
+  const order = [...tasks.keys()].filter((id) => !marker.checked?.[id]).sort((a, b) => (cutBefore.has(b) ? 1 : 0) - (cutBefore.has(a) ? 1 : 0));
+  const files = listRecords(folders, over);
+  const recs = new Map();   // path -> record | null, each file is parsed at most once
+  const runsOf = (id, lo) => {
+    const out = [];
+    for (const { p, m } of files) {
+      if (m < lo) continue;
+      if (over()) return { runs: out, cut: true };
+      let r = recs.get(p);
+      if (r === undefined) { r = parseRecord(p, maxRec); recs.set(p, r); }
+      if (r && r.taskId === id) out.push(r);
+    }
+    return { runs: out, cut: false };
+  };
+  const results = []; const partial = {}; const cut = [];
+  const pend = (id) => results.push({ taskId: id, status: 'pending', findings: [] });
+  const stopped = (id) => { cut.push(id); pend(id); };
+  for (const id of order) {
+    if (over()) { stopped(id); continue; }
+    let post = marker.partial?.[id] ?? null;
+    if (!post) {
+      const { runs, cut: c1 } = runsOf(id, sinceMs);
+      const first = runs.filter((r) => r.created >= sinceMs).sort((a, b) => a.created - b.created)[0];
+      const file = !c1 && first ? findTranscript(projects, first) : null;
+      const scan = file ? scanTranscript(file, { over }) : null;
+      if (c1 || scan?.cut) { stopped(id); continue; }
+      if (!scan || scan.avail === null) { pend(id); handled += 1; continue; }   // no run yet, or its tool list is not written yet
+      post = { run: { cliSessionId: first.cliSessionId, cwd: first.cwd, names: first.names }, avail: scan.avail };
+    }
     // the last PRE_RUNS runs before the switch: one run can itself have been made on the other account (a brief flip), with nothing called
-    const pres = (runs.get(id) ?? []).filter((r) => r.created < sinceMs).sort((a, b) => b.created - a.created)
-      .filter((r, i, all) => all.findIndex((x) => x.cliSessionId === r.cliSessionId) === i)   // the same run sits in every linked folder
+    const { runs: all, cut: c2 } = runsOf(id, sinceMs - LOOKBACK_MS);
+    const pres = all.filter((r) => r.created < sinceMs).sort((a, b) => b.created - a.created)
+      .filter((r, i, l) => l.findIndex((x) => x.cliSessionId === r.cliSessionId) === i)   // the same run sits in every linked folder
       .map((r) => ({ r, file: findTranscript(projects, r) })).filter((x) => x.file).slice(0, PRE_RUNS);
-    const scan = { avail: [], called: [] }; let preNames = {};
-    for (const pre of pres) { const sc = scanTranscript(pre.file, { wantCalls: true }); scan.called.push(...sc.called); scan.avail.push(...(sc.avail ?? [])); preNames = { ...pre.r.names, ...preNames }; }
+    const scan = { avail: [], called: [] }; let preNames = {}; let c3 = c2;
+    for (const pre of c3 ? [] : pres) {
+      if (over()) { c3 = true; break; }
+      const sc = scanTranscript(pre.file, { wantCalls: true, capBytes: cap, over });
+      if (sc.cut) { c3 = true; break; }
+      scan.called.push(...sc.called); scan.avail.push(...(sc.avail ?? [])); preNames = { ...pre.r.names, ...preNames };
+    }
+    if (c3) { partial[id] = post; stopped(id); continue; }   // the baseline was cut: keep the post-switch half for the next run
     let prompt = '';
     try { const fp = tasks.get(id)?.filePath; if (typeof fp === 'string') prompt = readFileSync(fp, 'utf8'); } catch { /* no prompt file */ }
-    const findings = compareTask({ called: scan.called, preAvail: scan.avail ?? [], postAvail: post.get(id).avail, prompt, names: { ...preNames, ...post.get(id).run.names } });
+    const findings = compareTask({ called: scan.called, preAvail: scan.avail ?? [], postAvail: post.avail, prompt, names: { ...preNames, ...post.run.names } });
     const alerts = findings.filter((f) => f.kind !== 'moved');
     results.push({ taskId: id, status: alerts.length ? 'flagged' : 'ok', findings, displayName: tasks.get(id)?.displayName ?? null });
+    handled += 1;
   }
-  return { results, enabled: [...tasks.keys()] };
+  return { results, partial, cut, enabled: [...tasks.keys()] };
 }
 
 /* ------------------------------------------------------------------ the alert */
@@ -318,6 +357,7 @@ function claim(ctx, key) {
  */
 export function connectorCheck(ctx, o = {}) {
   const log = o.log ?? (() => {});
+  const startedAt = (o.clock ?? Date.now)();   // the hook budget counts from here, all scans included
   try {
     const nowMs = ctx.now();
     let marker; let ephemeral = false;
@@ -332,15 +372,20 @@ export function connectorCheck(ctx, o = {}) {
       if (!marker) return { ran: false, reason: 'no-marker' };
       const last = Date.parse(marker.lastCheckAt);
       // throttle (the hook only): a last check inside the window, made for this same switch, is not repeated
-      if (o.throttleMs > 0 && Number.isFinite(last) && last >= Date.parse(marker.switchAt) && nowMs - last < o.throttleMs) return { ran: false, reason: 'throttled' };
+      // (a lastCheckAt in the future, from a clock set back, does not throttle: the check is due)
+      if (o.throttleMs > 0 && Number.isFinite(last) && last >= Date.parse(marker.switchAt) && last <= nowMs && nowMs - last < o.throttleMs) return { ran: false, reason: 'throttled' };
     }
-    const { results, enabled } = checkTasks(ctx, marker, { projects: o.projects, budgetMs: o.budgetMs });
+    const { results, partial, cut, enabled } = checkTasks(ctx, marker, { projects: o.projects, budgetMs: o.budgetMs, startedAt, clock: o.clock });
     const rep = { ran: true, dryRun: !!o.dryRun, switchAt: marker.switchAt, from: marker.from, to: marker.to, tasks: results, flagged: results.filter((r) => r.status === 'flagged').map((r) => r.taskId), pending: results.filter((r) => r.status === 'pending').map((r) => r.taskId), retired: null };
     const checkedNow = results.filter((r) => r.status !== 'pending');
     const allDone = enabled.length > 0 && enabled.every((id) => marker.checked?.[id] || checkedNow.some((r) => r.taskId === id));
     const expired = nowMs - Date.parse(marker.createdAt) >= EXPIRE_MS;
     if (!ephemeral && (allDone || expired)) rep.retired = allDone ? 'complete' : 'expired';
     if (o.dryRun) return rep;
+    // the hook holds no accounts lock: the live pass may have written a marker for a newer switch (and cleared its notice and flags) while the tasks
+    // were checked. Then nothing of this result is written: no flags, notice, toast or marker change
+    const newer = () => { if (ephemeral) return false; const c = readConnectorMarker(ctx); return !c || c.switchAt !== marker.switchAt; };
+    if (newer()) { rep.retired = null; rep.dropped = 'newer-switch'; log('connector check: a newer switch was recorded meanwhile; this result is dropped'); return rep; }
     // alerts: the flags file keeps the findings (it outlives the marker), the notice file is written from it
     const flagged = results.filter((r) => r.status === 'flagged');
     if (flagged.length) {
@@ -349,7 +394,7 @@ export function connectorCheck(ctx, o = {}) {
       for (const r of flagged) flags.tasks[r.taskId] = { displayName: r.displayName, findings: r.findings, at: iso(nowMs) };
       writeJsonAtomic(flagsFile(ctx), flags);
       try { mkdirSync(dirname(noticeFile(ctx)), { recursive: true }); writeFileSync(noticeFile(ctx), noticeText(flags)); } catch (e) { log(`connector check: the notice file was not written: ${e?.message ?? e}`); }
-      if (typeof o.toast === 'function') {
+      if (typeof o.toast === 'function' && !newer()) {
         const told = flagged.filter((r) => claim(ctx, `toast-${Date.parse(marker.switchAt)}-${safeKey(r.taskId)}`));
         if (told.length) {
           const body = told.slice(0, 3).map((r) => `${r.taskId}: ${r.findings.filter((f) => f.kind !== 'moved').map((f) => f.name).join(', ')}`).join('; ') + (told.length > 3 ? `; and ${told.length - 3} more` : '');
@@ -359,13 +404,19 @@ export function connectorCheck(ctx, o = {}) {
       log(`connector check: ${flagged.length} task(s) flagged (${flagged.map((r) => r.taskId).join(', ')})`);
     }
     if (!ephemeral) {
-      // the hook holds no accounts lock: a marker the live pass wrote for a newer switch meanwhile is not ours to retire or update
+      // re-read right before the write: a marker for a newer switch is not ours to retire or update
       const cur = readConnectorMarker(ctx);
-      const ours = !cur || cur.switchAt === marker.switchAt;
+      const ours = !!cur && cur.switchAt === marker.switchAt;
       if (rep.retired) { if (ours) { try { unlinkSync(markerFile(ctx)); } catch { /* already gone */ } log(`connector check: marker retired (${rep.retired})`); } }
-      else if ((checkedNow.length || o.throttleMs > 0) && cur && ours) {
+      else if ((checkedNow.length || o.throttleMs > 0 || cut.length) && ours) {
+        cur.checked = cur.checked ?? {};
         for (const r of checkedNow) cur.checked[r.taskId] = { at: iso(nowMs), status: r.status };
         if (o.throttleMs > 0) cur.lastCheckAt = iso(nowMs);
+        // what was cut this time goes first next time, and a post-switch tool list already read is kept
+        const keep = {};
+        for (const id of cut) { const p = partial[id] ?? cur.partial?.[id]; if (p) keep[id] = p; }
+        if (cut.length) cur.cut = cut; else delete cur.cut;
+        if (Object.keys(keep).length) cur.partial = keep; else delete cur.partial;
         writeJsonAtomic(markerFile(ctx), cur);
       }
     } else if (flagged.length || checkedNow.length) {
