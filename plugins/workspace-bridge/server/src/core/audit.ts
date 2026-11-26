@@ -58,8 +58,8 @@ export interface AuditRecord {
 }
 
 const TEXT_MAX = 300;
-/** `detail` is longer: an owner-directed send records the owner's quote there (up to 500 characters). */
-const DETAIL_MAX = 2000;
+/** `detail` is longer: an owner-directed send records the owner's quote there (up to 500 characters, more once JSON escapes it). */
+const DETAIL_MAX = 4000;
 const LIST_MAX = 100;
 
 const clip = (s: string | null | undefined, max = TEXT_MAX): string | null =>
