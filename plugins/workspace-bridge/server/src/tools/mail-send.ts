@@ -993,7 +993,7 @@ const reply = defineTool({
       }
       if (mode(ctx) === "all") {
         noteUnused(args, UNUSED_ALL);
-        await checkBeforeHold(ctx, "reply",args.account, args.messageId, undefined, args, false);
+        await checkBeforeHold(ctx, "reply", args.account, args.messageId, undefined, args, false);
         return true;
       }
       try {
@@ -1132,7 +1132,7 @@ const forward = defineTool({
       if (mode(ctx) === "off") return false;
       if (mode(ctx) === "all") {
         noteUnused(args, UNUSED_ALL);
-        await checkBeforeHold(ctx, "forward",args.account, args.messageId, undefined, args, true);
+        await checkBeforeHold(ctx, "forward", args.account, args.messageId, undefined, args, true);
         return true;
       }
       let entries: string[];
