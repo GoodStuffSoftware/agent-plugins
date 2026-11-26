@@ -615,6 +615,51 @@ async function sentTo(a: AccountRef, addresses: readonly string[]): Promise<stri
   return found;
 }
 
-const service: SendService = { prepare, deliver, readDraft, readDraftText, sendDraft, sentTo };
+/** From, To and Cc addresses of the sent and received messages of one thread (never drafts). */
+async function threadAddresses(
+  a: AccountRef,
+  ref: { threadId: string } | { messageId: string },
+): Promise<string[]> {
+  let threadId: string | undefined;
+  if ("threadId" in ref) {
+    threadId = ref.threadId;
+  } else {
+    const m = await gjson<GmailMessage>(
+      a,
+      `${BASE}/messages/${enc(ref.messageId)}`,
+      {},
+      { fields: "id,threadId", query: { format: "minimal" } },
+    );
+    threadId = m?.threadId;
+  }
+  if (!threadId) throw malformed();
+  const t = await gjson<{ messages?: GmailMessage[] }>(
+    a,
+    `${BASE}/threads/${enc(threadId)}`,
+    {},
+    {
+      fields: "messages(labelIds,payload/headers)",
+      query: { format: "metadata", metadataHeaders: ["From", "To", "Cc"] },
+    },
+  );
+  const out = new Set<string>();
+  for (const m of t?.messages ?? []) {
+    if ((m.labelIds ?? []).includes("DRAFT")) continue;
+    for (const name of ["From", "To", "Cc"]) {
+      for (const x of parseAddresses(headerOf(m.payload, name))) out.add(x);
+    }
+  }
+  return [...out];
+}
+
+const service: SendService = {
+  prepare,
+  deliver,
+  readDraft,
+  readDraftText,
+  sendDraft,
+  sentTo,
+  threadAddresses,
+};
 
 export const googleSend = provide(SEND, service);
