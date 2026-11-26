@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.14 - 2026-11-26
+
+### Added
+
+* **session-sync:** a connector check after an account switch. Scheduled tasks that use a connector not connected on the new account (on 11-25: bsk-app-review-watch, grocery-run-daily-check, grocery-run-price-check, friends-family-suggestions) used to fail silently. The live pass now leaves a "check pending" marker at each recorded switch (`accounts/connector-check.json`; `state.json` and `switch-history.json` are unchanged). The SessionStart hook compares each enabled task's last run before the switch with its first run after it, from the run transcripts (tool names only). A connector the earlier run called, or the prompt file names by id, that has no tool in the later run is flagged; the same tools under another id are reported as "available under a different id; the prompt hardcodes <id>" only when the prompt hardcodes the old id. Tasks with no run yet stay pending; the marker retires when every enabled task is checked or after 8 days.
+* **session-sync:** the alert is local: a toast (tag `connectors`, respects `notifications`), `CONNECTORS-MISSING.md` in the session-sync folder, and one SessionStart context line, each once per switch and task. No Discord, nothing sent outward.
+* **session-sync:** `accounts connector-check [--since <iso>] [--json] [--dry-run]`; `--dry-run` writes no state and sends no notification.
+
 ## 0.5.13 - 2026-11-25
 
 Docs only. No code change.
