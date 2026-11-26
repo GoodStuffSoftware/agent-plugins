@@ -155,8 +155,10 @@ export async function livePass(ctx, o = {}) {
       const now = ctx.now();
       noteSignedIn(state, app.signedIn, now);
       const sw = noteSwitch(state, app.signedIn, now);
-      if (sw.changed && recordSwitch(ctx, app.signedIn, now, { prev: sw.prev })) {   // the account of each link is told from this history (rclinks.mjs)
-        writeConnectorMarker(ctx, { at: now, from: sw.prev, to: app.signedIn });   // 0.5.14: the connector check runs later, from the SessionStart hook (connectors.mjs)
+      if (sw.changed) {
+        recordSwitch(ctx, app.signedIn, now, { prev: sw.prev });   // the account of each link is told from this history (rclinks.mjs)
+        // 0.5.14: marked on the switch itself, not on recordSwitch's result (it returns false when remote-control.log already put the new account in the history)
+        writeConnectorMarker(ctx, { at: now, from: sw.prev, to: app.signedIn });   // the connector check runs later, from the SessionStart hook (connectors.mjs)
       }
       const roles = folderRoles(app, group, state, now, group.filter((f) => !(state.group ?? []).includes(f.key)).map((f) => f.key));
       // what the app most likely loaded when it opened the signed-in account's folders: a switch, or a new app run

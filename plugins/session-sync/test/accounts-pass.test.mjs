@@ -304,3 +304,21 @@ test('unlink of a group that was never linked is refused', async () => {
   assert.equal((await unlink(w.ctx, {})).reason, 'not-linked');
   assert.equal(listFolders(w.r.store).length, 2);
 });
+
+test('0.5.14 live pass: an in-app switch A -> B leaves a connector-check marker (from, to, switch time), even when the history already holds B', async () => {
+  const w = world();
+  assert.equal((await link(w.ctx, {})).ok, true);
+  w.sim.setApp({ running: true, signedIn: A, startedAtMs: w.clock.tick() });
+  assert.equal((await livePass(w.ctx, {})).ok, true);
+  assert.equal(existsSync(join(w.r.acc, 'connector-check.json')), false, 'no switch yet: no marker');
+  // the history already ends with B (as when remote-control.log seeded it), so recordSwitch has nothing to add
+  writeFileSync(join(w.r.acc, 'switch-history.json'), JSON.stringify([{ at: new Date(w.clock.t).toISOString(), acct: B }]));
+  w.sim.setApp({ running: true, signedIn: B, startedAtMs: w.clock.t });
+  const at = w.clock.tick();
+  assert.equal((await livePass(w.ctx, {})).ok, true);
+  const m = readJson(join(w.r.acc, 'connector-check.json'), null);
+  assert.ok(m, 'the marker is written');
+  assert.equal(m.from, A);
+  assert.equal(m.to, B);
+  assert.ok(Date.parse(m.switchAt) >= at - 1000);
+});

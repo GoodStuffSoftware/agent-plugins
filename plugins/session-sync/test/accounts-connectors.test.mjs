@@ -124,6 +124,16 @@ test('C4 a connector uuid written in the prompt counts even when the pre run nev
   assert.equal(f[0].uuid, GMAIL);
 });
 
+test('C4b an id that was already available before the switch is not an "other id" for the missing connector; an empty task list never retires the marker', () => {
+  const dup = GM.map((n) => n.replace(GMAIL, GMAIL2));
+  const f = compareTask({ called: GM, preAvail: [...GM, ...dup], postAvail: dup, prompt: '' });
+  assert.equal(f[0].kind, 'missing');
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  assert.equal(check(w).retired, null);
+  assert.equal(existsSync(markerFile(w.ctx)), true);
+});
+
 test('C5 a task with no run since the switch stays pending, and so does a run whose tool list is not written yet', () => {
   const w = world();
   task(w, 'no-run-yet');

@@ -118,7 +118,7 @@ export function compareTask({ called = [], preAvail = [], postAvail = [], prompt
     const hardcoded = lowerText.includes(u);
     const name = connectorName(u, tools, names);
     let alt = null;
-    for (const [v, vt] of postBy) { if (tools.size && [...tools].every((t) => vt.has(t))) { alt = v; break; } }   // all of its known tools under one other uuid
+    for (const [v, vt] of postBy) { if (preBy.has(v)) continue; if (tools.size && [...tools].every((t) => vt.has(t))) { alt = v; break; } }   // all of its known tools under one other uuid
     if (alt) out.push({ uuid: u, name, kind: hardcoded ? 'different-id' : 'moved', alt, hardcoded });
     else out.push({ uuid: u, name, kind: 'missing', hardcoded });
   }
@@ -326,7 +326,7 @@ export function connectorCheck(ctx, o = {}) {
     const { results, enabled } = checkTasks(ctx, marker, { projects: o.projects });
     const rep = { ran: true, dryRun: !!o.dryRun, switchAt: marker.switchAt, from: marker.from, to: marker.to, tasks: results, flagged: results.filter((r) => r.status === 'flagged').map((r) => r.taskId), pending: results.filter((r) => r.status === 'pending').map((r) => r.taskId), retired: null };
     const checkedNow = results.filter((r) => r.status !== 'pending');
-    const allDone = enabled.every((id) => marker.checked?.[id] || checkedNow.some((r) => r.taskId === id));
+    const allDone = enabled.length > 0 && enabled.every((id) => marker.checked?.[id] || checkedNow.some((r) => r.taskId === id));
     const expired = nowMs - Date.parse(marker.createdAt) >= EXPIRE_MS;
     if (!ephemeral && (allDone || expired)) rep.retired = allDone ? 'complete' : 'expired';
     if (o.dryRun) return rep;
@@ -348,11 +348,13 @@ export function connectorCheck(ctx, o = {}) {
       log(`connector check: ${flagged.length} task(s) flagged (${flagged.map((r) => r.taskId).join(', ')})`);
     }
     if (!ephemeral) {
-      if (rep.retired) { try { unlinkSync(markerFile(ctx)); } catch { /* already gone */ } log(`connector check: marker retired (${rep.retired})`); }
-      else if (checkedNow.length) {
-        const fresh = readConnectorMarker(ctx) ?? marker;
-        for (const r of checkedNow) fresh.checked[r.taskId] = { at: iso(nowMs), status: r.status };
-        writeJsonAtomic(markerFile(ctx), fresh);
+      // the hook holds no accounts lock: a marker the live pass wrote for a newer switch meanwhile is not ours to retire or update
+      const cur = readConnectorMarker(ctx);
+      const ours = !cur || cur.switchAt === marker.switchAt;
+      if (rep.retired) { if (ours) { try { unlinkSync(markerFile(ctx)); } catch { /* already gone */ } log(`connector check: marker retired (${rep.retired})`); } }
+      else if (checkedNow.length && cur && ours) {
+        for (const r of checkedNow) cur.checked[r.taskId] = { at: iso(nowMs), status: r.status };
+        writeJsonAtomic(markerFile(ctx), cur);
       }
     } else if (flagged.length || checkedNow.length) {
       // an explicit --since run adopts that switch time as the pending marker with what it found, so the rest is rechecked later
