@@ -43,7 +43,7 @@ import { spawnPlan, spawnFixStep, spawnLook, spawnLine } from './accounts/rcspaw
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
-import { connectorCheck, connectorCheckStep, takeConnectorReport, HOOK_THROTTLE_MS, HOOK_BUDGET_MS } from './accounts/connectors.mjs';
+import { connectorCheck, backgroundConnectorCheck, connectorHookStep, takeConnectorReport, HOOK_THROTTLE_MS } from './accounts/connectors.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus, RESTART_LEAD, RESTART_LEAD_WAITER, WAIT_NOTE } from './accounts/report.mjs';
@@ -519,7 +519,7 @@ async function accountsHookStep() {
     // a go-live result no session has been told about yet (once), or a mid-run notice
     try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     // 0.5.14: after an account switch, scheduled tasks whose connector is not connected on the new account (once per switch and task)
-    try { const ctx = makeCtx(); if (ctx.store) { connectorCheckStep(ctx, { toast: connectorToast, log, throttleMs: HOOK_THROTTLE_MS, budgetMs: HOOK_BUDGET_MS }); const t = takeConnectorReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
+    try { const ctx = makeCtx(); if (ctx.store) { connectorHookStep(ctx, { log, throttleMs: HOOK_THROTTLE_MS }); const t = takeConnectorReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     await accountsHookStepInner(parts);
     try { rcHookArm(); } catch { /* never block a session */ }   // after the account step: that one may have armed the waiter with a reason of its own
     try { rcLogonTaskSetup(); } catch { /* never block a session */ }
@@ -780,6 +780,11 @@ function connectorCheckCommand(ctx, args) {
     since = Date.parse(args[si + 1] ?? '');
     if (!Number.isFinite(since)) { console.error('Usage: accounts connector-check [--since <iso date-time>] [--json] [--dry-run]  (--since needs a date-time such as 2026-11-25T04:42:00Z)'); return 2; }
   }
+  if (args.includes('--background')) {   // started by the SessionStart hook, hidden and detached: the full check, one at a time, reported through the toast and notice file
+    const b = backgroundConnectorCheck(ctx, { toast: connectorToast, log });
+    emit({ ok: b.reason !== 'error', command: 'connector-check', background: true, ran: !!b.ran, reason: b.reason ?? null, flagged: b.flagged ?? [], pending: b.pending ?? [], retired: b.retired ?? null }, [b.ran ? `Background check done: ${b.flagged.length} flagged, ${b.pending.length} pending.` : `Background check did not run: ${b.reason}.`]);
+    return 0;
+  }
   const r = connectorCheck(ctx, { since, dryRun: dry, toast: connectorToast, log });
   if (!r.ran) {
     emit({ ok: r.reason === 'no-marker', command: 'connector-check', ran: false, reason: r.reason }, [r.reason === 'no-marker' ? 'No connector check is pending (no account switch since the last check). Use --since <iso> to check against a switch time.' : `The check did not run: ${r.reason}.`]);
@@ -995,7 +1000,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json] [--background]');
   return 2;
 }
 
