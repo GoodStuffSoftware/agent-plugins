@@ -43,7 +43,7 @@ import { spawnPlan, spawnFixStep, spawnLook, spawnLine } from './accounts/rcspaw
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
-import { connectorCheck, connectorCheckStep, takeConnectorReport } from './accounts/connectors.mjs';
+import { connectorCheck, connectorCheckStep, takeConnectorReport, HOOK_THROTTLE_MS, HOOK_BUDGET_MS } from './accounts/connectors.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus, RESTART_LEAD, RESTART_LEAD_WAITER, WAIT_NOTE } from './accounts/report.mjs';
@@ -519,7 +519,7 @@ async function accountsHookStep() {
     // a go-live result no session has been told about yet (once), or a mid-run notice
     try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     // 0.5.14: after an account switch, scheduled tasks whose connector is not connected on the new account (once per switch and task)
-    try { const ctx = makeCtx(); if (ctx.store) { connectorCheckStep(ctx, { toast: connectorToast, log }); const t = takeConnectorReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
+    try { const ctx = makeCtx(); if (ctx.store) { connectorCheckStep(ctx, { toast: connectorToast, log, throttleMs: HOOK_THROTTLE_MS, budgetMs: HOOK_BUDGET_MS }); const t = takeConnectorReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     await accountsHookStepInner(parts);
     try { rcHookArm(); } catch { /* never block a session */ }   // after the account step: that one may have armed the waiter with a reason of its own
     try { rcLogonTaskSetup(); } catch { /* never block a session */ }

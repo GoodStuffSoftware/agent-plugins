@@ -30,6 +30,8 @@ export const EXPIRE_MS = 8 * 24 * 60 * 60 * 1000;
 const LOOKBACK_MS = 21 * 24 * 60 * 60 * 1000;   // how far before the switch a task's last run is searched for
 const PRE_SCAN_CAP = 256 * 1024 * 1024;         // bytes of one pre-switch transcript read for tool_use names
 const PRE_RUNS = 3;                             // pre-switch runs whose called connectors make up the baseline
+export const HOOK_THROTTLE_MS = 15 * 60 * 1000;  // the SessionStart hook checks at most this often
+export const HOOK_BUDGET_MS = 1000;              // and holds a session start no longer than about this (the rest stays pending)
 const POST_SCAN_LINES = 400;                    // the tool list sits in the first lines of a run
 
 export const markerFile = (ctx) => accPath(ctx, 'connector-check.json');
@@ -51,6 +53,8 @@ const safeKey = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, '_');
 export function writeConnectorMarker(ctx, { at, from, to }) {
   try {
     writeJsonAtomic(markerFile(ctx), { v: 1, switchAt: iso(at), from: from ?? null, to: to ?? null, createdAt: iso(ctx.now()), checked: {} });
+    // a notice and flags from an older switch must not outlive it: the next check rewrites them for this one
+    for (const f of [noticeFile(ctx), flagsFile(ctx)]) { try { unlinkSync(f); } catch { /* none */ } }
     return true;
   } catch { return false; }
 }
@@ -249,7 +253,10 @@ export function checkTasks(ctx, marker, o = {}) {
   const results = [];
   const needPre = [];
   const post = new Map();
+  const deadline = Number.isFinite(o.budgetMs) ? Date.now() + o.budgetMs : Infinity;
+  const over = () => Date.now() >= deadline;
   for (const id of wanted) {
+    if (over()) { results.push({ taskId: id, status: 'pending', findings: [] }); continue; }
     const first = (runs.get(id) ?? []).filter((r) => r.created >= sinceMs).sort((a, b) => a.created - b.created)[0];
     const file = first ? findTranscript(projects, first) : null;
     const scan = file ? scanTranscript(file) : null;
@@ -259,6 +266,7 @@ export function checkTasks(ctx, marker, o = {}) {
   }
   if (needPre.length) collectRuns(folders, new Set(needPre), sinceMs - LOOKBACK_MS, sinceMs, runs, seen);
   for (const id of needPre) {
+    if (over()) { results.push({ taskId: id, status: 'pending', findings: [] }); continue; }
     // the last PRE_RUNS runs before the switch: one run can itself have been made on the other account (a brief flip), with nothing called
     const pres = (runs.get(id) ?? []).filter((r) => r.created < sinceMs).sort((a, b) => b.created - a.created)
       .filter((r, i, all) => all.findIndex((x) => x.cliSessionId === r.cliSessionId) === i)   // the same run sits in every linked folder
@@ -322,8 +330,11 @@ export function connectorCheck(ctx, o = {}) {
     } else {
       marker = readConnectorMarker(ctx);
       if (!marker) return { ran: false, reason: 'no-marker' };
+      const last = Date.parse(marker.lastCheckAt);
+      // throttle (the hook only): a last check inside the window, made for this same switch, is not repeated
+      if (o.throttleMs > 0 && Number.isFinite(last) && last >= Date.parse(marker.switchAt) && nowMs - last < o.throttleMs) return { ran: false, reason: 'throttled' };
     }
-    const { results, enabled } = checkTasks(ctx, marker, { projects: o.projects });
+    const { results, enabled } = checkTasks(ctx, marker, { projects: o.projects, budgetMs: o.budgetMs });
     const rep = { ran: true, dryRun: !!o.dryRun, switchAt: marker.switchAt, from: marker.from, to: marker.to, tasks: results, flagged: results.filter((r) => r.status === 'flagged').map((r) => r.taskId), pending: results.filter((r) => r.status === 'pending').map((r) => r.taskId), retired: null };
     const checkedNow = results.filter((r) => r.status !== 'pending');
     const allDone = enabled.length > 0 && enabled.every((id) => marker.checked?.[id] || checkedNow.some((r) => r.taskId === id));
@@ -352,8 +363,9 @@ export function connectorCheck(ctx, o = {}) {
       const cur = readConnectorMarker(ctx);
       const ours = !cur || cur.switchAt === marker.switchAt;
       if (rep.retired) { if (ours) { try { unlinkSync(markerFile(ctx)); } catch { /* already gone */ } log(`connector check: marker retired (${rep.retired})`); } }
-      else if (checkedNow.length && cur && ours) {
+      else if ((checkedNow.length || o.throttleMs > 0) && cur && ours) {
         for (const r of checkedNow) cur.checked[r.taskId] = { at: iso(nowMs), status: r.status };
+        if (o.throttleMs > 0) cur.lastCheckAt = iso(nowMs);
         writeJsonAtomic(markerFile(ctx), cur);
       }
     } else if (flagged.length || checkedNow.length) {

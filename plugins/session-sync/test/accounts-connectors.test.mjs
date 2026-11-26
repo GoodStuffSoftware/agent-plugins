@@ -253,3 +253,51 @@ test('C10 without a marker the check does not run; a disabled task is ignored', 
   const r = check(w, { since: iso(SWITCH), dryRun: true });
   assert.deepEqual(r.tasks, []);
 });
+
+test('C11 the hook step is throttled to once per 15 minutes per switch, and a time budget leaves the rest pending', () => {
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  task(w, 'a-task');
+  task(w, 'b-task');   // no run yet: stays pending, so the marker survives
+  run(w, 'a-task', { at: SWITCH - 3 * HOUR, avail: BASE });
+  run(w, 'a-task', { at: SWITCH + 60_000, avail: BASE });
+  const hook = { projects: w.projects, throttleMs: 15 * 60_000 };
+  const r1 = connectorCheckStep(w.ctx, hook);
+  assert.equal(r1.ran, true);
+  assert.ok(readConnectorMarker(w.ctx).lastCheckAt, 'the check time is recorded in the marker');
+  w.ctx.setNow(SWITCH + HOUR + 10 * 60_000);
+  assert.deepEqual(connectorCheckStep(w.ctx, hook), { ran: false, reason: 'throttled' });
+  assert.equal(connectorCheck(w.ctx, { projects: w.projects }).ran, true, 'the CLI command is not throttled');
+  w.ctx.setNow(SWITCH + HOUR + 16 * 60_000);
+  assert.equal(connectorCheckStep(w.ctx, hook).ran, true, 'after the window it runs again');
+  // a new switch writes a fresh marker: no lastCheckAt, so it runs at once
+  writeConnectorMarker(w.ctx, { at: SWITCH + 2 * HOUR, from: ME, to: OTHER });
+  assert.equal(readConnectorMarker(w.ctx).lastCheckAt, undefined);
+  assert.equal(connectorCheckStep(w.ctx, hook).ran, true);
+  // a zero budget stops before any task: everything stays pending and nothing is marked checked
+  const w2 = world();
+  writeConnectorMarker(w2.ctx, { at: SWITCH, from: OTHER, to: ME });
+  task(w2, 'a-task');
+  run(w2, 'a-task', { at: SWITCH - 3 * HOUR, avail: BASE });
+  run(w2, 'a-task', { at: SWITCH + 60_000, avail: BASE });
+  const r = connectorCheck(w2.ctx, { projects: w2.projects, budgetMs: 0 });
+  assert.deepEqual(r.pending, ['a-task']);
+  assert.deepEqual(readConnectorMarker(w2.ctx).checked, {});
+  assert.equal(r.retired, null);
+});
+
+test('C12 a new switch clears the notice and flags of an older switch', () => {
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  task(w, 'grocery-run-price-check');
+  task(w, 'second-task');
+  run(w, 'grocery-run-price-check', { at: SWITCH - 3 * HOUR, avail: [...BASE, ...GR], called: [GR[1]] });
+  run(w, 'grocery-run-price-check', { at: SWITCH + 60_000, avail: BASE });
+  check(w);
+  assert.equal(existsSync(noticeFile(w.ctx)), true);
+  assert.equal(existsSync(flagsFile(w.ctx)), true);
+  writeConnectorMarker(w.ctx, { at: SWITCH + 24 * HOUR, from: ME, to: OTHER });
+  assert.equal(existsSync(noticeFile(w.ctx)), false, 'the notice never describes the older switch');
+  assert.equal(existsSync(flagsFile(w.ctx)), false);
+  assert.equal(takeConnectorReport(w.ctx), null);
+});
