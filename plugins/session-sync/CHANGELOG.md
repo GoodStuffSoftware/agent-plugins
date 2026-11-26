@@ -8,6 +8,11 @@
 * **session-sync:** the alert is local: a toast (tag `connectors`, respects `notifications`), `CONNECTORS-MISSING.md` in the session-sync folder, and one SessionStart context line, each once per switch and task. No Discord, nothing sent outward.
 * **session-sync:** `accounts connector-check [--since <iso>] [--json] [--dry-run]`; `--dry-run` writes no state and sends no notification.
 
+### Changed
+
+* **session-sync:** the SessionStart connector check runs at most once per 15 minutes per switch (last check time kept in the marker) and stops after about 1 second, leaving the rest pending. `accounts connector-check` is not throttled.
+* **session-sync:** a new switch deletes the `CONNECTORS-MISSING.md` notice and flags of the older switch, so the notice never describes a past switch.
+
 ## 0.5.13 - 2026-11-25
 
 Docs only. No code change.
