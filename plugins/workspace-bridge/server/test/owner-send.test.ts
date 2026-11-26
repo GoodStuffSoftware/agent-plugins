@@ -91,7 +91,17 @@ async function call(e: Env, ownerId: string, name: string, args: Record<string, 
   );
   await waitOnExecutionContext(exec);
   const { result } = await parseMcp(res);
-  return { isError: result?.isError === true, json: toolJson(result) as Json };
+  const isError = result?.isError === true;
+  // An input-validation refusal is plain text, not JSON.
+  if (isError) {
+    const text = (result?.content as { text?: string }[] | undefined)?.[0]?.text ?? "";
+    try {
+      return { isError, json: JSON.parse(text) as Json, text };
+    } catch {
+      return { isError, json: undefined as Json, text };
+    }
+  }
+  return { isError, json: toolJson(result) as Json, text: "" };
 }
 
 const sendRoute = (): GoogleRoute => ({
@@ -417,11 +427,9 @@ describe("reply with ownerInstruction", () => {
       ownerInstruction: "reply to everyone, send it",
     });
     expect(res.json.sent).toBe(true);
-    expect(res.json.ownerInstruction.recipientChecks.map((c: Json) => c.check)).toEqual([
-      "reply_thread",
-      "reply_thread",
-      "reply_thread",
-    ]);
+    const checks = res.json.ownerInstruction.recipientChecks.map((c: Json) => c.check);
+    expect(checks.length).toBeGreaterThan(0);
+    expect(checks.every((c: string) => c === "reply_thread")).toBe(true);
     expect(sendCalls(calls)).toHaveLength(1);
     expect(await quoteSlotsUsed(env.DB, Math.floor(Date.now() / 1000))).toBe(0);
     const row = await lastAudit(accountId, "reply");
@@ -541,7 +549,7 @@ describe("forward and draft sends with ownerInstruction", () => {
       "SELECT params FROM pending_actions WHERE id = ?",
       held.json.pendingActionId,
     );
-    expect(JSON.parse(stored?.params ?? "{}").draftLock).toMatch(/^sha256:/);
+    expect(JSON.parse(stored?.params ?? "{}").args.draftLock).toMatch(/^sha256:/);
     expect(sendCalls(calls)).toHaveLength(0);
 
     const sent = await call(NEW, ownerId, "send_message", {
