@@ -173,7 +173,8 @@ export function grantDetail(g: OwnerSendGrant): string {
   const checks = g.covered
     .map((c) => `${c.address} via ${c.via === "thread" ? "reply thread" : "named in instruction"}`)
     .join(", ");
-  return `owner-directed send, instruction ${JSON.stringify(g.instruction)}; ${checks}`;
+  // The checks come first: the longest field (the quote) is last, so a clip can only cut the quote.
+  return `owner-directed send; ${checks}; instruction ${JSON.stringify(g.instruction)}`;
 }
 
 /** What the tool answer says about a send that went out under the exemption. */
