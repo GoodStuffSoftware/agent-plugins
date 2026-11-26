@@ -8,7 +8,7 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 
 import { join } from 'node:path';
 import { makeRoot, addFolder, putRecord, putTasks, makeTask, uuid, setMtime } from './fixtures/store.mjs';
 import {
-  connectorCheck, connectorCheckStep, takeConnectorReport, writeConnectorMarker, readConnectorMarker, compareTask, markerFile, flagsFile, noticeFile, EXPIRE_MS,
+  connectorCheck, connectorCheckStep, takeConnectorReport, writeConnectorMarker, readConnectorMarker, compareTask, markerFile, flagsFile, noticeFile, indexFile, EXPIRE_MS,
 } from '../lib/accounts/connectors.mjs';
 
 const ME = uuid('a', 1);
@@ -274,7 +274,7 @@ test('C11 the hook step is throttled to once per 15 minutes per switch, and a ti
   writeConnectorMarker(w.ctx, { at: SWITCH + 2 * HOUR, from: ME, to: OTHER });
   assert.equal(readConnectorMarker(w.ctx).lastCheckAt, undefined);
   assert.equal(connectorCheckStep(w.ctx, hook).ran, true);
-  // a zero budget still checks the first task (progress is guaranteed); the rest stays pending
+  // a zero budget reads at most one record per run: nothing is judged yet, nothing is marked checked, and the run is not throttled
   const w2 = world();
   writeConnectorMarker(w2.ctx, { at: SWITCH, from: OTHER, to: ME });
   task(w2, 'a-task');
@@ -283,10 +283,10 @@ test('C11 the hook step is throttled to once per 15 minutes per switch, and a ti
     run(w2, id, { at: SWITCH - 3 * HOUR, avail: BASE });
     run(w2, id, { at: SWITCH + 60_000, avail: BASE });
   }
-  const r = connectorCheck(w2.ctx, { projects: w2.projects, budgetMs: 0 });
-  assert.deepEqual(r.pending, ['b-task']);
-  assert.deepEqual(Object.keys(readConnectorMarker(w2.ctx).checked), ['a-task']);
-  assert.deepEqual(readConnectorMarker(w2.ctx).cut, ['b-task'], 'the cut task goes first next time');
+  const r = connectorCheck(w2.ctx, { projects: w2.projects, budgetMs: 0, throttleMs: 15 * 60_000 });
+  assert.deepEqual(r.pending.sort(), ['a-task', 'b-task']);
+  assert.deepEqual(readConnectorMarker(w2.ctx).checked, {});
+  assert.equal(readConnectorMarker(w2.ctx).lastCheckAt, undefined, 'a run that only indexed is not throttled');
   assert.equal(r.retired, null);
   // a lastCheckAt in the future (clock set back) does not throttle
   const m = readConnectorMarker(w.ctx);
@@ -311,7 +311,7 @@ test('C13 a budget cuts between tasks and inside the baseline pass: every run pr
     return w;
   };
   let sawPartial = false; let sawCut = false;
-  for (const budget of [1, 3, 5, 8, 12, 20, 35, 60, 100]) {
+  for (const budget of [10, 12, 14, 17, 20, 25, 30, 40, 55, 80, 120]) {
     const w = build();
     let runs = 0; let last = -1;
     for (; runs < 12; runs += 1) {
@@ -321,13 +321,65 @@ test('C13 a budget cuts between tasks and inside the baseline pass: every run pr
       if (mk?.partial) sawPartial = true;
       if (mk?.cut) sawCut = true;
       if (r.retired) { last = runs; break; }
-      assert.ok(Object.keys(mk.checked).length > before, `budget ${budget}, run ${runs}: at least one more task checked`);
+      assert.ok(r.indexing || Object.keys(mk.checked).length > before, `budget ${budget}, run ${runs}: the index grew or at least one more task was checked`);
     }
     assert.ok(last >= 0, `budget ${budget}: retired within 12 runs`);
     assert.deepEqual(Object.keys(JSON.parse(readFileSync(flagsFile(w.ctx), 'utf8')).tasks), ['t3'], `budget ${budget}: same flags as an unbudgeted check`);
   }
   assert.ok(sawCut, 'some budget cut between tasks');
   assert.ok(sawPartial, 'some budget cut inside the baseline pass and kept the post-switch half');
+});
+
+test('C15 a no-run task first in line does not starve the checkable ones, whatever the budget', () => {
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  for (const id of ['n1', 'n2', 'n3', 'c1', 'c2']) task(w, id);
+  for (const id of ['c1', 'c2']) {
+    run(w, id, { at: SWITCH - 3 * HOUR, avail: [...BASE, ...GR], called: [GR[0]] });
+    run(w, id, { at: SWITCH + 60_000, avail: BASE });
+  }
+  let checked = 0;
+  for (let i = 0; i < 12 && checked < 2; i += 1) {
+    check(w, { budgetMs: 12, clock: stepClock(1) });
+    checked = Object.keys(readConnectorMarker(w.ctx).checked).length;
+  }
+  assert.equal(checked, 2, 'c1 and c2 are checked in a few runs');
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(flagsFile(w.ctx), 'utf8')).tasks).sort(), ['c1', 'c2']);
+});
+
+test('C16 many run records: one run reads a bounded slice, the index resumes, and the result equals an unbudgeted check', () => {
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  task(w, 'g-task');
+  run(w, 'g-task', { at: SWITCH - 3 * HOUR, avail: [...BASE, ...GR], called: [GR[0]] });
+  run(w, 'g-task', { at: SWITCH + 60_000, avail: BASE });
+  for (let i = 0; i < 300; i += 1) setMtime(putRecord(w.folder.path, 1000 + i, { cwd: 'C:\other', title: 'x'.repeat(2000) }), SWITCH - HOUR * (1 + (i % 50)));
+  const indexed = () => Object.keys(JSON.parse(readFileSync(indexFile(w.ctx), 'utf8')).files).length;
+  const r1 = check(w, { budgetMs: 60, clock: stepClock(1) });
+  assert.equal(r1.pending.length, 1);
+  assert.ok(indexed() < 302, 'the first run did not read every record');
+  assert.ok(indexed() >= 1, 'but it made progress');
+  let runs = 1;
+  while (!readConnectorMarker(w.ctx)?.checked?.['g-task'] && runs < 40) { check(w, { budgetMs: 60, clock: stepClock(1) }); runs += 1; }
+  assert.ok(runs > 1 && runs < 40, `finished after ${runs} runs`);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(flagsFile(w.ctx), 'utf8')).tasks), ['g-task']);
+});
+
+test('C17 a stored partial is used: the post-switch transcript is not read again', () => {
+  const w = world();
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  task(w, 'p-task');
+  run(w, 'p-task', { at: SWITCH - 3 * HOUR, avail: [...BASE, ...GR], called: [GR[0]] });
+  const cwd = `C:\synthetic\run-${w.n + 1}`;
+  run(w, 'p-task', { at: SWITCH + 60_000, avail: [...BASE, ...GR] });   // the transcript says GR is available ...
+  const m = readConnectorMarker(w.ctx);
+  m.partial = { 'p-task': { run: { cliSessionId: uuid('d', 99), cwd, names: {} }, avail: BASE } };   // ... the stored half says it is not
+  writeFileSync(markerFile(w.ctx), JSON.stringify(m));
+  const r = check(w, { budgetMs: 100000, clock: stepClock(1) });
+  assert.deepEqual(r.flagged, ['p-task'], 'the stored tool list decided, not the transcript');
+  m.partial = { 'p-task': { run: null, avail: 'garbage' } };   // an unusable entry is ignored and the transcript is read
+  writeFileSync(markerFile(w.ctx), JSON.stringify({ ...m, checked: {} }));
+  assert.deepEqual(check(w, { budgetMs: 100000, clock: stepClock(1) }).flagged, []);
 });
 
 test('C14 a newer switch recorded while the check runs: no flags, notice, toast or marker change for the old one', () => {
@@ -339,7 +391,7 @@ test('C14 a newer switch recorded while the check runs: no flags, notice, toast 
   run(w, 'grocery-run-price-check', { at: SWITCH + 60_000, avail: BASE });
   const toasts = [];
   let n = 0;
-  const clock = () => { n += 1; if (n === 3) writeConnectorMarker(w.ctx, { at: SWITCH + 24 * HOUR, from: ME, to: OTHER }); return 0; };
+  const clock = () => { n += 1; if (n === 2) writeConnectorMarker(w.ctx, { at: SWITCH + 24 * HOUR, from: ME, to: OTHER }); return 0; };
   const r = connectorCheck(w.ctx, { projects: w.projects, throttleMs: 15 * 60_000, budgetMs: 100000, clock, toast: (t, b) => toasts.push(b) });
   assert.equal(r.dropped, 'newer-switch');
   assert.equal(toasts.length, 0);
