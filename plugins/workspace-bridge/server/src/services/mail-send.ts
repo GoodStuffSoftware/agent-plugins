@@ -149,6 +149,16 @@ export interface SendService {
    * left out).
    */
   sentTo(a: AccountRef, addresses: readonly string[]): Promise<string[]>;
+  /**
+   * The addresses (lowercase) that appear as From, To or Cc of a message on a thread of the
+   * account, read from the provider: the thread named, or the thread of the message named. Drafts
+   * on the thread are left out (their recipients are whatever a caller typed). Used by the
+   * owner-directed send check; a thread that cannot be read throws, which fails that check.
+   */
+  threadAddresses(
+    a: AccountRef,
+    ref: { threadId: string } | { messageId: string },
+  ): Promise<string[]>;
 }
 
 export const SEND = capability<SendService>("mail.send", "mail");
