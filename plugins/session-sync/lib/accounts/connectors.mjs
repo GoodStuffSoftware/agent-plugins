@@ -29,6 +29,7 @@ import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync, exi
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn as nodeSpawn } from 'node:child_process';
+import { pidAlive } from '../lock.mjs';
 import { accPath, readJson, writeJsonAtomic } from './state.mjs';
 import { listFolders } from './folders.mjs';
 import { claudeHome } from '../paths.mjs';
@@ -168,7 +169,7 @@ function streamLines(file, fn, capBytes = Infinity) {
  * Read a run's transcript. wantCalls: also collect the connector tools the run called (reads the whole file up to capBytes); otherwise it stops at the
  * tool list. Returns { avail: [names] | null (no tool list yet), called: [names] }.
  */
-export function scanTranscript(file, { wantCalls = false, capBytes = wantCalls ? PRE_SCAN_CAP : Infinity } = {}) {
+export function scanTranscript(file, { wantCalls = false } = {}) {
   let avail = null;
   const called = new Set();
   streamLines(file, (line, n) => {
@@ -186,7 +187,7 @@ export function scanTranscript(file, { wantCalls = false, capBytes = wantCalls ?
     }
     if (!wantCalls && (avail !== null || n >= POST_SCAN_LINES)) return true;
     return false;
-  }, capBytes);
+  }, wantCalls ? PRE_SCAN_CAP : Infinity);
   return { avail, called: [...called] };
 }
 
@@ -396,8 +397,11 @@ export function connectorCheck(ctx, o = {}) {
 /** Is a background check running? The claim file holds {pid, at}; one older than CLAIM_STALE_MS is a dead run's. */
 function claimHeld(ctx) {
   if (!existsSync(claimFilePath(ctx))) return false;
-  const at = Number(readJson(claimFilePath(ctx), null)?.at);
-  return Number.isFinite(at) && ctx.now() - at < CLAIM_STALE_MS && at <= ctx.now() + CLAIM_STALE_MS;
+  const c = readJson(claimFilePath(ctx), null);
+  let at = Number(c?.at);
+  if (!Number.isFinite(at)) { try { at = statSync(claimFilePath(ctx)).mtimeMs; } catch { return false; } }   // just created, content not written yet: the file's own time
+  if (Number.isFinite(Number(c?.pid)) && !pidAlive(Number(c.pid))) return false;   // the run that held it is gone (killed with the app's job object)
+  return ctx.now() - at < CLAIM_STALE_MS && at <= ctx.now() + CLAIM_STALE_MS;
 }
 
 /** Take the claim (the background process does this, so two that raced start only one check). Returns true when it is ours. */
@@ -420,14 +424,25 @@ function releaseClaim(ctx) {
   try { if (readJson(claimFilePath(ctx), null)?.pid === process.pid) unlinkSync(claimFilePath(ctx)); } catch { /* gone already */ }
 }
 
+/** A check of this switch finished inside the window (a lastCheckAt in the future, from a clock set back, or from an older switch, does not count). */
+function throttled(marker, nowMs, throttleMs) {
+  const last = Date.parse(marker.lastCheckAt);
+  return throttleMs > 0 && Number.isFinite(last) && last >= Date.parse(marker.switchAt) && last <= nowMs && nowMs - last < throttleMs;
+}
+
 /**
  * `accounts connector-check --background`: the full check, one at a time (claim file), recording lastCheckAt. Never throws.
- * o: { toast, log, projects, afterScan }. Returns the check report, or { ran: false, reason: 'claimed' } when another background check runs.
+ * o: { throttleMs, toast, log, projects, afterScan }. Returns the check report, or { ran: false, reason: 'claimed' | 'throttled' }.
  */
 export function backgroundConnectorCheck(ctx, o = {}) {
   try {
     if (!takeClaim(ctx)) return { ran: false, reason: 'claimed' };
-    try { return connectorCheck(ctx, { ...o, stamp: true }); } finally { releaseClaim(ctx); }
+    try {
+      // a run that booted after another finished (two hooks raced) must not repeat the scan
+      const m = readConnectorMarker(ctx);
+      if (m && throttled(m, ctx.now(), o.throttleMs)) return { ran: false, reason: 'throttled' };
+      return connectorCheck(ctx, { ...o, stamp: true });
+    } finally { releaseClaim(ctx); }
   } catch { return { ran: false, reason: 'error' }; }
 }
 
@@ -442,8 +457,7 @@ export function connectorHookStep(ctx, o = {}) {
     const marker = readConnectorMarker(ctx);
     if (!marker) return { started: false, reason: 'no-marker' };
     const nowMs = ctx.now();
-    const last = Date.parse(marker.lastCheckAt);
-    if (o.throttleMs > 0 && Number.isFinite(last) && last >= Date.parse(marker.switchAt) && last <= nowMs && nowMs - last < o.throttleMs) return { started: false, reason: 'throttled' };
+    if (throttled(marker, nowMs, o.throttleMs)) return { started: false, reason: 'throttled' };
     if (claimHeld(ctx)) return { started: false, reason: 'claimed' };
     const spawnFn = o.spawnFn ?? nodeSpawn;
     const child = spawnFn(o.execPath ?? process.execPath, [o.cli ?? CLI_PATH, 'accounts', 'connector-check', '--background'], { detached: true, stdio: 'ignore', windowsHide: true, env: o.env ?? process.env });

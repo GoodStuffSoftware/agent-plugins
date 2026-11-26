@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { makeRoot, addFolder, putRecord, putTasks, makeTask, uuid, setMtime } from './fixtures/store.mjs';
 import {
@@ -311,19 +311,26 @@ test('C11b a held claim stops the hook from spawning; a stale claim does not; on
   run(w, 'a-task', { at: SWITCH + 60_000, avail: BASE });
   const spawnFn = fakeSpawn();
   const claimFile = join(w.acc, 'connector-check.claim');
-  writeFileSync(claimFile, JSON.stringify({ pid: 1, at: w.ctx.now() - 60_000 }));
+  writeFileSync(claimFile, JSON.stringify({ pid: process.pid, at: w.ctx.now() - 60_000 }));
   assert.deepEqual(hookOf(w, spawnFn), { started: false, reason: 'claimed' });
   assert.equal(spawnFn.calls.length, 0);
   // the background entry does not run while another holds the claim
   assert.deepEqual(backgroundConnectorCheck(w.ctx, { projects: w.projects }), { ran: false, reason: 'claimed' });
   assert.deepEqual(readConnectorMarker(w.ctx).checked, {});
   // a claim older than the stale timeout is a dead run's: the hook spawns, the background run takes it over and releases it
-  writeFileSync(claimFile, JSON.stringify({ pid: 1, at: w.ctx.now() - CLAIM_STALE_MS - 1000 }));
+  writeFileSync(claimFile, JSON.stringify({ pid: process.pid, at: w.ctx.now() - CLAIM_STALE_MS - 1000 }));
   assert.equal(hookOf(w, spawnFn).started, true);
   const r = backgroundConnectorCheck(w.ctx, { projects: w.projects });
   assert.equal(r.ran, true);
   assert.equal(existsSync(claimFile), false, 'the claim is released when the run ends');
-  assert.ok(readConnectorMarker(w.ctx) === null || readConnectorMarker(w.ctx).lastCheckAt, 'a finished run is stamped (or retired)');
+  writeConnectorMarker(w.ctx, { at: SWITCH, from: OTHER, to: ME });
+  // a claim with no content yet (just created) holds by its file time; one whose run is gone does not
+  writeFileSync(claimFile, ''); setMtime(claimFile, w.ctx.now() - 1000);
+  assert.deepEqual(hookOf(w, spawnFn), { started: false, reason: 'claimed' });
+  assert.deepEqual(backgroundConnectorCheck(w.ctx, { projects: w.projects }), { ran: false, reason: 'claimed' });
+  writeFileSync(claimFile, JSON.stringify({ pid: 2147483000, at: w.ctx.now() - 60_000 }));
+  assert.equal(hookOf(w, spawnFn).started, true, 'a dead holder does not block');
+  rmSync(claimFile);
 });
 
 test('C11c the background run records lastCheckAt, so the hook then throttles it', () => {
@@ -339,6 +346,8 @@ test('C11c the background run records lastCheckAt, so the hook then throttles it
   assert.equal(m.lastCheckAt, iso(w.ctx.now()));
   assert.deepEqual(Object.keys(m.checked), ['a-task'], 'a task with no run since the switch stays pending, not checked');
   assert.deepEqual(hookOf(w, fakeSpawn()), { started: false, reason: 'throttled' });
+  // a background run that boots inside the window (two hooks raced) does not scan again
+  assert.deepEqual(backgroundConnectorCheck(w.ctx, { projects: w.projects, throttleMs: THROTTLE }), { ran: false, reason: 'throttled' });
 });
 
 test('C15 tasks without a run first in line do not hold back the checkable ones: one unbudgeted run decides them all', () => {

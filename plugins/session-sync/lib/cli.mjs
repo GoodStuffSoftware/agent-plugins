@@ -781,8 +781,8 @@ function connectorCheckCommand(ctx, args) {
     if (!Number.isFinite(since)) { console.error('Usage: accounts connector-check [--since <iso date-time>] [--json] [--dry-run]  (--since needs a date-time such as 2026-11-25T04:42:00Z)'); return 2; }
   }
   if (args.includes('--background')) {   // started by the SessionStart hook, hidden and detached: the full check, one at a time, reported through the toast and notice file
-    const b = backgroundConnectorCheck(ctx, { toast: connectorToast, log });
-    emit({ ok: b.reason !== 'error', command: 'connector-check', background: true, ran: !!b.ran, reason: b.reason ?? null, flagged: b.flagged ?? [], pending: b.pending ?? [], retired: b.retired ?? null }, [b.ran ? `Background check done: ${b.flagged.length} flagged, ${b.pending.length} pending.` : `Background check did not run: ${b.reason}.`]);
+    const b = backgroundConnectorCheck(ctx, { toast: connectorToast, log, throttleMs: HOOK_THROTTLE_MS });
+    emit({ ok: b.reason !== 'error', command: 'connector-check', background: true, ran: !!b.ran, reason: b.reason ?? null, flagged: b.flagged ?? [], pending: b.pending ?? [], retired: b.retired ?? null }, [b.ran ? `Background check done: ${b.flagged.length} flagged, ${b.pending.length} pending${b.dropped ? ' (dropped: a newer switch was recorded)' : ''}.` : `Background check did not run: ${b.reason}.`]);
     return 0;
   }
   const r = connectorCheck(ctx, { since, dryRun: dry, toast: connectorToast, log });
