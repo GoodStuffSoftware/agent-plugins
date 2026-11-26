@@ -43,6 +43,7 @@ import { spawnPlan, spawnFixStep, spawnLook, spawnLine } from './accounts/rcspaw
 import { installLogonTask, uninstallLogonTask, ensureLogonTask } from './accounts/logontask.mjs';
 import { createProgressUi } from './accounts/progress.mjs';
 import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
+import { connectorCheck, connectorCheckStep, takeConnectorReport } from './accounts/connectors.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus, RESTART_LEAD, RESTART_LEAD_WAITER, WAIT_NOTE } from './accounts/report.mjs';
@@ -392,6 +393,12 @@ function accountsToast(title, body) {
   notify(title, body, { tag: 'accounts' });
 }
 
+/** The connector alert toast: honours `notifications` (not `notifyMode`: a failure alert is never a "done" toast). */
+function connectorToast(title, body) {
+  if (CFG.notifications === false) return;
+  notify(title, body, { persist: true, tag: 'connectors' });
+}
+
 function stampRecent(file, ms, now = Date.now()) {
   const t = Number(readFileSyncSafe(file));
   return Number.isFinite(t) && t > 0 && now - t < ms;
@@ -511,6 +518,8 @@ async function accountsHookStep() {
   try {
     // a go-live result no session has been told about yet (once), or a mid-run notice
     try { const ctx = makeCtx(); if (ctx.store) { const t = takeGoLiveReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
+    // 0.5.14: after an account switch, scheduled tasks whose connector is not connected on the new account (once per switch and task)
+    try { const ctx = makeCtx(); if (ctx.store) { connectorCheckStep(ctx, { toast: connectorToast, log }); const t = takeConnectorReport(ctx); if (t) parts.push(t); } } catch { /* never block a session */ }
     await accountsHookStepInner(parts);
     try { rcHookArm(); } catch { /* never block a session */ }   // after the account step: that one may have armed the waiter with a reason of its own
     try { rcLogonTaskSetup(); } catch { /* never block a session */ }
@@ -759,6 +768,36 @@ async function spawnFixCommand(ctx, args) {
   return r.status === 'ok' ? 0 : 3;
 }
 
+/**
+ * `accounts connector-check [--since <iso>] [--json] [--dry-run]`: compares each enabled scheduled task's last run before the switch with its
+ * first run after it (connectors.mjs). Without --since it checks the pending marker the account pass left. --dry-run writes no state and sends no toast.
+ */
+function connectorCheckCommand(ctx, args) {
+  const dry = args.includes('--dry-run');
+  const si = args.indexOf('--since');
+  let since;
+  if (si >= 0) {
+    since = Date.parse(args[si + 1] ?? '');
+    if (!Number.isFinite(since)) { console.error('Usage: accounts connector-check [--since <iso date-time>] [--json] [--dry-run]  (--since needs a date-time such as 2026-11-25T04:42:00Z)'); return 2; }
+  }
+  const r = connectorCheck(ctx, { since, dryRun: dry, toast: connectorToast, log });
+  if (!r.ran) {
+    emit({ ok: r.reason === 'no-marker', command: 'connector-check', ran: false, reason: r.reason }, [r.reason === 'no-marker' ? 'No connector check is pending (no account switch since the last check). Use --since <iso> to check against a switch time.' : `The check did not run: ${r.reason}.`]);
+    return r.reason === 'no-marker' ? 0 : 1;
+  }
+  const lines = [`${dry ? 'Dry run: ' : ''}switch at ${r.switchAt}${r.to ? ` to account ${r.to.slice(0, 8)}` : ''}.`];
+  for (const t of r.tasks) {
+    if (t.status === 'pending') { lines.push(`pending  ${t.taskId} (no run since the switch yet)`); continue; }
+    if (t.status === 'ok') { lines.push(`ok       ${t.taskId}${t.findings.length ? ' (a connector moved to another id; the prompt does not hardcode it)' : ''}`); continue; }
+    for (const f of t.findings.filter((x) => x.kind !== 'moved')) {
+      lines.push(f.kind === 'different-id' ? `FLAGGED  ${t.taskId}: ${f.name} is available under a different id (${f.alt}); the prompt hardcodes ${f.uuid}` : `FLAGGED  ${t.taskId}: ${f.name} (${f.uuid}) is not connected on the new account`);
+    }
+  }
+  lines.push(`${r.flagged.length} flagged, ${r.pending.length} pending${r.retired ? `; marker retired (${r.retired})` : ''}.`);
+  emit({ ok: true, command: 'connector-check', dryRun: dry, switchAt: r.switchAt, from: r.from, to: r.to, flagged: r.flagged, pending: r.pending, retired: r.retired, tasks: r.tasks }, lines);
+  return 0;
+}
+
 /** `accounts <sub> ...` (plan 6). Returns the exit code. */
 async function accountsCommand(sub, args) {
   const ctx = makeCtx();
@@ -897,6 +936,9 @@ async function accountsCommand(sub, args) {
   // 0.5.10: the live relink by hand for every stale link of the signed-in account (accounts rc-sweep [--before <iso>] [--dry-run] [--json])
   if (sub === 'rc-sweep') return rcSweepCommand(ctx, args);
 
+  // 0.5.14: scheduled tasks whose connector is not connected on the account the app switched to (accounts connector-check [--since <iso>] [--json] [--dry-run])
+  if (sub === 'connector-check') return connectorCheckCommand(ctx, args);
+
   // 0.5.10: the helper the Stop hook starts (rc-turn-end): waits about 2 s, stops that session's CLI, clears its stale link, deletes the request.
   if (sub === 'rc-turn-end-run') {
     const r = await runTurnEnd(ctx, { cliSessionId: args[0], platform: platform(), log });
@@ -953,7 +995,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json]');
   return 2;
 }
 
