@@ -390,8 +390,107 @@ describe("send_message with ownerInstruction", () => {
       sendArgs(["bob@example.com"], { ownerInstruction: "go ahead" }),
     );
     expect(res.json.status).toBeUndefined();
-    expect(res.json.ownerInstruction).toBeUndefined();
+    expect(res.json.ownerInstruction.applied).toBe(false);
+    expect(res.json.ownerInstruction.note).toContain("already known");
     expect(await quoteSlotsUsed(env.DB, Math.floor(Date.now() / 1000))).toBe(0);
+  });
+
+  it("says in one clause that the instruction was not used when the mode is `all`", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([...unknownRoutes(), sendRoute()]);
+    const res = await call(
+      MODE("all"),
+      ownerId,
+      "send_message",
+      sendArgs(["bob@example.com"], { ownerInstruction: "send it to bob@example.com" }),
+    );
+    expect(res.json.status).toBe("pending_approval");
+    expect(res.json.preview.ownerInstructionNote).toContain("owner instruction was not used");
+    expect(sendCalls(calls)).toHaveLength(0);
+    expect(await quoteSlotsUsed(env.DB, Math.floor(Date.now() / 1000))).toBe(0);
+  });
+
+  it("refuses control characters other than newline and tab in the instruction", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([...unknownRoutes(), sendRoute()]);
+    for (const bad of ["send to bob@example.com\u0001", "bob@example.com\u0000", "a\rb\u007f"]) {
+      const res = await call(
+        NEW,
+        ownerId,
+        "send_message",
+        sendArgs(["bob@example.com"], { ownerInstruction: bad }),
+      );
+      expect(res.isError).toBe(true);
+    }
+    const ok = await call(
+      NEW,
+      ownerId,
+      "send_message",
+      sendArgs(["bob@example.com"], { ownerInstruction: "yes,\n\tsend it to bob@example.com" }),
+    );
+    expect(ok.json.sent).toBe(true);
+    expect(sendCalls(calls)).toHaveLength(1);
+  });
+
+  it("a bad `from` is refused before a slot of the cap is taken", async () => {
+    const { ownerId } = await setup();
+    const calls = installGoogleRoutes([...unknownRoutes(), sendRoute()]);
+    const res = await call(
+      NEW,
+      ownerId,
+      "send_message",
+      sendArgs(["bob@example.com"], {
+        from: "not-mine@example.net",
+        ownerInstruction: "send it to bob@example.com",
+      }),
+    );
+    expect(res.isError).toBe(true);
+    expect(sendCalls(calls)).toHaveLength(0);
+    expect(await quoteSlotsUsed(env.DB, Math.floor(Date.now() / 1000))).toBe(0);
+  });
+
+  it("a bare replyThreadId earns no reply-check credit, even for an address on that thread", async () => {
+    const { ownerId, key } = await setup();
+    const calls = installGoogleRoutes([...threadRoutes(), ...unknownRoutes(), sendRoute()]);
+    const held = await call(
+      NEW,
+      ownerId,
+      "send_message",
+      sendArgs(["sam@example.net"], {
+        replyThreadId: `${key}:t_orig`,
+        ownerInstruction: "go ahead and send that",
+      }),
+    );
+    expect(held.json.status).toBe("pending_approval");
+    expect(held.json.preview.heldBecause).toContain("not a reply");
+    expect(sendCalls(calls)).toHaveLength(0);
+    // The same address with replyToMessageId is a reply to that message, and passes the check.
+    const sent = await call(
+      NEW,
+      ownerId,
+      "send_message",
+      sendArgs(["sam@example.net"], {
+        replyToMessageId: `${key}:m_orig`,
+        ownerInstruction: "go ahead and send that",
+      }),
+    );
+    expect(sent.json.sent).toBe(true);
+    expect(sent.json.ownerInstruction.recipientChecks).toEqual([
+      { address: "sam@example.net", check: "reply_thread" },
+    ]);
+    // A bare thread id can still be covered by the quote.
+    const quoted = await call(
+      NEW,
+      ownerId,
+      "send_message",
+      sendArgs(["lee@example.net"], {
+        replyThreadId: `${key}:t_orig`,
+        ownerInstruction: "send it to lee@example.net",
+      }),
+    );
+    expect(quoted.json.ownerInstruction.recipientChecks).toEqual([
+      { address: "lee@example.net", check: "named_in_instruction" },
+    ]);
   });
 
   it("a thread id the caller names is checked by reading the thread: a thread that is not there fails", async () => {

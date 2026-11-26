@@ -220,6 +220,17 @@ describe("address helpers", () => {
     expect(parseAddresses(undefined)).toEqual([]);
   });
 
+  it("never takes an address from inside a quoted display name", () => {
+    expect(parseAddresses('"<x@y.example>" <a@b.example>')).toEqual(["a@b.example"]);
+    expect(parseAddresses('"x@y.example" <a@b.example>, "<q@y.example>" <C@b.example>')).toEqual([
+      "a@b.example",
+      "c@b.example",
+    ]);
+    expect(parseAddresses('"say \\"<x@y.example>\\"" <a@b.example>')).toEqual(["a@b.example"]);
+    // A quote that is all there is names no address.
+    expect(parseAddresses('"<x@y.example>"')).toEqual([]);
+  });
+
   it("recognises the account itself through tags and gmail dots", () => {
     expect(canonicalAddress("Jo.Hn+news@gmail.com")).toBe("john@gmail.com");
     expect(canonicalAddress("a.b+x@work.example.com")).toBe("a.b@work.example.com");

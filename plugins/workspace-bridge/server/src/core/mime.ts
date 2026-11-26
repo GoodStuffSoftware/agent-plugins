@@ -427,7 +427,9 @@ export function parseAddresses(header: string | undefined): string[] {
   if (!header) return [];
   const out: string[] = [];
   for (const entry of splitAddressList(header)) {
-    const angled = entry.match(/<([^<>\s]+@[^<>\s]+)>/);
+    // A quoted display name is never an address, even one written like `"<x@y.example>"`: the
+    // angle-addr after the name wins. (A quote directly inside the brackets is a quoted local part.)
+    const angled = entry.replace(/(?<!<)"(?:[^"\\]|\\.)*"/g, " ").match(/<([^<>\s]+@[^<>\s]+)>/);
     if (angled) {
       out.push((angled[1] ?? "").toLowerCase());
       continue;
