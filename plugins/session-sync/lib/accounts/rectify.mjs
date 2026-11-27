@@ -29,7 +29,7 @@ import { dirname, join } from 'node:path';
 import { RECORD, TOMB, OURTMP, homeOf } from './folders.mjs';
 import { backupCopy, resetBackupCache, sha256File, pruneBackups } from './backup.mjs';
 import { accPath, readJson, tickMutation, sleepSync, LOCK_TTL_MS, loadOwnLinks, ownInos, saveOwnLinks, OWN_LINKS_CAP, holdsResetDone, markHoldsReset } from './state.mjs';
-import { AppRunningError, nameIsHeld } from './appstate.mjs';
+import { AppRunningError, nameIsHeld, signedInNow } from './appstate.mjs';
 import { acquireLock, pidAlive } from '../lock.mjs';
 
 const TEN_MIB = 10 * 1024 * 1024;
@@ -271,7 +271,7 @@ export function rectify(group, opts) {
     if (!lock.acquired) { rep.skipped = 'locked'; return rep; }
   }
   const roles = mode === 'targeted' ? { loaded: new Set(opts.roles?.loaded ?? []), cooling: new Set(opts.roles?.cooling ?? []) } : null;
-  try { return run(group, { mode, ctx, state, guard, remoteList, live, roles, testHook: opts.testHook, dryRun, appStartedAtMs: opts.appStartedAtMs ?? 0, accountFields: opts.accountFields ?? mode === 'full' }, rep); }
+  try { return run(group, { mode, ctx, state, guard, remoteList, live, roles, testHook: opts.testHook, signedIn: opts.signedIn ?? null, dryRun, appStartedAtMs: opts.appStartedAtMs ?? 0, accountFields: opts.accountFields ?? mode === 'full' }, rep); }
   finally { lock?.release(); }
 }
 
@@ -384,7 +384,13 @@ function run(group, o, rep) {
     } catch { return 'gone since it was read'; }
     return null;
   };
-  const changedSince = (e) => { o.testHook?.('before-act', e); return restat(e); };
+  const changedSince = (e) => {
+    o.testHook?.('before-act', e);
+    // 0.5.16: a targeted pass read the signed-in account once, before its inventory. Read it again right before each act: a switch in
+    // between would make the copy we link into a folder the app just loaded stale count as "the copy the app loaded" on the next pass.
+    if (mode === 'targeted' && o.signedIn) { const now = signedInNow(ctx); if (now && now !== o.signedIn) return 'the signed-in account changed during the pass'; }
+    return restat(e);
+  };
   const owe = (id, why, folder) => { rep.counts.deferred++; rep.owed.push({ id, why, ...(folder ? { folder } : {}) }); };
   const note = (id, msg) => rep.notes.push({ id, msg });
 

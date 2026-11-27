@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { fullPass, livePass, dryRectify } from '../lib/accounts/pass.mjs';
 import { setOldWaiterGate } from '../lib/accounts/rectify.mjs';
-import { pruneBackups } from '../lib/accounts/backup.mjs';
+import { pruneBackups, backupCopy, resetBackupCache } from '../lib/accounts/backup.mjs';
 import { loadState, saveState, emptyState, resetMutations } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey } from '../lib/accounts/folders.mjs';
 import { G_SWITCH_MS } from '../lib/accounts/appstate.mjs';
@@ -179,4 +179,52 @@ test('dry run: wouldRewriteNewer flags a replaced copy that holds work the winne
   assert.equal(relinks.length, 2);
   assert.equal(relinks.find((d) => d.id === id(1)).newerThanWinner, true, 'work the winner lacks');
   assert.equal(relinks.find((d) => d.id === id(2)).newerThanWinner, false, 'an older copy is not');
+});
+
+// ---- 0.5.16 re-review must-fix items ----
+
+test('C2b a pass that read "B signed in" before the switch links B\'s newest copy into the folder the app loaded stale: one conflict, B\'s copy backed up', async () => {
+  const w = await world();
+  const confs = (lp) => (lp?.rectify?.conflicts ?? []).length;
+  w.sim.start(A, w.fA, w.r.userData); await w.pass();
+  w.sim.signIn(B, w.fB, { userData: w.r.userData }); await w.pass(); w.clock.tick(SW); await w.pass();
+  w.sim.saveFromMemory(id(1), { title: 'B ordinary' }); w.clock.tick(1000); await w.pass();   // FA gets it
+  // the waiter is not running: B's newer turns never reach FA
+  w.sim.saveFromMemory(id(1), { title: 'B-new' }); w.clock.tick(1000);
+  w.sim.saveFromMemory(id(1), { title: 'B-newer' }); w.clock.tick(1000);
+  // the pass reads "B signed in"; Mike switches to A (the app loads FA's stale copy) before the pass acts on FA
+  let switched = 0;
+  const testHook = (when, e) => {
+    if (when !== 'before-act' || e.folder !== w.fA.key || switched) return;
+    switched++; w.sim.signIn(A, w.fA, { userData: w.r.userData });
+  };
+  w.clock.tick(500);
+  await w.pass({ testHook });
+  assert.equal(switched, 1, 'the pass reached FA');
+  let n = confs(await w.pass());
+  w.sim.saveFromMemory(id(1), { title: 'A-cont' }); w.clock.tick(1000); n += confs(await w.pass());
+  w.clock.tick(SW); n += confs(await w.pass());
+  const kept = w.backups('split-loser').map((b) => { try { return JSON.parse(readFileSync(join(w.r.acc, 'rectify-backups', ...b.dst.split('/')), 'utf8')).title; } catch { return '?'; } });
+  assert.equal(n, 1, 'one conflict');
+  assert.ok(kept.includes('B-newer'), `B-newer is backed up (backups: ${JSON.stringify(kept)})`);
+});
+
+test('C3 a delete backup is not skipped for a prunable backup of the same content, so retention cannot take its only copy', () => {
+  const r = makeRoot('c3'); let t = Date.parse('2026-11-01T12:00:00Z'); r.ctx.now = () => t;
+  const p = join(r.root, 'local_x.json'); writeFileSync(p, '{"title":"C"}');
+  const a = backupCopy(r.ctx, p, { reason: 'split-loser', folder: 'a/o', name: 'local_x.json' });
+  assert.equal(a.skipped, false);
+  t += 86400000; resetBackupCache();
+  const d = backupCopy(r.ctx, p, { reason: 'delete', folder: 'b/o', name: 'local_x.json' });
+  assert.equal(d.skipped, false, 'the delete backup is made');
+  // a prunable backup still dedupes against a kept one, and a second delete against the first
+  assert.equal(backupCopy(r.ctx, p, { reason: 'split-loser', folder: 'a/o', name: 'local_x.json' }).skipped, true);
+  assert.equal(backupCopy(r.ctx, p, { reason: 'delete', folder: 'b/o', name: 'local_x.json' }).skipped, true);
+  t += 20 * 86400000; resetBackupCache();
+  pruneBackups(r.ctx, { force: true });
+  const root = join(r.acc, 'rectify-backups');
+  const walk = (d0) => readdirSync(d0, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? walk(join(d0, e.name)) : [join(d0, e.name)]);
+  const left = walk(root).filter((f) => !/index\.jsonl|\.pruned-at/.test(f)).filter((f) => readFileSync(f, 'utf8') === '{"title":"C"}');
+  assert.equal(left.length, 1, 'the delete copy survives retention');
+  assert.deepEqual(readFileSync(join(root, 'index.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).reason), ['delete']);
 });

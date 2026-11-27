@@ -196,7 +196,7 @@ export async function livePass(ctx, o = {}) {
       retakeSnapshot(state, app, group, sw);
       const pinned = new Set([...roles.loaded, ...roles.cooling]);
       rep.live = [...roles.loaded]; rep.cooling = [...roles.cooling]; rep.switched = sw.changed;
-      const rec = rectify(group, { mode: 'targeted', roles, ctx, state, locked: true, remoteList: o.remoteList, appStartedAtMs: app.startedAtMs, testHook: o.testHook });
+      const rec = rectify(group, { mode: 'targeted', roles, ctx, state, locked: true, remoteList: o.remoteList, appStartedAtMs: app.startedAtMs, signedIn: app.signedIn, testHook: o.testHook });
       rep.rectify = rec;
       if (rec.skipped) return { ...rep, skipped: rec.skipped };
       // a group that gained a folder (an account linked later) needs a full pass: it takes the safety backup and finishes the new folders

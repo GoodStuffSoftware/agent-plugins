@@ -63,7 +63,7 @@ function indexSet(file) {
       if (!line.trim()) continue;
       try {
         const o = JSON.parse(line);
-        const k = `${o.name}\0${o.sha256}`;
+        const k = `${o.name}\0${o.sha256}\0${PRUNABLE_REASONS.has(o.reason) ? 'p' : 'k'}`;
         (map.get(k) ?? map.set(k, []).get(k)).push(lineDst(o));
       } catch { /* skip a torn line */ }
     }
@@ -88,7 +88,11 @@ export function backupCopy(ctx, path, meta = {}) {
   const seen = indexSet(index);
   // 0.5.16: skipped only while an indexed copy of it still exists on disk (a line whose file was deleted must not block a real backup)
   const root = accPath(ctx, 'rectify-backups');
-  if ((seen.get(`${name}\0${sha}`) ?? []).some((rel) => rel && existsSync(join(root, ...rel.split('/'))))) return { skipped: true, sha256: sha };
+  // a backup of a kind retention keeps (delete, memory, tasks, settings) dedupes only against one of those kinds: a prunable copy of the
+  // same content is erased later, and with it the only copy of a deleted conversation
+  const prunable = PRUNABLE_REASONS.has(meta.reason);
+  const have = [...(seen.get(`${name}\0${sha}\0k`) ?? []), ...(prunable ? (seen.get(`${name}\0${sha}\0p`) ?? []) : [])];
+  if (have.some((rel) => rel && existsSync(join(root, ...rel.split('/'))))) return { skipped: true, sha256: sha };
   tickMutation();
   const st = statSync(path, { bigint: true });
   const dir = accPath(ctx, 'rectify-backups', localDay(ctx.now()), ...String(meta.folder ?? '_').split('/'));
@@ -102,7 +106,7 @@ export function backupCopy(ctx, path, meta = {}) {
     at: new Date(ctx.now()).toISOString(), reason: meta.reason ?? null, folder: meta.folder ?? null,
     name, sha256: sha, size: buf.length, mtimeMs, ino: `${st.dev}:${st.ino}`, dst: relative(root, dst).split(sep).join('/'),
   }) + '\n');
-  const k = `${name}\0${sha}`;
+  const k = `${name}\0${sha}\0${prunable ? 'p' : 'k'}`;
   (seen.get(k) ?? seen.set(k, []).get(k)).push(relative(root, dst).split(sep).join('/'));
   return { skipped: false, dst, sha256: sha };
 }

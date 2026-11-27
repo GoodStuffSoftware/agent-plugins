@@ -166,6 +166,12 @@ export function readSignedIn(userData) {
   return found;
 }
 
+/** The signed-in account right now (config.json, or the test seam), or null when unknown. A pass re-reads it right before it acts. */
+export function signedInNow(ctx) {
+  const seam = testSeam();
+  return seam ? seam.signedIn : readSignedIn(ctx.userData);
+}
+
 /**
  * Pure decision rule for "running" (plan 5.2). `rec` is lock-stale.json
  * ({firstSeenAt, count}) or null; returns the new record to persist.
