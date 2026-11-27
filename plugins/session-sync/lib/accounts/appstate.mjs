@@ -385,19 +385,26 @@ export function folderRoles(app, folders, state, now, gainedKeys = []) {
  */
 export function heldSinceOf(state, acct, appStartedAtMs = 0) {
   const t = state.signed?.unloadedAt?.[acct];
-  return typeof t === 'number' && t >= appStartedAtMs ? t : Infinity;
+  // 0.5.16: counted from the END of the cooling window. The app's own save at the switch (about 3 s after it) lands inside the
+  // window and is drift that converges to the newest copy, not a parked session's write.
+  return typeof t === 'number' && t >= appStartedAtMs ? t + G_SWITCH_MS : Infinity;
 }
 
 /**
  * Is this record name (in a folder that is neither loaded nor cooling) a parked session's file? Pure.
  *   - `state.held[id][folder] === ino`: seen as held before (S3: a link another folder took to it does not end the hold, nlink is not used);
  *   - else not an inode a pass of ours left there (`state.records[id].ino`), alone (nlink 1) and written after the folder was unloaded.
+ * 0.5.16: an inode that a link of ours produced (`own`: the inodes rectify recorded at the moment of each link) is never a parked
+ * session's, whatever its link count; and a recorded hold ends when the write is no later than the start of held time (a switch-time save).
  * @param {{id:string, folder:string, inoKey:string, nlink:number, mtimeMs:number}} e
+ * @param {Iterable<string>} [own] inode keys of recent links of ours for this id
  */
-export function nameIsHeld(state, e, appStartedAtMs = 0) {
-  if (state.held?.[e.id]?.[e.folder] === e.inoKey) return true;
+export function nameIsHeld(state, e, appStartedAtMs = 0, own = null) {
+  if (own && (own instanceof Set ? own.has(e.inoKey) : [...own].includes(e.inoKey))) return false;
+  const since = heldSinceOf(state, String(e.folder).split('/')[0], appStartedAtMs);
+  if (state.held?.[e.id]?.[e.folder] === e.inoKey) return e.mtimeMs > since;
   const ours = state.records?.[e.id]?.ino;
-  return ours !== e.inoKey && e.nlink === 1 && e.mtimeMs > heldSinceOf(state, String(e.folder).split('/')[0], appStartedAtMs);
+  return ours !== e.inoKey && e.nlink === 1 && e.mtimeMs > since;
 }
 
 /** When the next cooling period ends (ms), or 0 when none is running. */
