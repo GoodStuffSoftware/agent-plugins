@@ -114,7 +114,7 @@ const SUMMARIES = new Map();
 const SUMMARY_CACHE_MAX = 20000;
 export const summaryStats = { parsed: 0, hits: 0 };
 
-function makeSummarizer() {
+export function makeSummarizer() {
   return (e) => {
     const k = `${e.path}|${e.inoKey}|${e.mtimeNs}|${e.size}`;
     let r = SUMMARIES.get(k);

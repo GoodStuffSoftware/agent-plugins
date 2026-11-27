@@ -46,6 +46,7 @@ import { launchDetached, launchViaHelper } from './accounts/launcher.mjs';
 import { connectorCheck, backgroundConnectorCheck, connectorHookStep, takeConnectorReport, HOOK_THROTTLE_MS } from './accounts/connectors.mjs';
 import { planGoLive, beginGoLive, runGoLive, goLiveInProgress, resumeIfDead, replaceWaitingRunner, PLUGIN_VERSION, copyWords, takeGoLiveReport, runnerAlive, goLiveLogFile, goLiveResultFile } from './accounts/golive.mjs';
 import { quitSupport } from './accounts/appquit.mjs';
+import { runReady, formatReady, waiterOlderThanSelf, ReadyError } from './accounts/ready.mjs';
 import { collectStatus, summarizePass, formatPass, formatStatus, RESTART_LEAD, RESTART_LEAD_WAITER, WAIT_NOTE } from './accounts/report.mjs';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, closeSync, writeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
@@ -563,6 +564,19 @@ async function accountsHookStepInner(parts) {
   const group = groupOf(state, folders);
   if (group.length < 2) return;
   const stamp = accPath(ctx, state.linked ? 'hook-rectify.stamp' : 'hook-link.stamp');
+  // 0.5.17: a waiter older than this copy (an install does not end it) is taken over in the background, through the launcher. The common case
+  // (no waiter, or a current one) costs one small file read. The rectify it starts replaces the waiter; its stamp keeps the rectify below from running twice.
+  if (state.linked) {
+    try {
+      const takeStamp = accPath(ctx, 'hook-takeover.stamp');
+      if (waiterOlderThanSelf(ctx) && !stampRecent(takeStamp, HOOK_DEBOUNCE_MS)) {
+        writeStamp(takeStamp);
+        const r = launchViaHelper(['accounts', 'rectify', '--from-hook'], { ctx });
+        if (r.ok) writeStamp(stamp);
+        log(`accounts: waiter older than ${PLUGIN_VERSION}, takeover ${r.ok ? 'started in the background' : `not started (${r.error ?? r.method})`}`);
+      }
+    } catch { /* never block a session */ }
+  }
   if (state.linked && lockfilePresent(ctx)) {
     armWaiter(ctx, 'watch');
     const told = claimRestartNotice(ctx, state, group);
@@ -819,6 +833,20 @@ async function accountsCommand(sub, args) {
   };
   const refused = (code, text, facts = {}) => { if (!hook) emit({ ok: false, command: sub, reason: code, ...facts }, [text]); return 3; };
 
+  if (sub === 'ready') {
+    // 0.5.17: one command before an account switch: copies, waiter, behind copies, mid-turn sessions; exit 0 GO, 1 NO-GO, 2 error
+    const ti = args.indexOf('--to');
+    try {
+      if (ti >= 0 && (!args[ti + 1] || args[ti + 1].startsWith('--'))) throw new ReadyError('--to needs an account id (or the start of one)');
+      const r = await runReady(ctx, { to: ti >= 0 ? args[ti + 1] : null });
+      emit(r, formatReady(r));
+      return r.verdict === 'GO' ? 0 : 1;
+    } catch (e) {
+      emit({ ok: false, command: 'ready', error: String(e?.message ?? e) }, [`accounts ready: ${e?.message ?? e}`]);
+      return 2;
+    }
+  }
+
   if (sub === 'status') {
     let remote = null;
     if (has('--remote')) remote = await accountsRemoteCheck(ctx);
@@ -1003,7 +1031,7 @@ async function accountsCommand(sub, args) {
 
   // hidden: the helper the SessionStart hook starts (detached, hidden). Only the two long-lived entries may be launched.
   if (sub === 'launch-detached') {
-    const ok = args[0] === 'accounts' && (args[1] === 'wait' || args[1] === 'golive-run' || (args[1] === 'rc-turn-end-run' && /^[0-9a-f-]{36}$/i.test(args[2] ?? '')));
+    const ok = args[0] === 'accounts' && (args[1] === 'wait' || args[1] === 'golive-run' || (args[1] === 'rectify' && args.length === 3 && args[2] === '--from-hook') || (args[1] === 'rc-turn-end-run' && /^[0-9a-f-]{36}$/i.test(args[2] ?? '')));
     const r = ok ? launchDetached(args, { ctx }) : { ok: false, method: 'none', error: 'not a launchable command' };
     log(`accounts launch-detached ${args.slice(1, 2).join('')}: ${r.method}${r.ok ? ` pid ${r.pid ?? '?'}` : ` failed (${r.error})`}`);
     return r.ok ? 0 : 1;
@@ -1024,7 +1052,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json] [--background]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | ready [--to <acct>] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json] [--background]');
   return 2;
 }
 
