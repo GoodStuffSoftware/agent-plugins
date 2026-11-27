@@ -531,7 +531,11 @@ function run(group, o, rep) {
   /** true: re-linked. false: busy (EPERM and the like). A string: the target changed since the inventory, left as it is. */
   function relink(W, loser, superseded = false) {
     check('relink', loser.folder, loser);
-    if (dryRun) { rep.dry.push({ op: 'relink', id: loser.id, folder: loser.folder }); return true; }
+    if (dryRun) {
+      let backup = false; try { backup = !superseded && sha256File(loser.path) !== sha256File(W.path); } catch { /* unreadable: no backup claimed */ }
+      rep.dry.push({ op: 'relink', id: loser.id, folder: loser.folder, from: W.folder, backup, newerThanWinner: loser.mtimeMs > W.mtimeMs });
+      return true;
+    }
     const dst = loser.path;
     const ch = changedSince(loser);
     if (ch) { note(loser.id, `${loser.folder}: ${ch}; next pass`); return ch; }

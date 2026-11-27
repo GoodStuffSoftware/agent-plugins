@@ -36,6 +36,7 @@ import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic, roll
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './accounts/folders.mjs';
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
 import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
+import { rectify as rectifyPass } from './accounts/rectify.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
 import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass, rcSweep } from './accounts/rcrestore.mjs';
 import { rcRepair, turnEndHook, runTurnEnd } from './accounts/rcrepair.mjs';
@@ -885,6 +886,30 @@ async function accountsCommand(sub, args) {
       // a stamp written by the SessionStart step already debounces; a second guard for direct runs
       if (stampRecent(accPath(ctx, 'hook-rectify-run.stamp'), HOOK_DEBOUNCE_MS)) return 0;
       writeStamp(accPath(ctx, 'hook-rectify-run.stamp'));
+    }
+    if (has('--dry-run')) {
+      // 0.5.16: the rectify pass on a clone of the state, no lock and no writes; prints what it would change
+      const state = loadState(ctx);
+      if (!state.linked) return refused('not-linked', REASON('not-linked'));
+      const rec = rectifyPass(groupOf(state, listFolders(ctx.store)), { mode: 'full', ctx, state, dryRun: true });
+      const dry = rec.dry ?? [];
+      const ops = (op) => dry.filter((d) => d.op === op);
+      const facts = {
+        ok: !rec.skipped, command: 'rectify', dryRun: true, skipped: rec.skipped ?? null,
+        wouldUpdate: ops('relink').map((d) => ({ id: d.id, folder: d.folder, from: d.from })),
+        wouldAdd: ops('add').map((d) => ({ id: d.id, folder: d.folder })),
+        wouldDelete: ops('delete').map((d) => d.id),
+        wouldResurrect: ops('resurrect').map((d) => d.id),
+        wouldBackup: ops('relink').filter((d) => d.backup).map((d) => ({ id: d.id, folder: d.folder })),
+        wouldRewriteNewer: ops('relink').filter((d) => d.newerThanWinner).map((d) => ({ id: d.id, folder: d.folder })),
+        conflicts: (rec.conflicts ?? []).map((c) => ({ id: c.id, winner: c.winner, losers: c.losers })),
+        holdsReset: rec.holdsReset ?? 0, holdsResetDeferred: rec.holdsResetDeferred ?? null,
+      };
+      emit(facts, [
+        `Dry run, nothing was written: ${facts.wouldUpdate.length} frozen copy(ies) would be updated, ${facts.wouldBackup.length} backup(s) made, ${facts.wouldAdd.length} added, ${facts.wouldDelete.length} deleted, ${facts.wouldResurrect.length} resurrected.`,
+        `${facts.wouldRewriteNewer.length} copy(ies) newer than the winner would be rewritten; ${facts.conflicts.length} conflict(s); ${facts.holdsReset} hold(s) reset.`,
+      ]);
+      return facts.ok ? 0 : 3;
     }
     const res = await accountsPass(ctx, 'rectify');
     if (res.skipped === 'not-linked') return refused('not-linked', REASON('not-linked'));

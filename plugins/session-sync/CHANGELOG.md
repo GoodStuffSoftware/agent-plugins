@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.16 - 2026-11-27
+
+### Fixed
+
+* **session-sync:** a stale copy is no longer kept as the winner or reported as a conflict when it is only an older save. A conflict is now recorded only when another copy holds work the winner was continued from lacks (a later record time, or the same time and more completed turns, than the copy the app loaded) and its content differs. The base is read when the app loads the folder, once per episode.
+* **session-sync:** a session the app has parked (saved in a folder it no longer has loaded) is held by the inode of the links the plugin itself made (`accounts/own-links.json`, a side file kept apart from `state.json`, with the folder of the winner each link came from). A copy of a link from that folder is superseded by a later save there; a copy that is not ours is held.
+* **session-sync:** the one-time reset of holds made by an older version runs once (done-marker `accounts/holds-reset.json`, written before any hold is dropped), and not while an older-version waiter is alive.
+
+### Changed
+
+* **session-sync:** a rectify pass backs up a copy before it replaces one that really differs (and a copy newer than the winner), in `accounts/rectify-backups/`. Backups of replaced conversation copies older than 14 days are pruned (index rewritten first, then the files, then empty folders). Delete, memory, tasks and settings backups are never erased.
+
+### Added
+
+* **session-sync:** `accounts rectify --dry-run [--json]` runs the rectify pass on a copy of the state and writes nothing (not the store, `state.json`, `own-links.json`, `holds-reset.json` or any backup folder). It lists the frozen copies it would update, the backups, additions, deletions, copies newer than the winner it would rewrite, conflicts and holds it would reset.
+
 ## 0.5.15 - 2026-11-26
 
 ### Fixed

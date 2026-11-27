@@ -48,7 +48,7 @@ Say this before asking for a yes:
 - cloud sessions, cloud routines, projects, chats, artifacts and connectors: claude.ai keeps these with the account that made them;
 - server-side bridge and Remote Control state, and plugins installed from the server.
 
-Two honest limits: a conversation continued from the second account exists as two copies until the next pass (every SessionStart, before every push, after every pull), then the newest wins and the older copy is kept in a backup folder. Nothing is ever erased; displaced files are copied aside first.
+Two honest limits: a conversation continued from the second account exists as two copies until the next pass (every SessionStart, before every push, after every pull), then the newest wins and the older copy is kept in a backup folder. Nothing is ever erased; displaced files are copied aside first. Delete, memory, tasks and settings backups are never erased; only the backups of replaced conversation copies are pruned, after 14 days. While Claude runs, a copy saved by a parked session is held and not overwritten; the plugin records the inode of its own links (`accounts/own-links.json`) so they are not taken for a parked session's. A conflict is reported only when another copy holds work the winner was continued from lacks, not for an older save. To see what a pass would change without writing anything, run `accounts rectify --dry-run --json`.
 
 ## 3. Link
 

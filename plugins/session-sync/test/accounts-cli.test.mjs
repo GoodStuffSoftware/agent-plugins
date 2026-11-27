@@ -9,13 +9,13 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync } from 'node:fs';
+import { writeFileSync, mkdirSync, existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { PLUGIN_VERSION, codeHash } from '../lib/accounts/version.mjs';
 import { readJson } from '../lib/accounts/state.mjs';
 import { pairKey } from '../lib/accounts/folders.mjs';
-import { recordName, nlinkOf } from './fixtures/store.mjs';
+import { recordName, nlinkOf, putRecord, treeHashes } from './fixtures/store.mjs';
 import { cworld, cleanupWorlds, waitFor, CLI, A, B } from './fixtures/cliworld.mjs';
 
 test.after(() => cleanupWorlds());
@@ -241,6 +241,35 @@ test('accounts rectify: a manual run reports the pass and the remote check; not 
   const j = JSON.parse(r.stdout);
   assert.equal(j.ok, true);
   assert.ok('remoteCheck' in j);
+});
+
+test('accounts rectify --dry-run --json: reports what would change and writes nothing (hashes and mtimes of the store and state are the same)', () => {
+  const w = cworld();
+  assert.equal(w.run(['accounts', 'answer', 'yes']).status, 0);
+  // a frozen copy: the record in B is replaced by a different file under its own inode, older than A's
+  const name = recordName(1);
+  const frozen = join(w.fB.path, name);
+  rmSync(frozen);
+  putRecord(w.fB.path, 1, { title: 'frozen older copy' }, 1_700_000_000_000);
+  const snap = () => {
+    const out = {};
+    for (const root of [w.userData, w.stateDir]) {
+      const hashes = treeHashes(root);
+      for (const rel of Object.keys(hashes)) out[`${root}/${rel}`] = `${hashes[rel]}@${statSync(join(root, rel)).mtimeMs}`;
+    }
+    return out;
+  };
+  const before = snap();
+  const r = w.run(['accounts', 'rectify', '--dry-run', '--json']);
+  assert.equal(r.status, 0, r.stderr);
+  const j = JSON.parse(r.stdout);
+  assert.equal(j.dryRun, true);
+  assert.equal(j.ok, true);
+  for (const k of ['wouldUpdate', 'wouldAdd', 'wouldDelete', 'wouldResurrect', 'wouldBackup', 'wouldRewriteNewer', 'conflicts']) assert.ok(Array.isArray(j[k]), k);
+  assert.equal(j.wouldUpdate.length, 1);
+  assert.equal(j.wouldBackup.length, 1);
+  assert.deepEqual(snap(), before);
+  assert.notEqual(nlinkOf(frozen), 2, 'the frozen copy is still a separate file');
 });
 
 test('S5 accounts rectify ends a watcher that runs other code (same version, another code hash) so a new one can take its place; a watcher with the same code is left alone', () => {
