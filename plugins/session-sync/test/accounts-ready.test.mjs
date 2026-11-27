@@ -5,6 +5,8 @@
 
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -81,6 +83,43 @@ test('mirrorTree: copies what differs, removes the extras, leaves .in_use alone,
   assert.ok(existsSync(join(dest, '.in_use')), '.in_use stays');
   assert.deepEqual(mirrorTree(src, dest, join(root, 'rpm')), { copied: 0, removed: 0 });   // a second run changes nothing
   assert.throws(() => mirrorTree(src, join(root, 'elsewhere'), join(root, 'rpm')), ReadyError);
+});
+
+/** Make `fn` of node:fs fail for the paths `bad(p)` accepts, for the duration of `body`; the ESM named imports follow through syncBuiltinESMExports. */
+function failing(fn, bad, body) {
+  const orig = fs[fn];
+  fs[fn] = (p, ...rest) => { if (bad(String(p))) { const e = new Error(`injected ${fn} failure`); e.code = 'EPERM'; throw e; } return orig(p, ...rest); };
+  syncBuiltinESMExports();
+  const done = () => { fs[fn] = orig; syncBuiltinESMExports(); };
+  let res;
+  try { res = body(); } catch (e) { done(); throw e; }
+  if (res && typeof res.then === 'function') return res.finally(done);
+  done();
+  return res;
+}
+const versionOf = (root) => JSON.parse(readFileSync(join(root, '.claude-plugin', 'plugin.json'), 'utf8')).version;
+const norm = (p) => p.replace(/\\/g, '/');
+
+test('mirrorTree: a source folder that cannot be listed aborts, nothing is deleted and the version label is not written', () => {
+  const root = tmp('mirror-src');
+  const src = join(root, 'src'); const dest = join(root, 'rpm', 'x');
+  plugin(src, '2.0.0', { 'lib/a.mjs': 'new', 'lib/accounts/w.mjs': 'w' });
+  plugin(dest, '1.0.0', { 'lib/a.mjs': 'old', 'lib/accounts/w.mjs': 'old-w', 'lib/extra.mjs': 'e' });
+  assert.throws(() => failing('readdirSync', (p) => norm(p) === norm(join(src, 'lib', 'accounts')), () => mirrorTree(src, dest, join(root, 'rpm'))), /cannot list/);
+  assert.ok(existsSync(join(dest, 'lib', 'extra.mjs')) && existsSync(join(dest, 'lib', 'accounts', 'w.mjs')), 'nothing was deleted');
+  assert.equal(versionOf(dest), '1.0.0');
+});
+
+test('mirrorTree: a delete that fails leaves the old version label (the next run redoes the mirror)', () => {
+  const root = tmp('mirror-del');
+  const src = join(root, 'src'); const dest = join(root, 'rpm', 'x');
+  plugin(src, '2.0.0', { 'lib/a.mjs': 'new' });
+  plugin(dest, '1.0.0', { 'lib/a.mjs': 'old', 'lib/extra.mjs': 'e' });
+  assert.throws(() => failing('rmSync', (p) => norm(p).endsWith('lib/extra.mjs'), () => mirrorTree(src, dest, join(root, 'rpm'))), /injected rmSync/);
+  assert.equal(versionOf(dest), '1.0.0');
+  const r = mirrorTree(src, dest, join(root, 'rpm'));   // the retry finishes the job
+  assert.equal(versionOf(dest), '2.0.0');
+  assert.ok(!existsSync(join(dest, 'lib', 'extra.mjs')) && r.removed === 1);
 });
 
 test('backupCopy: a dated folder under ~/.claude/backups, unique on a second call, without .in_use', () => {
@@ -182,6 +221,43 @@ test('ready: behind copies in the target account are a NO-GO; the source account
   assert.deepEqual(toA.behind.sourceIds, [uuid('c', 1).slice(0, 8)]);
 });
 
+test('ready: a behind copy on the source side only is a GO; equal rpm versions do nothing (no backup, no write)', async () => {
+  const w = world({ waiterVersion: '0.5.17', rpmVersion: '0.5.17' });
+  const base = w.clock.tick();
+  putRecord(w.fB.path, 1, { lastActivityAt: '2026-10-01T12:00:00.000Z', completedTurns: 3 }, 500);   // target side is the winner (settled before the unload at 1000, so not mid-turn)
+  putRecord(w.fA.path, 1, { lastActivityAt: '2026-10-01T10:00:00.000Z', completedTurns: 1 }, 400);   // source side is behind
+  const r = await w.run({ to: B });
+  assert.deepEqual([r.behind.target, r.behind.source], [0, 1]);
+  assert.equal(r.verdict, 'GO', JSON.stringify(r.reasons));
+  for (const c of r.copies.filter((x) => x.kind === 'desktop')) { assert.equal(c.action, 'current'); assert.equal(c.backup, undefined); }
+  assert.ok(!existsSync(join(w.home, '.claude', 'backups')), 'an equal copy is never backed up');
+  for (const root of Object.values(w.rpm)) assert.equal(readFileSync(join(root, 'lib', 'cli.mjs'), 'utf8'), 'old', 'and never rewritten');
+});
+
+test('ready: a mirror that fails (source folder unreadable) is reported failed, deletes nothing and is a NO-GO', async () => {
+  const w = world({ waiterVersion: '0.5.17' });
+  const r = await failing('readdirSync', (p) => norm(p) === norm(join(w.cache, 'lib')), () => w.run({ to: B }));
+  const rpm = r.copies.filter((c) => c.kind === 'desktop');
+  assert.ok(rpm.length === 2 && rpm.every((c) => c.action === 'failed' && /cannot list/.test(c.error)), JSON.stringify(rpm));
+  assert.equal(r.verdict, 'NO-GO');
+  assert.ok(r.reasons.some((x) => x.code === 'rpm-copy-failed'));
+  for (const root of Object.values(w.rpm)) {
+    assert.equal(versionOf(root), '0.5.11', 'the label stays old');
+    assert.ok(existsSync(join(root, 'lib', 'gone.mjs')) && existsSync(join(root, 'lib', 'cli.mjs')), 'nothing was deleted');
+  }
+});
+
+test('ready: the waiter takeover child gets a capped time, and the app-stopped NO-GO tells how to proceed', async () => {
+  const w = world();
+  const seen = [];
+  await w.run({ self: { path: w.rpm.a, version: '0.5.11' }, deps: { child: (cli, ms) => { seen.push(ms); w.setWaiter('0.5.17'); return { ok: true, status: 0 }; } } });
+  assert.equal(seen.length, 1);
+  assert.ok(seen[0] <= 60 * 1000 && seen[0] >= 5000, String(seen[0]));
+  const gone = world({ waiterVersion: null });
+  const r = await gone.run({ deps: { app: () => ({ running: false, signedIn: null, startedAtMs: 0 }) }, to: 'bbbb' });
+  assert.ok(r.reasons.find((x) => x.code === 'waiter-not-running').text.includes('start Claude'));
+});
+
 test('ready: a session still running in the account that is not loaded is a NO-GO', async () => {
   const w = world({ waiterVersion: '0.5.17' });
   putRecord(w.fB.path, 2, { lastActivityAt: '2026-10-01T12:00:00.000Z' }, w.clock.tick());   // alone in the parked account's folder, written after the unload
@@ -230,6 +306,9 @@ test('cli: accounts ready exits 2 for an unknown --to and for --to without a val
   assert.equal(JSON.parse(bad.stdout).ok, false);
   const none = w.run(['accounts', 'ready', '--to']);
   assert.equal(none.status, 2);
+  const eq = w.run(['accounts', 'ready', '--to=zzzz', '--json']);   // the equals form is parsed, not ignored
+  assert.equal(eq.status, 2, eq.stderr);
+  assert.match(JSON.parse(eq.stdout).error, /no such account/);
   w.setApp({ running: true, signedIn: CA });
   const r = w.run(['accounts', 'ready', '--to', CB.slice(0, 8), '--json']);
   assert.ok([0, 1].includes(r.status), `${r.status} ${r.stderr}`);
@@ -238,6 +317,16 @@ test('cli: accounts ready exits 2 for an unknown --to and for --to without a val
   assert.equal(j.verdict, r.status === 0 ? 'GO' : 'NO-GO');
   assert.equal(j.target, CB.slice(0, 8));
   assert.ok(Array.isArray(j.copies) && typeof j.elapsedMs === 'number' && 'before' in j.waiter && 'after' in j.waiter);
+});
+
+test('cli: accounts ready exits 2 (not 3) when the desktop store is missing', () => {
+  const w = cworld();
+  rmSync(w.store, { recursive: true, force: true });
+  const r = w.run(['accounts', 'ready', '--json']);
+  assert.equal(r.status, 2, `${r.status} ${r.stdout} ${r.stderr}`);
+  const j = JSON.parse(r.stdout);
+  assert.equal(j.ok, false);
+  assert.equal(j.reason, 'no-store');
 });
 
 test('cli: launch-detached allows `accounts rectify --from-hook` and nothing longer', () => {

@@ -13,7 +13,7 @@
  * Everything outside the pure decisions is passed in (`deps`), so the tests run it against a fixture home with no process started.
  */
 
-import { existsSync, readdirSync, readFileSync, mkdirSync, cpSync, copyFileSync, rmSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, mkdirSync, cpSync, copyFileSync, rmSync, statSync } from 'node:fs';
 import { join, dirname, resolve, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -77,12 +77,13 @@ export function newestCopy(cache, self) {
 const inside = (parent, child) => { const r = relative(resolve(parent), resolve(child)); return r !== '' && !r.startsWith('..') && !r.includes(':') && !r.startsWith(sep); };
 const kept = (rel) => rel === IN_USE || rel.startsWith(`${IN_USE}/`);
 
-function listTree(root) {
+/** All files and folders under `root` (`.in_use` left out). `strict`: a folder that cannot be listed throws (the source side: a short listing would delete good files). */
+function listTree(root, strict = false) {
   const files = new Map();
   const dirs = [];
   const walk = (abs, rel) => {
     let ents = [];
-    try { ents = readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    try { ents = readdirSync(abs, { withFileTypes: true }); } catch (e) { if (strict) throw new ReadyError(`cannot list ${abs}: ${e?.code ?? e?.message ?? e}`); return; }
     for (const e of ents) {
       const r = rel ? `${rel}/${e.name}` : e.name;
       if (kept(r)) continue;
@@ -95,28 +96,40 @@ function listTree(root) {
 
 const sameFile = (a, b) => { try { return readFileSync(a).equals(readFileSync(b)); } catch { return false; } };
 
+const sizeOf = (p) => { try { return statSync(p).size; } catch { return -1; } };
+const LABEL = '.claude-plugin/plugin.json';
+
 /**
- * Make `dest` end with `src`'s file set: copy the files that differ, remove the files and folders `src` does not have, `.in_use` untouched,
- * `.claude-plugin/plugin.json` written last (an interrupted mirror keeps the old version label and is redone). Refuses a `dest` outside `allowedRoot`.
+ * Make `dest` end with `src`'s file set: copy the files that differ, remove the files and folders `src` does not have, `.in_use` untouched.
+ * Order: every other file is copied, the extras are deleted, the result is listed again and must hold exactly the source's files (sizes equal),
+ * and only then `.claude-plugin/plugin.json` (the version label) is written. Any failure throws and the label keeps the old version, so a
+ * mixed copy is never labelled as the new version. A source folder that cannot be listed aborts before anything is deleted.
+ * Refuses a `dest` outside `allowedRoot`.
  * @returns {{copied:number, removed:number}}
  */
 export function mirrorTree(src, dest, allowedRoot) {
   if (!inside(allowedRoot, dest)) throw new ReadyError(`refusing to write outside ${allowedRoot}`);
-  const s = listTree(src);
+  const s = listTree(src, true);
   const d = listTree(dest);
   let copied = 0; let removed = 0;
-  const last = '.claude-plugin/plugin.json';
-  const order = [...s.files.keys()].filter((r) => r !== last).concat(s.files.has(last) ? [last] : []);
-  for (const rel of order) {
+  const put = (rel) => {
     const to = join(dest, ...rel.split('/'));
-    if (d.files.has(rel) && sameFile(s.files.get(rel), to)) continue;
+    if (d.files.has(rel) && sameFile(s.files.get(rel), to)) return;
     mkdirSync(dirname(to), { recursive: true });
     copyFileSync(s.files.get(rel), to);
     copied++;
-  }
+  };
+  for (const rel of s.files.keys()) if (rel !== LABEL) put(rel);
   for (const [rel, p] of d.files) if (!s.files.has(rel)) { rmSync(p, { force: true }); removed++; }
   const srcDirs = new Set(s.dirs);
   for (const rel of d.dirs.filter((r) => !srcDirs.has(r)).sort((a, b) => b.length - a.length)) rmSync(join(dest, ...rel.split('/')), { recursive: true, force: true });
+  const after = listTree(dest, true);
+  for (const [rel, p] of s.files) {
+    if (rel === LABEL) continue;
+    if (!after.files.has(rel) || sizeOf(after.files.get(rel)) !== sizeOf(p)) throw new ReadyError(`the copy is incomplete: ${rel}`);
+  }
+  for (const rel of after.files.keys()) if (rel !== LABEL && !s.files.has(rel)) throw new ReadyError(`the copy still holds a file the cache lacks: ${rel}`);
+  if (s.files.has(LABEL)) put(LABEL);
   return { copied, removed };
 }
 
@@ -196,15 +209,21 @@ export function waiterOlderThanSelf(ctx, selfVersion = PLUGIN_VERSION, alive = p
 
 const waiterCurrent = (w, newestVersion) => w.alive && !!w.version && (compareVersions(w.version, newestVersion) ?? -1) >= 0;
 
-const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/* Time budget: the whole command stays under 2 minutes. The child is capped at 60 s and runs without the remote check; the wait for the waiter
+ * stops by 100 s after the start; what follows (reading the records) is local. */
+const CHILD_CAP_MS = 60 * 1000;
+const BUDGET_MS = 100 * 1000;
 
-function defaultChild(cli) {
-  const r = spawnSync(process.execPath, [cli, 'accounts', 'rectify', '--json'], { windowsHide: true, encoding: 'utf8', timeout: 90 * 1000, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
+const defaultSleep =(ms) => new Promise((r) => setTimeout(r, ms));
+
+/** The rectify takeover as a hidden child. `--no-remote` skips the remote listing (the slow part, and not needed for the waiter); the cap is `timeoutMs`. */
+function defaultChild(cli, timeoutMs = CHILD_CAP_MS) {
+  const r = spawnSync(process.execPath, [cli, 'accounts', 'rectify', '--json', '--no-remote'], { windowsHide: true, encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'], env: process.env });
   return { ok: !r.error, status: r.status ?? null, error: r.error ? String(r.error.message ?? r.error) : null };
 }
 
 /** Replace a waiter older than the newest copy. Returns {mode, ok, ...}; never throws. */
-async function takeover(ctx, newest, self, state, deps) {
+async function takeover(ctx, newest, self, state, deps, deadline) {
   const cli = join(newest.path, 'lib', 'cli.mjs');
   try {
     if ((compareVersions(self.version, newest.version) ?? -1) >= 0) {
@@ -218,7 +237,7 @@ async function takeover(ctx, newest, self, state, deps) {
       });
       return { mode: 'in-process', ok: e.action !== 'failed', replaced: !!r.replaced, ensure: e.action, ...(e.error ? { reason: e.error } : {}) };
     }
-    const c = deps.child(cli);
+    const c = deps.child(cli, Math.max(5000, Math.min(CHILD_CAP_MS, deadline - Date.now() - 10000)));
     return { mode: 'child', ok: c.ok, ...(c.error ? { reason: c.error } : {}) };
   } catch (e) {
     return { mode: 'error', ok: false, reason: String(e?.message ?? e) };
@@ -288,15 +307,15 @@ export async function runReady(ctx, o = {}) {
   let take = null;
   const needs = before.alive ? !waiterCurrent(before, newest.version) : (app.running || !!state.fullPassOwed);
   if (needs && state.linked && group.length >= 2) {
-    take = await takeover(ctx, newest, self, state, deps);
-    const end = Date.now() + deps.waitMs;
+    take = await takeover(ctx, newest, self, state, deps, t0 + BUDGET_MS);
+    const end = Math.min(Date.now() + deps.waitMs, t0 + BUDGET_MS);
     for (;;) {
       after = waiterInfo(ctx);
       if (waiterCurrent(after, newest.version) || Date.now() >= end) break;
       await deps.sleep(250);
     }
   }
-  if (!after.alive) why('waiter-not-running', 'the background waiter is not running');
+  if (!after.alive) why('waiter-not-running', `the background waiter is not running${app.running ? '' : ' and Claude is stopped; start Claude, then run accounts ready again'}`);
   else if (!waiterCurrent(after, newest.version)) why('waiter-old', `the waiter runs ${after.version ?? 'an unknown version'}, the newest copy is ${newest.version}${take && !take.ok ? ` (takeover: ${take.reason ?? take.mode} failed)` : ''}`);
 
   // 4: the session records (after the takeover: a pass it ran may have repaired some)

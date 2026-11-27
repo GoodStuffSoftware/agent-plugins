@@ -823,8 +823,8 @@ async function accountsCommand(sub, args) {
   const hook = args.includes('--from-hook');
   const has = (f) => args.includes(f);
   if (!ctx.store && sub !== 'wait' && sub !== 'launch-detached' && sub !== 'rc-restore') {
-    emit({ ok: false, reason: 'no-store' }, ['The Claude desktop session store was not found on this machine.']);
-    return 3;
+    emit({ ok: false, reason: 'no-store', ...(sub === 'ready' ? { command: 'ready', error: 'the Claude desktop session store was not found on this machine' } : {}) }, ['The Claude desktop session store was not found on this machine.']);
+    return sub === 'ready' ? 2 : 3; // `ready` exits 0 GO, 1 NO-GO, 2 error
   }
   const printPass = (res, kind) => {
     const sum = summarizePass(res, kind);
@@ -836,9 +836,13 @@ async function accountsCommand(sub, args) {
   if (sub === 'ready') {
     // 0.5.17: one command before an account switch: copies, waiter, behind copies, mid-turn sessions; exit 0 GO, 1 NO-GO, 2 error
     const ti = args.indexOf('--to');
+    const eq = args.find((a) => a.startsWith('--to='));
     try {
-      if (ti >= 0 && (!args[ti + 1] || args[ti + 1].startsWith('--'))) throw new ReadyError('--to needs an account id (or the start of one)');
-      const r = await runReady(ctx, { to: ti >= 0 ? args[ti + 1] : null });
+      let to = null;
+      if (eq !== undefined) to = eq.slice('--to='.length);
+      else if (ti >= 0) to = args[ti + 1] ?? '';
+      if (to !== null && (!to || to.startsWith('--'))) throw new ReadyError('--to needs an account id (or the start of one)');
+      const r = await runReady(ctx, { to });
       emit(r, formatReady(r));
       return r.verdict === 'GO' ? 0 : 1;
     } catch (e) {
@@ -943,7 +947,8 @@ async function accountsCommand(sub, args) {
     const sum = summarizePass(res, res.kind === 'live' ? 'live' : 'full');
     if (hook) return 0;
     // a manual run includes the remote check
-    const remote = await accountsRemoteCheck(ctx);
+    // (`--no-remote` skips it: `accounts ready` runs the takeover child this way to stay inside its 2-minute budget)
+    const remote = has('--no-remote') ? { checked: false, reason: 'skipped (--no-remote)' } : await accountsRemoteCheck(ctx);
     emit({ command: 'rectify', ...sum, remoteCheck: remote },
       [...formatPass(sum), remote.checked ? `Remote: ${remote.ids} record(s), ${remote.duplicates} duplicate(s)${remote.neverPushed ? ' (nothing has been pushed yet)' : ''}.` : `Remote check not run: ${remote.reason}.`]);
     return sum.ok || sum.skipped ? 0 : 3;
@@ -1052,7 +1057,7 @@ async function accountsCommand(sub, args) {
     return 0;
   }
 
-  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | ready [--to <acct>] [--json] | link [--now] | rectify | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json] [--background]');
+  console.error('Usage: accounts status [--all] [--remote] [--json] | answer yes|no | go-live [--yes] [--no-relaunch] [--quit-app] [--json] | ready [--to <acct>] [--json] | link [--now] | rectify [--no-remote] | unlink [--when-app-exits] | rollback [--exact] [--dry-run] | rc-restore --if-app-stopped|install-logon-task|uninstall-logon-task | rc-sweep [--before <iso>] [--dry-run] [--json] | rc-repair <id> [--stop-cli | --at-turn-end] | rc-spawn-fix [--dry-run] [--json] | connector-check [--since <iso>] [--dry-run] [--json] [--background]');
   return 2;
 }
 
