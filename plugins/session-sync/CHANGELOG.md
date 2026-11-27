@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.17 - 2026-11-27
+
+### Added
+
+* **session-sync:** `accounts ready [--to <acct>] [--json]`, one command before an account switch. It lists the CLI cache's and the desktop app's copies of the plugin, backs up (`~/.claude/backups/rpm-session-sync-<ver>-<date>`) and mirrors an app copy older than the cache with Node fs (`.in_use` is never copied over or deleted), replaces a waiter older than the newest copy (in-process through `replaceOldWaiter` and the launcher when this copy is the newest, else a hidden `accounts rectify --json` child from the newest copy), and prints GO or NO-GO: behind session copies in the target account, conversations still running, the waiter's version, an app copy of the target older than the cache. Exit 0 GO, 1 NO-GO, 2 error.
+* **session-sync:** the SessionStart hook starts the waiter takeover in the background (`accounts rectify --from-hook` through the launcher, now allowed by `launch-detached`) when the live waiter is older than the running copy; the common case costs one small file read.
+
 ## 0.5.16 - 2026-11-27
 
 ### Fixed

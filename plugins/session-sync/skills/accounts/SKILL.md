@@ -160,6 +160,14 @@ A link moves what is on this machine. What claude.ai holds server-side needs han
 
 Mention that the artifact list is capped at the newest 20 unless `--all` is given.
 
+## Before a switch
+
+Run one command: `node "${CLAUDE_PLUGIN_ROOT}/lib/cli.mjs" accounts ready [--to <account>] [--json]`. `--to` is an account id or the start of one; without it the target is the account that is not loaded now. It lists every installed copy of the plugin (the CLI cache and each copy the desktop app runs), backs up and mirrors an app copy that is older than the cache (an install changes the cache only, so the app keeps running old code until this is done), replaces a waiter that runs older code than the newest copy, and then prints GO or NO-GO with the reasons. It takes well under two minutes and needs no hand-reading of counts.
+
+* **GO** (exit 0): the target account's session copies are current, no conversation is still running, the waiter runs the newest version, and no app copy of the target account is older than the cache. Switch.
+* **NO-GO** (exit 1): the reasons say what is missing: copies in the target account that are behind (a pass or the waiter repairs them; run `accounts rectify`, then ask again), a conversation still running (finish or stop it), a waiter that is not running or not the newest version, or an app copy that could not be updated. Fix the reason and run it again.
+* Exit 2 is an error (an unknown `--to`, or the loaded account is not known: pass `--to`). The source account's behind copies are repaired by the next normal quit; they are counted as information and never block.
+
 ## Switching accounts once linked
 
 Never tell the user to restart or quit Claude because of an account switch. After the link, a watcher (the waiter process, started with the first Code session) keeps every folder the app has not loaded current within about 2 seconds of a save and adds new names to the loaded one, so signing out, signing in to the other account, switching back or signing out with sessions running all show every conversation at once. The only restart prompt left is the one-time "Restart Claude to sync your accounts" for an account that was never linked (it joined later); say it once, with the quit-from-the-tray instruction, and not again. Whatever the watcher had to hold back (a copy the app has loaded, a conversation still running in the account that was left) finishes by itself after the user's next normal quit.
