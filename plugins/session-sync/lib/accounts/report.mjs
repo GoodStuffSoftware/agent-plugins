@@ -11,7 +11,7 @@
 
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { loadState, accPath, readJson, rollbackActive } from './state.mjs';
+import { loadState, accPath, readJson, rollbackActive, loadOwnLinks, ownInos } from './state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, RECORD } from './folders.mjs';
 import { appState, nameIsHeld } from './appstate.mjs';
 import { owedWork } from './pass.mjs';
@@ -135,7 +135,7 @@ export function groupHealth(group) {
  * accounts with a conversation running): the name in the other folder is not one a pass of ours made, and is newer than the
  * switch. When the loaded account holds an idle copy of the same id it is listed as such. Read-only.
  */
-export function heldConversations(group, state, app) {
+export function heldConversations(group, state, app, own = null) {
   if (!app.running || !app.signedIn) return [];
   const loaded = new Set(group.filter((f) => f.acct === app.signedIn).map((f) => f.key));
   const stat = (p) => { try { return statSync(p, { bigint: true }); } catch { return null; } };
@@ -156,7 +156,7 @@ export function heldConversations(group, state, app) {
       const st = stat(join(f.path, n));
       if (!st) continue;
       // the same rule the engine uses (appstate.nameIsHeld): recorded as held, or alone and written after an unload seen in this app run
-      if (!nameIsHeld(state, { id, folder: f.key, inoKey: `${st.dev}:${st.ino}`, nlink: Number(st.nlink), mtimeMs: Number(st.mtimeNs / 1000000n) }, app.startedAtMs ?? 0)) continue;
+      if (!nameIsHeld(state, { id, folder: f.key, inoKey: `${st.dev}:${st.ino}`, nlink: Number(st.nlink), mtimeMs: Number(st.mtimeNs / 1000000n) }, app.startedAtMs ?? 0, ownInos(own, id, f.key))) continue;
       out.push({ id: id8(id.slice(6)), runningIn: id8(f.acct), idleCopyIn: inLoaded.has(id) ? id8(app.signedIn) : null });
     }
   }
@@ -213,7 +213,7 @@ export function collectStatus(ctx, o = {}) {
       cooling: Object.entries(state.signed.cooling ?? {}).filter(([, t]) => t > ctx.now()).map(([a]) => id8(a)),
     } : null,
     conflicts: Object.entries(state.conflicts ?? {}).map(([id, c]) => ({ id: id8(id.slice(6)), at: c.at, winner: id8(String(c.winner).split('/')[0]), loser: id8(String(c.loser).split('/')[0]), cliChanged: !!c.cliChanged })),
-    held: group.length >= 2 ? heldConversations(group, state, app) : [],
+    held: group.length >= 2 ? heldConversations(group, state, app, loadOwnLinks(ctx)) : [],
     rcSpawn: spawnStatus(ctx),   // sessions started from claude.ai under another account: flagged now (pending) and fixed earlier
   };
 }

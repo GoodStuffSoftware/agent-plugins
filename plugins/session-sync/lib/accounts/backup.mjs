@@ -9,7 +9,7 @@
 
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, utimesSync, statSync, lstatSync,
-  readdirSync, appendFileSync,
+  readdirSync, appendFileSync, rmSync, renameSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { dirname, join, relative, sep } from 'node:path';
@@ -89,6 +89,50 @@ export function backupCopy(ctx, path, meta = {}) {
   }) + '\n');
   seen.add(`${name}\0${sha}`);
   return { skipped: false, dst, sha256: sha };
+}
+
+/**
+ * Retention: delete the rectify-backups day directories (YYYY-MM-DD, local day) whose WHOLE day ended more than `days` days ago, and drop
+ * their lines from index.jsonl (the index dedupes by name + sha; a stale line would block a fresh backup of the same copy). Nothing else
+ * is touched. Runs at most once a day (stamp file), only when the directory exists.
+ * @returns {{pruned:string[], skipped?:boolean}}
+ */
+export function pruneBackups(ctx, { days = 14, force = false } = {}) {
+  const root = accPath(ctx, 'rectify-backups');
+  if (!existsSync(root)) return { pruned: [], skipped: true };
+  const now = ctx.now();
+  const stamp = join(root, '.pruned-at');
+  if (!force) {
+    const last = Number(readJson(stamp, 0)) || 0;
+    if (now - last < 24 * 3600 * 1000 && now >= last) return { pruned: [], skipped: true };
+  }
+  const gone = new Set();
+  for (const d of readdirSync(root, { withFileTypes: true })) {
+    const m = d.isDirectory() && /^(\d{4})-(\d{2})-(\d{2})$/.exec(d.name);
+    if (!m) continue;
+    const dayEnd = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1).getTime();
+    if (now - dayEnd > days * 24 * 3600 * 1000) {
+      try { rmSync(join(root, d.name), { recursive: true, force: true }); gone.add(d.name); } catch { /* left for the next run */ }
+    }
+  }
+  if (gone.size) {
+    const index = join(root, 'index.jsonl');
+    if (existsSync(index)) {
+      const keep = [];
+      for (const line of readFileSync(index, 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        let drop = false;
+        try { const t = Date.parse(JSON.parse(line).at); drop = !Number.isNaN(t) && gone.has(localDay(t)); } catch { /* torn line: keep */ }
+        if (!drop) keep.push(line);
+      }
+      const tmp = `${index}.${process.pid}.tmp`;
+      writeFileSync(tmp, keep.length ? `${keep.join('\n')}\n` : '');
+      renameSync(tmp, index);
+    }
+    indexCache.clear();
+  }
+  writeFileSync(stamp, String(now));
+  return { pruned: [...gone].sort() };
 }
 
 /* ---- the one-time backup ---- */

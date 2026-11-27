@@ -27,8 +27,8 @@ import {
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { RECORD, TOMB, OURTMP, homeOf } from './folders.mjs';
-import { backupCopy, resetBackupCache, sha256File } from './backup.mjs';
-import { accPath, readJson, tickMutation, sleepSync, LOCK_TTL_MS } from './state.mjs';
+import { backupCopy, resetBackupCache, sha256File, pruneBackups } from './backup.mjs';
+import { accPath, readJson, tickMutation, sleepSync, LOCK_TTL_MS, loadOwnLinks, ownInos, saveOwnLinks, OWN_LINKS_CAP } from './state.mjs';
 import { AppRunningError, nameIsHeld } from './appstate.mjs';
 import { acquireLock, pidAlive } from '../lock.mjs';
 
@@ -126,11 +126,12 @@ function makeSummarizer() {
       r = {
         ok: true,
         la: toMs(o.lastActivityAt),
+        turns: Number.isFinite(o.completedTurns) ? o.completedTurns : 0,
         cli: typeof o.cliSessionId === 'string' ? o.cliSessionId : null,
         bound: [...BOUND_FIELDS.filter((f) => o[f] !== undefined && o[f] !== null),
           ...Object.keys(o).some((x) => x.startsWith('remoteControl')) ? ['remoteControl*'] : []],
       };
-    } catch { r = { ok: false, la: -Infinity, cli: null, bound: [] }; }
+    } catch { r = { ok: false, la: -Infinity, turns: 0, cli: null, bound: [] }; }
     if (SUMMARIES.size >= SUMMARY_CACHE_MAX) SUMMARIES.clear();
     SUMMARIES.set(k, r);
     return r;
@@ -252,27 +253,43 @@ function newReport(mode) {
  * @param {object}        [opts.remoteList]
  * @param {boolean}       [opts.locked] caller already holds accounts.lock
  * @param {boolean}       [opts.accountFields] count account-bound fields (default: full pass)
+ * @param {boolean}       [opts.dryRun] no lock, no writes anywhere (state is cloned); `rep.dry` lists what would change
  */
 export function rectify(group, opts) {
-  const { mode = 'full', ctx, state, guard, remoteList } = opts;
+  const { mode = 'full', ctx, guard, remoteList } = opts;
+  const dryRun = !!opts.dryRun;
+  const state = dryRun ? structuredClone(opts.state) : opts.state;
   const live = opts.live instanceof Set ? opts.live : new Set(opts.live ?? []);
   const rep = newReport(mode);
+  if (dryRun) rep.dry = [];
   const pa = readJson(accPath(ctx, 'pull-active'), null);
   if (pa && pidAlive(pa.pid) && ctx.now() - (pa.at || 0) < PULL_ACTIVE_MAX_AGE_MS) { rep.skipped = 'pull-active'; return rep; }
 
   let lock = null;
-  if (!opts.locked) {
+  if (!opts.locked && !dryRun) {
     lock = acquireLock(accPath(ctx, 'accounts.lock'), { ttlMs: LOCK_TTL_MS });
     if (!lock.acquired) { rep.skipped = 'locked'; return rep; }
   }
   const roles = mode === 'targeted' ? { loaded: new Set(opts.roles?.loaded ?? []), cooling: new Set(opts.roles?.cooling ?? []) } : null;
-  try { return run(group, { mode, ctx, state, guard, remoteList, live, roles, testHook: opts.testHook, appStartedAtMs: opts.appStartedAtMs ?? 0, accountFields: opts.accountFields ?? mode === 'full' }, rep); }
+  try { return run(group, { mode, ctx, state, guard, remoteList, live, roles, testHook: opts.testHook, dryRun, appStartedAtMs: opts.appStartedAtMs ?? 0, accountFields: opts.accountFields ?? mode === 'full' }, rep); }
   finally { lock?.release(); }
 }
 
 function run(group, o, rep) {
-  const { mode, ctx, state, guard, remoteList, live, roles } = o;
+  const { mode, ctx, state, guard, remoteList, live, roles, dryRun } = o;
   resetBackupCache();
+  if (!dryRun) { try { rep.pruned = pruneBackups(ctx, { days: 14 }).pruned; } catch { /* retention is best effort */ } }
+  // 0.5.16: the inode each link of ours actually got (side file; see state.mjs). Kept apart from state.json.
+  const own = loadOwnLinks(ctx);
+  const ownOf = (id, folder = null) => ownInos(own, id, folder);
+  const recordOwn = (id, ino, f) => {
+    const list = (own.links[id] ||= []).filter((x) => !(x.ino === ino && x.f === f));
+    list.push({ ino, f, at: ctx.now() });
+    own.links[id] = list.slice(-OWN_LINKS_CAP);
+  };
+  // the one-time reset (case b): copies the old waiter linked have no inode record and read as a parked session's. The first pass of
+  // this version drops every hold and holds nothing; from the next pass on, our links are recorded and a real parked session is held again.
+  const resetHolds = !own.resetAt;
   const groupKeys = group.map((f) => f.key);
   const folderPath = Object.fromEntries(group.map((f) => [f.key, f.path]));
   const inv = inventory(group);
@@ -288,15 +305,27 @@ function run(group, o, rep) {
   const held = (state.held ||= {});
   if (mode === 'targeted') {
     if (state.heldRun !== (o.appStartedAtMs ?? 0)) { for (const k of Object.keys(held)) delete held[k]; state.heldRun = o.appStartedAtMs ?? 0; }   // a restart ends every parked session
+    if (resetHolds) {
+      const n = Object.values(held).reduce((a, h) => a + Object.keys(h).length, 0);
+      for (const k of Object.keys(held)) delete held[k];
+      rep.holdsReset = n;
+      if (dryRun) rep.dry.push({ op: 'reset-holds', held: n });
+    }
     for (const id of Object.keys(held)) {
       if (!inv.byId.has(id)) { delete held[id]; continue; }
-      for (const F of Object.keys(held[id])) if (roles.loaded.has(F) || !inv.byId.get(id).has(F)) delete held[id][F];   // loaded again, or the name is gone
+      for (const F of Object.keys(held[id])) {
+        const e = inv.byId.get(id).get(F);
+        // loaded again, the name is gone, or the name is one of our links / a write no later than the start of held time (0.5.16)
+        if (roles.loaded.has(F) || !e || (held[id][F] === e.inoKey && !nameIsHeld(state, e, o.appStartedAtMs ?? 0, ownOf(id, F)))) delete held[id][F];
+      }
       if (!Object.keys(held[id]).length) delete held[id];
     }
-    for (const P of inv.byId.values()) {
-      for (const e of P.values()) {
-        if (roles.loaded.has(e.folder) || roles.cooling.has(e.folder)) continue;
-        if (nameIsHeld(state, e, o.appStartedAtMs ?? 0)) (held[e.id] ||= {})[e.folder] = e.inoKey;
+    if (!resetHolds) {
+      for (const P of inv.byId.values()) {
+        for (const e of P.values()) {
+          if (roles.loaded.has(e.folder) || roles.cooling.has(e.folder)) continue;
+          if (nameIsHeld(state, e, o.appStartedAtMs ?? 0, ownOf(e.id, e.folder))) (held[e.id] ||= {})[e.folder] = e.inoKey;
+        }
       }
     }
   }
@@ -337,7 +366,7 @@ function run(group, o, rep) {
     for (const n of f.ourTmp) {
       const p = join(f.folder.path, n);
       try {
-        if (ctx.now() - statSync(p).mtimeMs > OUR_TMP_MAX_AGE_MS) { unlinkSync(p); rep.counts.cleanedTmp++; }
+        if (ctx.now() - statSync(p).mtimeMs > OUR_TMP_MAX_AGE_MS) { if (!dryRun) unlinkSync(p); rep.counts.cleanedTmp++; }
       } catch { /* gone */ }
     }
   }
@@ -353,7 +382,7 @@ function run(group, o, rep) {
         else throw e;
       }
     }
-    if (mode === 'full') sweepGone();
+    if (mode === 'full' && !dryRun) sweepGone();
   } catch (e) {
     if (e instanceof AppRunningError) {
       rep.aborted = true;
@@ -364,6 +393,10 @@ function run(group, o, rep) {
 
   if (mode === 'full' && !rep.aborted) { state.held = {}; state.heldRun = 0; }   // the app is stopped: no parked session is left
   state.lastRectify = new Date(ctx.now()).toISOString();
+  if (!dryRun) {
+    if (!rep.aborted && mode !== 'live' && !own.resetAt) own.resetAt = new Date(ctx.now()).toISOString();
+    try { saveOwnLinks(ctx, own); } catch { /* the record is advisory; the next pass writes it again */ }
+  }
   return rep;
 
   /* ---------------- per record ---------------- */
@@ -377,6 +410,7 @@ function run(group, o, rep) {
 
     if (plan.delete) {
       if (mode === 'live') { owe(plan.id, 'delete'); return; }
+      if (dryRun) { rep.dry.push({ op: 'delete', id: plan.id }); return; }
       const done = doDelete(plan);
       if (done) rep.counts.delete++;
       return;
@@ -387,7 +421,7 @@ function run(group, o, rep) {
         const pinned = [...plan.del.keys()].find((F) => roles.loaded.has(F) || roles.cooling.has(F));
         if (pinned) { owe(plan.id, 'resurrect', pinned); return; }
       }
-      doResurrect(plan);
+      if (dryRun) rep.dry.push({ op: 'resurrect', id: plan.id }); else doResurrect(plan);
       rep.counts.resurrect++;
     }
 
@@ -399,7 +433,9 @@ function run(group, o, rep) {
     // or a parked session), is an ancestor of that save: it needs no backup. Only a copy from another history (a stale continuation,
     // a switch flush, field drift) is backed up.
     const prevWin = state.records?.[plan.id]?.win;
-    const supersedes = (loser) => mode === 'targeted' && !!prevWin && prevWin.ino === loser.inoKey && prevWin.f === plan.W.folder
+    // 0.5.16: the loser is an inode a link of ours produced (the recorded inode, not only the last winner's) in the winner's own folder's lineage
+    const ownIds = (ino, F) => ownOf(plan.id, F).has(ino);
+    const supersedes = (loser) => mode === 'targeted' && !!prevWin && (ownIds(loser.inoKey, loser.folder) || prevWin.ino === loser.inoKey) && prevWin.f === plan.W.folder
       && (roles.loaded.has(plan.W.folder) || isHeld(plan.W));
     for (const loser of plan.losers) {
       if (mode === 'live' && live.has(loser.folder)) { owe(plan.id, 'split-loser-live', loser.folder); continue; }
@@ -434,11 +470,20 @@ function run(group, o, rep) {
       const snap = state.loadedSnapshot?.[L]?.[plan.id.toLowerCase()];
       const mine = plan.entries.get(L);
       if (!snap || !mine || mine.inoKey === snap || mine.inoKey !== plan.W.inoKey) continue;
-      const displaced = plan.losers.filter((loser) => loser.folder !== L && loser.inoKey !== snap);
+      // 0.5.16: a conflict only when another copy is REALLY newer than the winner (a later record timestamp, or the same one and more
+      // completed turns) and its content differs; a copy that is merely a different inode, or an older save, is not one.
+      const ws = plan.summary;
+      const reallyNewer = (l) => {
+        const ls = summarize(l);
+        if (!(ls.la > ws.la || (ls.la === ws.la && ls.turns > ws.turns))) return false;
+        try { return sha256File(l.path) !== sha256File(plan.W.path); } catch { return false; }
+      };
+      const displaced = plan.losers.filter((loser) => loser.folder !== L && loser.inoKey !== snap && reallyNewer(loser));
       if (!displaced.length) continue;
       state.conflicts ||= {};
       const prev = state.conflicts[plan.id];
-      if (prev && prev.winnerIno === plan.W.inoKey && displaced.every((l) => prev.loserInos?.includes(l.inoKey) || prev.loserIno === l.inoKey)) continue;
+      // deduped on the set of other copies (the winner's inode changes with every save and is not part of the key)
+      if (prev && displaced.every((l) => (prev.loserInos ?? [prev.loserIno]).includes(l.inoKey))) continue;
       // N1: one entry names every displaced copy (the first is `loser`, all are in `losers`), not only the last one met
       const c = {
         at: new Date(ctx.now()).toISOString(), winner: L, loser: displaced[0].folder, losers: displaced.map((l) => l.folder),
@@ -455,17 +500,25 @@ function run(group, o, rep) {
   /** true: re-linked. false: busy (EPERM and the like). A string: the target changed since the inventory, left as it is. */
   function relink(W, loser, superseded = false) {
     check('relink', loser.folder, loser);
+    if (dryRun) { rep.dry.push({ op: 'relink', id: loser.id, folder: loser.folder }); return true; }
     const dst = loser.path;
     const ch = changedSince(loser);
     if (ch) { note(loser.id, `${loser.folder}: ${ch}; next pass`); return ch; }
-    if (!superseded && sha256File(dst) !== sha256File(W.path)) backupCopy(ctx, dst, { reason: 'split-loser', folder: loser.folder, name: loser.name });
     const tmp = join(dirname(dst), `.session-sync-link-${randomBytes(6).toString('hex')}`);
     let err = null;
+    let linked = null;
     for (let i = 0; i < 3; i++) {
-      // N8: look at the target once more right before it is replaced (the backup of a big record takes a while)
-      const late = restat(loser);
-      if (late) { note(loser.id, `${loser.folder}: ${late}; next pass`); return late; }
-      try { linkSync(W.path, tmp); renameSync(tmp, dst); err = null; break; } catch (e) {
+      try {
+        linkSync(W.path, tmp);
+        // 0.5.16: the inode this link ACTUALLY got (the winner may have been replaced by a save since the inventory)
+        const t = statSync(tmp, { bigint: true });
+        linked = `${t.dev}:${t.ino}`;
+        // the backup only when a copy that differs is really about to be replaced; N8: look at the target again right after it (it takes a while)
+        if (!superseded && sha256File(dst) !== sha256File(tmp)) backupCopy(ctx, dst, { reason: 'split-loser', folder: loser.folder, name: loser.name });
+        const late = restat(loser);
+        if (late) { try { unlinkSync(tmp); } catch { /* gone */ } note(loser.id, `${loser.folder}: ${late}; next pass`); return late; }
+        renameSync(tmp, dst); err = null; break;
+      } catch (e) {
         err = e;
         try { unlinkSync(tmp); } catch { /* not created */ }
         // N9: the winner went away between the plan and the link: owed, not a failed pass
@@ -475,14 +528,21 @@ function run(group, o, rep) {
       }
     }
     if (err) return false;
-    const a = statSync(dst, { bigint: true }); const b = statSync(W.path, { bigint: true });
-    if (a.ino !== b.ino || a.dev !== b.dev) throw new Error(`re-link of ${dst} did not share the inode`);
+    const a = statSync(dst, { bigint: true });
+    if (`${a.dev}:${a.ino}` !== linked) throw new Error(`re-link of ${dst} did not share the inode`);
+    recordOwn(loser.id, linked, loser.folder);
     return true;
   }
 
   function addLink(W, F, id) {
     check('add', F);
-    try { linkSync(W.path, join(folderPath[F], W.name)); return true; } catch (e) {
+    if (dryRun) { rep.dry.push({ op: 'add', id, folder: F }); return true; }
+    const dst = join(folderPath[F], W.name);
+    try {
+      linkSync(W.path, dst);
+      try { const t = statSync(dst, { bigint: true }); recordOwn(id, `${t.dev}:${t.ino}`, F); } catch { /* recorded next time */ }
+      return true;
+    } catch (e) {
       if (e.code === 'EEXIST') { note(id, `${F}: name appeared meanwhile; next pass`); return false; }
       if (e.code === 'EXDEV') { note(id, `${F}: different volume; not linked`); return false; }
       throw e;

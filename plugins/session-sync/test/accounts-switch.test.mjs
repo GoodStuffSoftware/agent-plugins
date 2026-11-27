@@ -9,17 +9,18 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { readFileSync, existsSync, readdirSync, writeFileSync, lstatSync, unlinkSync, utimesSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, writeFileSync, lstatSync, unlinkSync, utimesSync, mkdirSync, rmSync } from 'node:fs';
 import { fullPass, livePass, owedWork } from '../lib/accounts/pass.mjs';
 import { runWaiter } from '../lib/accounts/waiter.mjs';
-import { summaryStats } from '../lib/accounts/rectify.mjs';
+import { summaryStats, rectify } from '../lib/accounts/rectify.mjs';
+import { pruneBackups } from '../lib/accounts/backup.mjs';
 import { loadState, saveState, emptyState, resetMutations, readJson } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey, listFolders, groupOf, pendingPairs, accountsOf } from '../lib/accounts/folders.mjs';
-import { G_SWITCH_MS } from '../lib/accounts/appstate.mjs';
+import { G_SWITCH_MS, nameIsHeld } from '../lib/accounts/appstate.mjs';
 import { accountsPushFilter } from '../lib/sync.mjs';
 import { collectStatus, formatStatus } from '../lib/accounts/report.mjs';
 import {
-  makeRoot, makeClock, addFolder, putRecord, recordName, inoOf, nlinkOf, uuid, readRecord, readJsonFile,
+  makeRoot, makeClock, addFolder, putRecord, recordName, inoOf, nlinkOf, uuid, readRecord, readJsonFile, treeHashes, setMtime,
 } from './fixtures/store.mjs';
 import { createSim } from './fixtures/appsim.mjs';
 
@@ -82,7 +83,7 @@ test('W1/W3 A to B: B is fresh before the switch; the flush race leaves a stale 
   assert.equal(w.state().fullPassOwed, true);
 
   // the conversation is continued from the stale copy
-  w.sim.saveFromMemory(id(1), { title: 'continued in B from the stale copy' });
+  w.sim.saveFromMemory(id(1), { title: 'continued in B from the stale copy', lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt });
   w.clock.tick(SW);
   const lp2 = await w.pass();
   assert.equal(lp2.ok, true);
@@ -111,7 +112,7 @@ test('W3 a conflict whose copies point at different transcripts (/clear) is flag
   await w.pass();
   w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] });
   await w.pass();                                          // the watcher sees the switch at once and notes what B loaded
-  w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1) });
+  w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1), lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt });
   w.clock.tick(SW);
   await w.pass();
   const c = w.state().conflicts[id(1)];
@@ -435,7 +436,7 @@ test('W3/W6 watcher: a continued stale copy is toasted once (only when the trans
   w.sim.start(A, w.fA, w.r.userData);
   const L = loop(w, {
     2: () => { w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] }); L.fire(w.r.userData, 'config.json'); },
-    4: () => { w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1) }); L.fire(w.fB.path, recordName(1)); },
+    4: () => { w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1), lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt }); L.fire(w.fB.path, recordName(1)); },
     24: () => { w.sim.stopApp(); },
     40: () => { w.sim.start(A, w.fA, w.r.userData); },
     44: 'stop',
@@ -686,9 +687,157 @@ test('N1 a conflict names every displaced copy, not only the last one met', asyn
   await w.pass();
   w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A flushed' } }] });
   await w.pass();
-  w.sim.saveFromMemory(id(1), { title: 'B continued', cliSessionId: uuid('f', 1) });
+  w.sim.saveFromMemory(id(1), { title: 'B continued', cliSessionId: uuid('f', 1), lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt });
   w.clock.tick(SW); await w.pass();
   const c = w.state().conflicts[id(1)];
   assert.ok(c);
   assert.ok(c.losers.includes(w.fA.key), 'A (the flushed copy) is named');
+});
+
+/* ---------------------------------------------------------------- 0.5.16: stale copies, own links, retention, dry run */
+
+test('0.5.16 a save the app makes at the switch (inside the cooling window) is drift, not a parked session: nothing is held', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A flushed at the switch' } }] });
+  await w.pass();
+  w.clock.tick(SW);
+  await w.pass();
+  assert.equal(w.state().held[id(1)], undefined, 'the switch-time save is frozen out of the hold');
+  const lp = await w.pass();
+  assert.equal(lp.rectify.owed.some((o) => o.id === id(1) && /held/.test(o.why)), false);
+});
+
+test('0.5.16 own links: the inode each link got is recorded in own-links.json (not state.json) and stays ours after the app saves', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  w.sim.save(w.fA, id(1), { title: 'A1 edit 1' });
+  await w.pass();
+  const ownFile = join(w.r.acc, 'own-links.json');
+  const own = readJsonFile(ownFile);
+  assert.ok(own.resetAt, 'the one-time reset is recorded');
+  assert.equal(own.links[id(1)].filter((x) => x.f === w.fB.key).pop().ino, w.ino(w.fB, 1));
+  assert.doesNotMatch(readFileSync(join(w.r.acc, 'state.json'), 'utf8'), /own-links|"links"/, 'state.json keeps its shape');
+  w.clock.tick(3000);
+  w.sim.save(w.fA, id(1), { title: 'A1 edit 2' });
+  await w.pass();
+  assert.equal(w.title(w.fB, 1), 'A1 edit 2');
+  assert.equal(w.ino(w.fA, 1), w.ino(w.fB, 1));
+  assert.equal(readJsonFile(ownFile).links[id(1)].find((x) => x.f === w.fB.key && x.ino === w.ino(w.fB, 1)) !== undefined, true, 'the new inode is recorded too');
+  assert.equal(w.backups().length, 0, 'an ancestor of the app\'s save needs no backup');
+  // the rule itself: a lone name with an inode that is not state.records[id].ino reads as a parked session unless the link is ours
+  const st = w.state();
+  st.signed = { unloadedAt: { [B]: 1 } };
+  st.records[id(1)].ino = 'x:y';
+  const e = { id: id(1), folder: w.fB.key, inoKey: w.ino(w.fB, 1), nlink: 1, mtimeMs: 1e13 };
+  assert.equal(nameIsHeld(st, e, 0), true);
+  assert.equal(nameIsHeld(st, e, 0, new Set([e.inoKey])), false);
+});
+
+test('0.5.16 a stale continuation is logged once per real conflict, not once per save', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] });
+  await w.pass();
+  const loaded = w.sim.memory.get(id(1)).lastActivityAt;
+  let seen = 0;
+  for (let i = 0; i < 3; i++) {
+    w.sim.saveFromMemory(id(1), { title: `continued ${i}`, lastActivityAt: loaded });
+    const lp = await w.pass();                              // A is still cooling: the newer copy stays displaced for all three passes
+    seen += (lp.rectify.conflicts ?? []).length;
+  }
+  assert.equal(seen, 1);
+  assert.equal(w.state().conflicts[id(1)].losers.length, 1);
+});
+
+test('0.5.16 a continuation that is not older than the other copy is no conflict', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] });
+  await w.pass();
+  w.sim.saveFromMemory(id(1), { title: 'continued, newer record time' });
+  w.clock.tick(SW); await w.pass();
+  assert.equal(w.state().conflicts?.[id(1)], undefined);
+  assert.equal(w.title(w.fA, 1), 'continued, newer record time');
+});
+
+test('0.5.16 a backup is written only when a copy that differs is really rewritten', async () => {
+  const w = await world();
+  const pA = join(w.fA.path, recordName(1)); const pB = join(w.fB.path, recordName(1));
+  const bytes = readFileSync(pA);
+  unlinkSync(pB); writeFileSync(pB, bytes);                 // same content, another inode
+  assert.equal((await fullPass(w.ctx, {})).ok, true);
+  assert.equal(w.ino(w.fA, 1), w.ino(w.fB, 1), 'unified');
+  assert.equal(w.backups().length, 0, 'identical content: nothing to back up');
+  unlinkSync(pB); writeFileSync(pB, JSON.stringify({ ...JSON.parse(bytes), title: 'older and different' }));
+  setMtime(pB, lstatSync(pA).mtimeMs - 5000);
+  assert.equal((await fullPass(w.ctx, {})).ok, true);
+  assert.equal(w.ino(w.fA, 1), w.ino(w.fB, 1));
+  assert.equal(w.backups('split-loser').filter((b) => b.name === recordName(1)).length, 1, 'a different copy is backed up once');
+});
+
+test('0.5.16 retention: a backup day is deleted only once it ended more than 14 days ago; its index lines go with it', () => {
+  const r = makeRoot('retain');
+  const now = new Date(2026, 10, 27, 23, 0).getTime();
+  r.ctx.now = () => now;
+  const root = join(r.acc, 'rectify-backups');
+  const days = ['2026-11-12', '2026-11-13', '2026-11-27'];
+  for (const d of days) { mkdirSync(join(root, d, 'x', 'y'), { recursive: true }); writeFileSync(join(root, d, 'x', 'y', 'f.json'), '{}'); }
+  mkdirSync(join(root, 'keepme'), { recursive: true });
+  const at = (y, m, d) => new Date(y, m - 1, d, 12).toISOString();
+  writeFileSync(join(root, 'index.jsonl'), [
+    { at: at(2026, 11, 12), name: 'old.json', sha256: 'a' }, { at: at(2026, 11, 13), name: 'edge.json', sha256: 'b' }, { at: at(2026, 11, 27), name: 'new.json', sha256: 'c' },
+  ].map((o) => JSON.stringify(o)).join('\n') + '\n');
+  // 2026-11-13 ended 13 d 23 h ago: kept. 2026-11-12 ended 14 d 23 h ago: deleted.
+  const out = pruneBackups(r.ctx, { days: 14 });
+  assert.deepEqual(out.pruned, ['2026-11-12']);
+  assert.equal(existsSync(join(root, '2026-11-12')), false);
+  assert.equal(existsSync(join(root, '2026-11-13', 'x', 'y', 'f.json')), true);
+  assert.equal(existsSync(join(root, '2026-11-27')), true);
+  assert.equal(existsSync(join(root, 'keepme')), true, 'only YYYY-MM-DD directories are touched');
+  const names = readFileSync(join(root, 'index.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).name);
+  assert.deepEqual(names, ['edge.json', 'new.json']);
+  assert.equal(pruneBackups(r.ctx, { days: 14 }).skipped, true, 'once a day');
+});
+
+test('0.5.16 case b: a name the old waiter linked (no inode record) is let go once; the reset does not repeat', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.sim.signIn(B, w.fB, { userData: w.r.userData, multi: true, running: [id(1)] });
+  await w.pass();
+  w.clock.tick(SW);
+  w.sim.tickParked({ title: 'parked write' });
+  await w.pass();
+  assert.ok(w.state().held[id(1)]?.[w.fA.key], 'held before the reset');
+  const ownFile = join(w.r.acc, 'own-links.json');
+  rmSync(ownFile);                                          // the state the old waiter left: no inode record, no reset marker
+  w.clock.tick(3000);
+  const lp = await w.pass();
+  assert.ok(lp.rectify.holdsReset >= 1);
+  assert.equal(w.state().held[id(1)], undefined, 'no longer held');
+  assert.ok(readJsonFile(ownFile).resetAt, 'the reset is recorded');
+  w.clock.tick(3000);
+  const lp2 = await w.pass();
+  assert.equal(lp2.rectify.holdsReset, undefined, 'it ran once');
+});
+
+test('0.5.16 dryRun writes nothing and lists what it would change', async () => {
+  const w = await world3();
+  const pA = join(w.fA.path, recordName(1));
+  unlinkSync(pA); putRecord(w.fA.path, 1, { title: 'drifted in A' }, w.clock.tick());
+  const st = loadState(w.ctx);
+  const group = groupOf(st, listFolders(w.ctx.store));
+  const before = treeHashes(w.r.root);
+  const inos = [w.fA, w.fB, w.fC].map((f) => w.ino(f, 1));
+  const stBefore = JSON.stringify(st);
+  const rep = rectify(group, { mode: 'full', ctx: w.ctx, state: st, dryRun: true });
+  assert.deepEqual(treeHashes(w.r.root), before, 'no file changed, none was added');
+  assert.deepEqual([w.fA, w.fB, w.fC].map((f) => w.ino(f, 1)), inos, 'no link changed');
+  assert.equal(JSON.stringify(st), stBefore, 'the state passed in is untouched');
+  assert.equal(rep.dry.filter((d) => d.op === 'relink' && d.id === id(1)).length, 2);
+  assert.equal(w.backups().length, 0);
 });

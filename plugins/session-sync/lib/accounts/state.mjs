@@ -210,3 +210,28 @@ export function tickMutation() {
   mutations++;
   if (mutations > Number(n)) throw new Error(`SESSION_SYNC_TEST_FAIL_AFTER: injected failure after ${n} mutations`);
 }
+
+/* ---- own-links.json: the inode each link of ours actually got (a side file; state.json keeps its shape) ---- */
+
+export const OWN_LINKS_MAX_AGE_MS = 6 * 3600 * 1000;
+export const OWN_LINKS_CAP = 8;
+
+/** {links: {id: [{ino, f, at}]}, resetAt?: iso}; entries older than 6 h are dropped on load. */
+export function loadOwnLinks(ctx) {
+  const o = readJson(accPath(ctx, 'own-links.json'), null);
+  const own = o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  const links = {};
+  const now = ctx.now();
+  for (const [id, list] of Object.entries(own.links && typeof own.links === 'object' ? own.links : {})) {
+    const keep = (Array.isArray(list) ? list : []).filter((x) => x && typeof x.ino === 'string' && now - (x.at || 0) < OWN_LINKS_MAX_AGE_MS).slice(-OWN_LINKS_CAP);
+    if (keep.length) links[id] = keep;
+  }
+  return { ...(own.resetAt ? { resetAt: own.resetAt } : {}), links };
+}
+
+/** The inode keys of recent links of ours for one id (a Set); with a folder, only the names we linked IN that folder (the winner's own name shares the inode but is not ours). */
+export function ownInos(own, id, folder = null) {
+  return new Set((own?.links?.[id] ?? []).filter((x) => folder === null || x.f === folder).map((x) => x.ino));
+}
+
+export function saveOwnLinks(ctx, own) { writeJsonAtomic(accPath(ctx, 'own-links.json'), own); }
