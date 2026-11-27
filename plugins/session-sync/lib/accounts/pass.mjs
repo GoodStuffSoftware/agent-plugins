@@ -163,7 +163,7 @@ export async function livePass(ctx, o = {}) {
       const roles = folderRoles(app, group, state, now, group.filter((f) => !(state.group ?? []).includes(f.key)).map((f) => f.key));
       // what the app most likely loaded when it opened the signed-in account's folders: a switch, or a new app run
       if (app.signedIn && (sw.changed || state.signed.snapRun !== app.startedAtMs)) {
-        state.loadedSnapshot = {};
+        state.loadedSnapshot = {}; state.loadedBase = {};
         for (const f of group) if (f.acct === app.signedIn) state.loadedSnapshot[f.key] = snapshotFolder(f.path);
         state.signed.snapRun = app.startedAtMs;
       }
@@ -256,7 +256,7 @@ export async function unlink(ctx, o = {}) {
       const yes = Object.entries(state.pairs ?? {}).filter(([, v]) => v?.answer === 'yes').map(([k]) => k);
       answerPairs(state, yes, 'no', 'unlink', ctx.now());
       state.linked = false; state.group = []; state.records = {}; state.tasksWritten = {};
-      state.live = { startedAtMs: 0, folders: [] }; state.loadedSnapshot = {}; state.conflicts = {};
+      state.live = { startedAtMs: 0, folders: [] }; state.loadedSnapshot = {}; state.loadedBase = {}; state.conflicts = {};
       state.fullPassOwed = false; state.lastUnlink = iso(ctx);
       journalClear(ctx);
       return { ...rep, ok: true };

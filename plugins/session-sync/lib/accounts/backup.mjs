@@ -45,18 +45,31 @@ const indexCache = new Map();   // index file -> Set("name\0sha")
 /** Drop cached index contents (rectify calls this at the start of every pass). */
 export function resetBackupCache() { indexCache.clear(); }
 
+/** The backup file an index line points at, relative to the rectify-backups root (lines before 0.5.16 carry no `dst`: derived from the day, folder and name). */
+function lineDst(o) {
+  if (typeof o.dst === 'string' && o.dst) return o.dst;
+  const t = Date.parse(o.at);
+  if (Number.isNaN(t) || typeof o.name !== 'string') return null;
+  return [localDay(t), ...String(o.folder ?? '_').split('/'), o.name].join('/');
+}
+
+/** key (name + sha) -> the backup files the index lists for it. */
 function indexSet(file) {
-  let set = indexCache.get(file);
-  if (set) return set;
-  set = new Set();
+  let map = indexCache.get(file);
+  if (map) return map;
+  map = new Map();
   try {
     for (const line of readFileSync(file, 'utf8').split('\n')) {
       if (!line.trim()) continue;
-      try { const o = JSON.parse(line); set.add(`${o.name}\0${o.sha256}`); } catch { /* skip a torn line */ }
+      try {
+        const o = JSON.parse(line);
+        const k = `${o.name}\0${o.sha256}`;
+        (map.get(k) ?? map.set(k, []).get(k)).push(lineDst(o));
+      } catch { /* skip a torn line */ }
     }
   } catch { /* no index yet */ }
-  indexCache.set(file, set);
-  return set;
+  indexCache.set(file, map);
+  return map;
 }
 
 /**
@@ -73,7 +86,9 @@ export function backupCopy(ctx, path, meta = {}) {
   const name = meta.name ?? path.split(/[\\/]/).pop();
   const index = accPath(ctx, 'rectify-backups', 'index.jsonl');
   const seen = indexSet(index);
-  if (seen.has(`${name}\0${sha}`)) return { skipped: true, sha256: sha };
+  // 0.5.16: skipped only while an indexed copy of it still exists on disk (a line whose file was deleted must not block a real backup)
+  const root = accPath(ctx, 'rectify-backups');
+  if ((seen.get(`${name}\0${sha}`) ?? []).some((rel) => rel && existsSync(join(root, ...rel.split('/'))))) return { skipped: true, sha256: sha };
   tickMutation();
   const st = statSync(path, { bigint: true });
   const dir = accPath(ctx, 'rectify-backups', localDay(ctx.now()), ...String(meta.folder ?? '_').split('/'));
@@ -85,16 +100,31 @@ export function backupCopy(ctx, path, meta = {}) {
   try { utimesSync(dst, mtimeMs / 1000, mtimeMs / 1000); } catch { /* keep the copy even if the stamp fails */ }
   appendFileSync(index, JSON.stringify({
     at: new Date(ctx.now()).toISOString(), reason: meta.reason ?? null, folder: meta.folder ?? null,
-    name, sha256: sha, size: buf.length, mtimeMs, ino: `${st.dev}:${st.ino}`,
+    name, sha256: sha, size: buf.length, mtimeMs, ino: `${st.dev}:${st.ino}`, dst: relative(root, dst).split(sep).join('/'),
   }) + '\n');
-  seen.add(`${name}\0${sha}`);
+  const k = `${name}\0${sha}`;
+  (seen.get(k) ?? seen.set(k, []).get(k)).push(relative(root, dst).split(sep).join('/'));
   return { skipped: false, dst, sha256: sha };
 }
 
+/** The reasons of the backups a rectify pass makes of a displaced conversation copy; only these are ever pruned. */
+export const PRUNABLE_REASONS = new Set(['split-loser', 'unlink-nonhome', 'tombstone-resurrect']);
+
+function removeEmptyDirs(dir) {
+  let left = 0;
+  for (const d of readdirSync(dir, { withFileTypes: true })) {
+    if (d.isDirectory() && removeEmptyDirs(join(dir, d.name))) continue;
+    left++;
+  }
+  if (left) return false;
+  try { rmSync(dir, { recursive: false }); return true; } catch { return false; }
+}
+
 /**
- * Retention: delete the rectify-backups day directories (YYYY-MM-DD, local day) whose WHOLE day ended more than `days` days ago, and drop
- * their lines from index.jsonl (the index dedupes by name + sha; a stale line would block a fresh backup of the same copy). Nothing else
- * is touched. Runs at most once a day (stamp file), only when the directory exists.
+ * Retention: delete the rectify backups of conversation copies (reasons in PRUNABLE_REASONS; never the delete, memory, tasks or settings
+ * backups) whose WHOLE day ended more than `days` days ago, and their lines in index.jsonl. The index is rewritten atomically FIRST (the
+ * lines of the files about to go dropped), then the files are deleted: a crash in between leaves an orphan file, never an index line for a
+ * file that is gone. Day directories left empty are removed. Runs at most once a day (stamp file), only when the directory exists.
  * @returns {{pruned:string[], skipped?:boolean}}
  */
 export function pruneBackups(ctx, { days = 14, force = false } = {}) {
@@ -106,30 +136,36 @@ export function pruneBackups(ctx, { days = 14, force = false } = {}) {
     const last = Number(readJson(stamp, 0)) || 0;
     if (now - last < 24 * 3600 * 1000 && now >= last) return { pruned: [], skipped: true };
   }
+  const aged = (day) => {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+    return !!m && now - new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1).getTime() > days * 24 * 3600 * 1000;
+  };
   const gone = new Set();
-  for (const d of readdirSync(root, { withFileTypes: true })) {
-    const m = d.isDirectory() && /^(\d{4})-(\d{2})-(\d{2})$/.exec(d.name);
-    if (!m) continue;
-    const dayEnd = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + 1).getTime();
-    if (now - dayEnd > days * 24 * 3600 * 1000) {
-      try { rmSync(join(root, d.name), { recursive: true, force: true }); gone.add(d.name); } catch { /* left for the next run */ }
+  const files = [];
+  const index = join(root, 'index.jsonl');
+  if (existsSync(index)) {
+    const keep = [];
+    for (const line of readFileSync(index, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      let drop = false;
+      try {
+        const o = JSON.parse(line);
+        const rel = lineDst(o);
+        const day = rel ? rel.split('/')[0] : null;
+        if (day && aged(day) && PRUNABLE_REASONS.has(o.reason)) { drop = true; files.push(rel); gone.add(day); }
+      } catch { /* torn line: keep */ }
+      if (!drop) keep.push(line);
     }
-  }
-  if (gone.size) {
-    const index = join(root, 'index.jsonl');
-    if (existsSync(index)) {
-      const keep = [];
-      for (const line of readFileSync(index, 'utf8').split('\n')) {
-        if (!line.trim()) continue;
-        let drop = false;
-        try { const t = Date.parse(JSON.parse(line).at); drop = !Number.isNaN(t) && gone.has(localDay(t)); } catch { /* torn line: keep */ }
-        if (!drop) keep.push(line);
-      }
+    if (files.length) {
       const tmp = `${index}.${process.pid}.tmp`;
       writeFileSync(tmp, keep.length ? `${keep.join('\n')}\n` : '');
-      renameSync(tmp, index);
+      renameSync(tmp, index);   // a failure here throws before anything is deleted
+      indexCache.clear();
+      for (const rel of files) { try { rmSync(join(root, ...rel.split('/')), { force: true }); } catch { /* an orphan file, no index line */ } }
     }
-    indexCache.clear();
+  }
+  for (const d of readdirSync(root, { withFileTypes: true })) {
+    if (d.isDirectory() && aged(d.name)) { try { removeEmptyDirs(join(root, d.name)); } catch { /* left for the next run */ } }
   }
   writeFileSync(stamp, String(now));
   return { pruned: [...gone].sort() };

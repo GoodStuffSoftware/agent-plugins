@@ -28,6 +28,7 @@ import { pidAlive } from '../lock.mjs';
 import { accPath, readJson, writeJsonAtomic, loadState, saveState, withAccountsLock } from './state.mjs';
 import { createStopWatch, coolingEndsAt, readSignedIn, appState } from './appstate.mjs';
 import { listFolders } from './folders.mjs';
+import { setOldWaiterGate } from './rectify.mjs';
 import { fullPass, livePass, link, unlink, owedWork } from './pass.mjs';
 import { PLUGIN_VERSION, codeHash, compareVersions } from './version.mjs';
 import { verifyProcess, WAITER_MARKER } from './procid.mjs';
@@ -188,6 +189,13 @@ export function replaceOldWaiter(ctx, deps = {}) {
   drop();
   return { replaced: true, pid: st.pid, version, hash: mine?.hash ?? null, reasons: st.reasons };
 }
+
+// 0.5.16: the one-time hold reset (rectify.mjs) waits until no older-version waiter is alive: replaceOldWaiter ended it or found none
+// (a current or newer waiter is no older one). An older waiter that is unverified, busy or will not die defers the reset to a later pass.
+setOldWaiterGate((ctx) => {
+  const r = replaceOldWaiter(ctx);
+  return r.replaced === true || ['no-waiter', 'current', 'newer'].includes(r.reason);
+});
 
 /**
  * Is this claim held by a waiter that is really running? A live pid is not enough: after a reboot or a kill the pid

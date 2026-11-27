@@ -12,8 +12,8 @@ import { join } from 'node:path';
 import { readFileSync, existsSync, readdirSync, writeFileSync, lstatSync, unlinkSync, utimesSync, mkdirSync, rmSync } from 'node:fs';
 import { fullPass, livePass, owedWork } from '../lib/accounts/pass.mjs';
 import { runWaiter } from '../lib/accounts/waiter.mjs';
-import { summaryStats, rectify } from '../lib/accounts/rectify.mjs';
-import { pruneBackups } from '../lib/accounts/backup.mjs';
+import { summaryStats, rectify, setOldWaiterGate } from '../lib/accounts/rectify.mjs';
+import { pruneBackups, backupCopy, resetBackupCache } from '../lib/accounts/backup.mjs';
 import { loadState, saveState, emptyState, resetMutations, readJson } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey, listFolders, groupOf, pendingPairs, accountsOf } from '../lib/accounts/folders.mjs';
 import { G_SWITCH_MS, nameIsHeld } from '../lib/accounts/appstate.mjs';
@@ -83,7 +83,7 @@ test('W1/W3 A to B: B is fresh before the switch; the flush race leaves a stale 
   assert.equal(w.state().fullPassOwed, true);
 
   // the conversation is continued from the stale copy
-  w.sim.saveFromMemory(id(1), { title: 'continued in B from the stale copy', lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt });
+  w.sim.saveFromMemory(id(1), { title: 'continued in B from the stale copy' });
   w.clock.tick(SW);
   const lp2 = await w.pass();
   assert.equal(lp2.ok, true);
@@ -112,7 +112,7 @@ test('W3 a conflict whose copies point at different transcripts (/clear) is flag
   await w.pass();
   w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] });
   await w.pass();                                          // the watcher sees the switch at once and notes what B loaded
-  w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1), lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt });
+  w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1) });
   w.clock.tick(SW);
   await w.pass();
   const c = w.state().conflicts[id(1)];
@@ -436,7 +436,7 @@ test('W3/W6 watcher: a continued stale copy is toasted once (only when the trans
   w.sim.start(A, w.fA, w.r.userData);
   const L = loop(w, {
     2: () => { w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] }); L.fire(w.r.userData, 'config.json'); },
-    4: () => { w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1), lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt }); L.fire(w.fB.path, recordName(1)); },
+    4: () => { w.sim.saveFromMemory(id(1), { title: 'B1 cleared and continued', cliSessionId: uuid('f', 1) }); L.fire(w.fB.path, recordName(1)); },
     24: () => { w.sim.stopApp(); },
     40: () => { w.sim.start(A, w.fA, w.r.userData); },
     44: 'stop',
@@ -687,7 +687,7 @@ test('N1 a conflict names every displaced copy, not only the last one met', asyn
   await w.pass();
   w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A flushed' } }] });
   await w.pass();
-  w.sim.saveFromMemory(id(1), { title: 'B continued', cliSessionId: uuid('f', 1), lastActivityAt: w.sim.memory.get(id(1)).lastActivityAt });
+  w.sim.saveFromMemory(id(1), { title: 'B continued', cliSessionId: uuid('f', 1) });
   w.clock.tick(SW); await w.pass();
   const c = w.state().conflicts[id(1)];
   assert.ok(c);
@@ -716,7 +716,8 @@ test('0.5.16 own links: the inode each link got is recorded in own-links.json (n
   await w.pass();
   const ownFile = join(w.r.acc, 'own-links.json');
   const own = readJsonFile(ownFile);
-  assert.ok(own.resetAt, 'the one-time reset is recorded');
+  assert.ok(existsSync(join(w.r.acc, 'holds-reset.json')), 'the one-time reset is recorded in its own file');
+  assert.equal(own.resetAt, undefined);
   assert.equal(own.links[id(1)].filter((x) => x.f === w.fB.key).pop().ino, w.ino(w.fB, 1));
   assert.doesNotMatch(readFileSync(join(w.r.acc, 'state.json'), 'utf8'), /own-links|"links"/, 'state.json keeps its shape');
   w.clock.tick(3000);
@@ -752,16 +753,34 @@ test('0.5.16 a stale continuation is logged once per real conflict, not once per
   assert.equal(w.state().conflicts[id(1)].losers.length, 1);
 });
 
-test('0.5.16 a continuation that is not older than the other copy is no conflict', async () => {
+test('0.5.16 an ordinary save of an up-to-date conversation is no conflict (the other copy has nothing the loaded one lacks)', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.sim.signIn(B, w.fB, { userData: w.r.userData });          // no flush: B loaded the same record A holds
+  await w.pass();
+  w.sim.saveFromMemory(id(1), { title: 'saved in B, up to date' });
+  w.clock.tick(SW); await w.pass();
+  assert.equal(w.state().conflicts?.[id(1)], undefined);
+  assert.equal(w.title(w.fA, 1), 'saved in B, up to date');
+});
+
+test('0.5.16 a stale continuation whose record time moved to now is still a conflict (judged against what the winner was loaded as), and a parked copy that keeps saving reports once', async () => {
   const w = await world();
   w.sim.start(A, w.fA, w.r.userData);
   await w.pass();
   w.sim.signIn(B, w.fB, { userData: w.r.userData, flush: [{ id: id(1), patch: { title: 'A1 flushed' } }] });
   await w.pass();
-  w.sim.saveFromMemory(id(1), { title: 'continued, newer record time' });
-  w.clock.tick(SW); await w.pass();
-  assert.equal(w.state().conflicts?.[id(1)], undefined);
-  assert.equal(w.title(w.fA, 1), 'continued, newer record time');
+  assert.ok(w.state().loadedBase?.[w.fB.key]?.[id(1)], 'the loaded record is remembered as a base');
+  w.sim.saveFromMemory(id(1), { title: 'continued from the stale copy' });   // its lastActivityAt is now
+  w.clock.tick(SW);
+  let seen = (await w.pass()).rectify.conflicts?.length ?? 0;
+  assert.equal(seen, 1);
+  for (let i = 0; i < 3; i++) {
+    w.sim.save(w.fA, id(1), { title: `parked ${i}`, lastActivityAt: new Date(Date.now() + 1e9 + i * 1000).toISOString() });
+    seen += (await w.pass()).rectify.conflicts?.length ?? 0;
+  }
+  assert.equal(seen, 1, 'the same other copy is reported once per episode');
 });
 
 test('0.5.16 a backup is written only when a copy that differs is really rewritten', async () => {
@@ -779,31 +798,95 @@ test('0.5.16 a backup is written only when a copy that differs is really rewritt
   assert.equal(w.backups('split-loser').filter((b) => b.name === recordName(1)).length, 1, 'a different copy is backed up once');
 });
 
-test('0.5.16 retention: a backup day is deleted only once it ended more than 14 days ago; its index lines go with it', () => {
+test('0.5.16 retention: only the conversation-copy backups of a day that ended more than 14 days ago go, with their index lines; delete, memory, tasks and settings backups stay', () => {
   const r = makeRoot('retain');
   const now = new Date(2026, 10, 27, 23, 0).getTime();
   r.ctx.now = () => now;
   const root = join(r.acc, 'rectify-backups');
-  const days = ['2026-11-12', '2026-11-13', '2026-11-27'];
-  for (const d of days) { mkdirSync(join(root, d, 'x', 'y'), { recursive: true }); writeFileSync(join(root, d, 'x', 'y', 'f.json'), '{}'); }
+  const put = (rel, text = '{}') => { mkdirSync(join(root, ...rel.split('/').slice(0, -1)), { recursive: true }); writeFileSync(join(root, ...rel.split('/')), text); };
+  put('2026-11-12/x/y/old.json'); put('2026-11-12/x/y/deleted.json'); put('2026-11-12/paths/settings.jsonl');
+  put('2026-11-13/x/y/edge.json'); put('2026-11-27/x/y/new.json');
   mkdirSync(join(root, 'keepme'), { recursive: true });
   const at = (y, m, d) => new Date(y, m - 1, d, 12).toISOString();
-  writeFileSync(join(root, 'index.jsonl'), [
-    { at: at(2026, 11, 12), name: 'old.json', sha256: 'a' }, { at: at(2026, 11, 13), name: 'edge.json', sha256: 'b' }, { at: at(2026, 11, 27), name: 'new.json', sha256: 'c' },
-  ].map((o) => JSON.stringify(o)).join('\n') + '\n');
-  // 2026-11-13 ended 13 d 23 h ago: kept. 2026-11-12 ended 14 d 23 h ago: deleted.
+  const lines = [
+    { at: at(2026, 11, 12), reason: 'split-loser', folder: 'x/y', name: 'old.json', sha256: 'a', dst: '2026-11-12/x/y/old.json' },
+    { at: at(2026, 11, 12), reason: 'delete', folder: 'x/y', name: 'deleted.json', sha256: 'd', dst: '2026-11-12/x/y/deleted.json' },
+    { at: at(2026, 11, 13), reason: 'split-loser', folder: 'x/y', name: 'edge.json', sha256: 'b', dst: '2026-11-13/x/y/edge.json' },
+    { at: at(2026, 11, 27), reason: 'split-loser', folder: 'x/y', name: 'new.json', sha256: 'c', dst: '2026-11-27/x/y/new.json' },
+  ];
+  writeFileSync(join(root, 'index.jsonl'), lines.map((o) => JSON.stringify(o)).join('\n') + '\n');
+  // 2026-11-13 ended 13 d 23 h ago: kept. 2026-11-12 ended 14 d 23 h ago: its split-loser copy goes.
   const out = pruneBackups(r.ctx, { days: 14 });
   assert.deepEqual(out.pruned, ['2026-11-12']);
-  assert.equal(existsSync(join(root, '2026-11-12')), false);
-  assert.equal(existsSync(join(root, '2026-11-13', 'x', 'y', 'f.json')), true);
+  assert.equal(existsSync(join(root, '2026-11-12/x/y/old.json')), false);
+  assert.equal(existsSync(join(root, '2026-11-12/x/y/deleted.json')), true, 'a delete backup is never pruned');
+  assert.equal(existsSync(join(root, '2026-11-12/paths/settings.jsonl')), true, 'a settings backup is never pruned');
+  assert.equal(existsSync(join(root, '2026-11-13/x/y/edge.json')), true);
   assert.equal(existsSync(join(root, '2026-11-27')), true);
   assert.equal(existsSync(join(root, 'keepme')), true, 'only YYYY-MM-DD directories are touched');
   const names = readFileSync(join(root, 'index.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).name);
-  assert.deepEqual(names, ['edge.json', 'new.json']);
+  assert.deepEqual(names, ['deleted.json', 'edge.json', 'new.json']);
   assert.equal(pruneBackups(r.ctx, { days: 14 }).skipped, true, 'once a day');
 });
 
-test('0.5.16 case b: a name the old waiter linked (no inode record) is let go once; the reset does not repeat', async () => {
+test('0.5.16 a pass that throws still saves the own-link records it made', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.clock.tick(3000);
+  w.sim.save(w.fA, id(1), { title: 'edit 1' }); w.sim.save(w.fA, id(2), { title: 'edit 2' });
+  const ownFile = join(w.r.acc, 'own-links.json');
+  rmSync(ownFile);
+  process.env.SESSION_SYNC_TEST_FAIL_AFTER = '1';           // the first re-link goes through, the second mutation throws
+  resetMutations();
+  try { await w.pass().catch(() => {}); } finally { delete process.env.SESSION_SYNC_TEST_FAIL_AFTER; resetMutations(); }
+  assert.ok(existsSync(ownFile), 'the record of the link that did happen is on disk');
+  const own = readJsonFile(ownFile);
+  assert.ok(Object.values(own.links).flat().some((x) => x.f === w.fB.key));
+});
+
+test('0.5.16 a link is superseded only when it came from the winner\'s own folder', async () => {
+  const w = await world();
+  w.sim.start(A, w.fA, w.r.userData);
+  await w.pass();
+  w.clock.tick(3000);
+  w.sim.save(w.fA, id(1), { title: 'A1 edit' });
+  await w.pass();
+  const own = readJsonFile(join(w.r.acc, 'own-links.json'));
+  const rec = own.links[id(1)].filter((x) => x.f === w.fB.key).pop();
+  assert.equal(rec.w, w.fA.key, 'the record names the folder of the winner it was linked from');
+});
+
+test('0.5.16 an index line never outlives its backup file: backupCopy backs up again when the indexed file is gone', () => {
+  const r = makeRoot('stale-index');
+  r.ctx.now = () => new Date(2026, 10, 27, 12, 0).getTime();
+  const src = join(r.root, 'src.json'); writeFileSync(src, '{"a":1}');
+  const first = backupCopy(r.ctx, src, { reason: 'split-loser', folder: 'x/y', name: 'n.json' });
+  assert.equal(first.skipped, false);
+  resetBackupCache();
+  assert.equal(backupCopy(r.ctx, src, { reason: 'split-loser', folder: 'x/y', name: 'n.json' }).skipped, true, 'same copy, file still there');
+  rmSync(first.dst);                                        // the file is gone but its index line is not (a crash, a manual clean-up)
+  resetBackupCache();
+  const again = backupCopy(r.ctx, src, { reason: 'split-loser', folder: 'x/y', name: 'n.json' });
+  assert.equal(again.skipped, false, 'a real backup is not skipped for a stale line');
+  assert.equal(existsSync(again.dst), true);
+});
+
+test('0.5.16 retention writes the index first: a file that cannot be deleted leaves an orphan, never an index line for a missing file', () => {
+  const r = makeRoot('prune-order');
+  const now = new Date(2026, 10, 27, 23, 0).getTime();
+  r.ctx.now = () => now;
+  const root = join(r.acc, 'rectify-backups');
+  mkdirSync(join(root, '2026-11-01/x'), { recursive: true });
+  writeFileSync(join(root, '2026-11-01/x/o.json'), '{}');
+  writeFileSync(join(root, 'index.jsonl'), JSON.stringify({ at: new Date(2026, 10, 1, 12).toISOString(), reason: 'split-loser', name: 'o.json', sha256: 'a', dst: '2026-11-01/x/o.json' }) + '\n');
+  mkdirSync(`${join(root, 'index.jsonl')}.${process.pid}.tmp`);   // the index cannot be rewritten
+  assert.throws(() => pruneBackups(r.ctx, { days: 14 }));
+  assert.equal(existsSync(join(root, '2026-11-01/x/o.json')), true, 'nothing is deleted when the index could not be rewritten');
+  assert.match(readFileSync(join(root, 'index.jsonl'), 'utf8'), /o\.json/);
+});
+
+async function caseBWorld() {
   const w = await world();
   w.sim.start(A, w.fA, w.r.userData);
   await w.pass();
@@ -813,16 +896,46 @@ test('0.5.16 case b: a name the old waiter linked (no inode record) is let go on
   w.sim.tickParked({ title: 'parked write' });
   await w.pass();
   assert.ok(w.state().held[id(1)]?.[w.fA.key], 'held before the reset');
-  const ownFile = join(w.r.acc, 'own-links.json');
-  rmSync(ownFile);                                          // the state the old waiter left: no inode record, no reset marker
+  rmSync(join(w.r.acc, 'own-links.json'));                  // the state the old waiter left: no inode record
+  rmSync(join(w.r.acc, 'holds-reset.json'));                // and no reset marker
   w.clock.tick(3000);
+  return w;
+}
+
+test('0.5.16 case b: a name the old waiter linked (no inode record) is let go once; a lost own-links.json never repeats the reset', async () => {
+  const w = await caseBWorld();
   const lp = await w.pass();
   assert.ok(lp.rectify.holdsReset >= 1);
   assert.equal(w.state().held[id(1)], undefined, 'no longer held');
-  assert.ok(readJsonFile(ownFile).resetAt, 'the reset is recorded');
+  assert.ok(existsSync(join(w.r.acc, 'holds-reset.json')), 'the done-marker is its own file');
+  w.clock.tick(3000);
+  assert.equal((await w.pass()).rectify.holdsReset, undefined, 'it ran once');
+  rmSync(join(w.r.acc, 'own-links.json'));
+  writeFileSync(join(w.r.acc, 'own-links.json'), '{ corrupt');
+  w.clock.tick(3000);
+  assert.equal((await w.pass()).rectify.holdsReset, undefined, 'a corrupt own-links.json does not repeat it');
+});
+
+test('0.5.16 case b: the reset waits while an older waiter is alive, and a done-marker that cannot be written drops no hold', async () => {
+  const w = await caseBWorld();
+  setOldWaiterGate(() => false);
+  try {
+    const lp = await w.pass();
+    assert.equal(lp.rectify.holdsReset, undefined);
+    assert.match(lp.rectify.holdsResetDeferred, /older waiter/);
+    assert.ok(w.state().held[id(1)]?.[w.fA.key], 'the hold is kept');
+    assert.equal(existsSync(join(w.r.acc, 'holds-reset.json')), false, 'no marker yet');
+  } finally { setOldWaiterGate(() => true); }
+  const blocker = join(w.r.acc, `holds-reset.json.${process.pid}.tmp`);
+  mkdirSync(blocker);                                       // the marker cannot be written
   w.clock.tick(3000);
   const lp2 = await w.pass();
-  assert.equal(lp2.rectify.holdsReset, undefined, 'it ran once');
+  assert.equal(lp2.rectify.holdsReset, undefined);
+  assert.match(lp2.rectify.holdsResetDeferred, /marker/);
+  assert.ok(w.state().held[id(1)]?.[w.fA.key], 'still held: nothing was dropped');
+  rmSync(blocker, { recursive: true });
+  w.clock.tick(3000);
+  assert.ok((await w.pass()).rectify.holdsReset >= 1, 'the later pass resets');
 });
 
 test('0.5.16 dryRun writes nothing and lists what it would change', async () => {

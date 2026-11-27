@@ -28,7 +28,7 @@ import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { RECORD, TOMB, OURTMP, homeOf } from './folders.mjs';
 import { backupCopy, resetBackupCache, sha256File, pruneBackups } from './backup.mjs';
-import { accPath, readJson, tickMutation, sleepSync, LOCK_TTL_MS, loadOwnLinks, ownInos, saveOwnLinks, OWN_LINKS_CAP } from './state.mjs';
+import { accPath, readJson, tickMutation, sleepSync, LOCK_TTL_MS, loadOwnLinks, ownInos, saveOwnLinks, OWN_LINKS_CAP, holdsResetDone, markHoldsReset } from './state.mjs';
 import { AppRunningError, nameIsHeld } from './appstate.mjs';
 import { acquireLock, pidAlive } from '../lock.mjs';
 
@@ -275,6 +275,13 @@ export function rectify(group, opts) {
   finally { lock?.release(); }
 }
 
+/**
+ * The one-time hold reset waits for this: true when no OLDER-version waiter is alive (replaceOldWaiter ended it, or found none). Wired by
+ * waiter.mjs (rectify.mjs cannot import it: pass.mjs and waiter.mjs import each other's neighbours); unwired it allows the reset.
+ */
+let oldWaiterGate = () => true;
+export function setOldWaiterGate(fn) { oldWaiterGate = typeof fn === 'function' ? fn : () => true; }
+
 function run(group, o, rep) {
   const { mode, ctx, state, guard, remoteList, live, roles, dryRun } = o;
   resetBackupCache();
@@ -282,20 +289,41 @@ function run(group, o, rep) {
   // 0.5.16: the inode each link of ours actually got (side file; see state.mjs). Kept apart from state.json.
   const own = loadOwnLinks(ctx);
   const ownOf = (id, folder = null) => ownInos(own, id, folder);
-  const recordOwn = (id, ino, f) => {
+  // `w`: the folder of the winner the link was made from (a copy of a link from that folder is what a later save there supersedes)
+  const recordOwn = (id, ino, f, w = null) => {
     const list = (own.links[id] ||= []).filter((x) => !(x.ino === ino && x.f === f));
-    list.push({ ino, f, at: ctx.now() });
+    list.push({ ino, f, w, at: ctx.now() });
     own.links[id] = list.slice(-OWN_LINKS_CAP);
   };
   // the one-time reset (case b): copies the old waiter linked have no inode record and read as a parked session's. The first pass of
   // this version drops every hold and holds nothing; from the next pass on, our links are recorded and a real parked session is held again.
-  const resetHolds = !own.resetAt;
+  // 0.5.16: it runs only when no older-version waiter is alive (it would re-hold, unrecorded, right after) and only once its done-marker
+  // (holds-reset.json, atomic, its own file) is written: before any hold is dropped, and no reset when that write fails.
+  let resetHolds = mode === 'targeted' && !holdsResetDone(ctx);
+  if (resetHolds && !dryRun) {
+    let clear = true;
+    try { clear = oldWaiterGate(ctx) !== false; } catch { clear = false; }
+    if (!clear) { resetHolds = false; rep.holdsResetDeferred = 'an older waiter is alive'; }
+    else { try { markHoldsReset(ctx); } catch { resetHolds = false; rep.holdsResetDeferred = 'the done-marker could not be written'; } }
+  }
   const groupKeys = group.map((f) => f.key);
   const folderPath = Object.fromEntries(group.map((f) => [f.key, f.path]));
   const inv = inventory(group);
   const summarize = makeSummarizer();
   const plans = classify(inv, state, { groupKeys, remoteList, summarize });
   state.records ||= {};
+  // 0.5.16: what the app loaded, as its record read then (la, turns): the base a continuation is judged against (see noteConflict).
+  // Taken on the first pass after the snapshot, while the loaded folder still holds the snapshot's inode.
+  if (mode === 'targeted' && !dryRun) {
+    const lb = (state.loadedBase ||= {});
+    for (const L of roles.loaded) {
+      for (const [sid, sino] of Object.entries(state.loadedSnapshot?.[L] ?? {})) {
+        if (lb[L]?.[sid]) continue;
+        const e = inv.byId.get(sid)?.get(L) ?? [...inv.byId.entries()].find(([k]) => k.toLowerCase() === sid)?.[1]?.get(L);
+        if (e && e.inoKey === sino) { const s = summarize(e); if (s.ok) (lb[L] ||= {})[sid] = { la: s.la, turns: s.turns }; }
+      }
+    }
+  }
 
   // targeted: why a mutation other than ADD may not touch this name now (null = it may)
   // A name that is not the inode a pass of ours left there, alone, and written since the folder stopped being loaded (an unload seen
@@ -389,14 +417,13 @@ function run(group, o, rep) {
       state.fullPassOwed = true;
       note('pass', e.message);
     } else throw e;
+  } finally {
+    // 0.5.16: a pass that throws (a link that did not share the inode, an injected failure) still keeps the records it made
+    if (!dryRun) { try { saveOwnLinks(ctx, own); } catch { /* the record is advisory; the next pass writes it again */ } }
   }
 
   if (mode === 'full' && !rep.aborted) { state.held = {}; state.heldRun = 0; }   // the app is stopped: no parked session is left
   state.lastRectify = new Date(ctx.now()).toISOString();
-  if (!dryRun) {
-    if (!rep.aborted && mode !== 'live' && !own.resetAt) own.resetAt = new Date(ctx.now()).toISOString();
-    try { saveOwnLinks(ctx, own); } catch { /* the record is advisory; the next pass writes it again */ }
-  }
   return rep;
 
   /* ---------------- per record ---------------- */
@@ -433,9 +460,10 @@ function run(group, o, rep) {
     // or a parked session), is an ancestor of that save: it needs no backup. Only a copy from another history (a stale continuation,
     // a switch flush, field drift) is backed up.
     const prevWin = state.records?.[plan.id]?.win;
-    // 0.5.16: the loser is an inode a link of ours produced (the recorded inode, not only the last winner's) in the winner's own folder's lineage
-    const ownIds = (ino, F) => ownOf(plan.id, F).has(ino);
-    const supersedes = (loser) => mode === 'targeted' && !!prevWin && (ownIds(loser.inoKey, loser.folder) || prevWin.ino === loser.inoKey) && prevWin.f === plan.W.folder
+    // 0.5.16: the loser is the inode a link of ours put in ITS folder (own-links) from the very inode the last pass recorded for the
+    // winner's folder (prevWin), not any inode of ours; or the last winner's inode itself
+    const supersedes = (loser) => mode === 'targeted' && !!prevWin && prevWin.f === plan.W.folder
+      && (prevWin.ino === loser.inoKey || (own.links[plan.id] ?? []).some((x) => x.f === loser.folder && x.ino === loser.inoKey && x.w === plan.W.folder))
       && (roles.loaded.has(plan.W.folder) || isHeld(plan.W));
     for (const loser of plan.losers) {
       if (mode === 'live' && live.has(loser.folder)) { owe(plan.id, 'split-loser-live', loser.folder); continue; }
@@ -470,20 +498,23 @@ function run(group, o, rep) {
       const snap = state.loadedSnapshot?.[L]?.[plan.id.toLowerCase()];
       const mine = plan.entries.get(L);
       if (!snap || !mine || mine.inoKey === snap || mine.inoKey !== plan.W.inoKey) continue;
-      // 0.5.16: a conflict only when another copy is REALLY newer than the winner (a later record timestamp, or the same one and more
-      // completed turns) and its content differs; a copy that is merely a different inode, or an older save, is not one.
-      const ws = plan.summary;
+      // 0.5.16: a conflict only when another copy holds work the winner was continued FROM lacks: a later record timestamp, or the same
+      // one and more completed turns, than the copy the app loaded (loadedBase, read when the folder was loaded; the winner's own time
+      // has moved to now and proves nothing), and its content differs from the winner's. A copy that is an older save, or an ancestor
+      // of the loaded one (an ordinary save of an up-to-date conversation), is not one. Without a base the winner's record stands in.
+      const base = state.loadedBase?.[L]?.[plan.id.toLowerCase()] ?? plan.summary;
       const reallyNewer = (l) => {
         const ls = summarize(l);
-        if (!(ls.la > ws.la || (ls.la === ws.la && ls.turns > ws.turns))) return false;
+        if (!(ls.la > base.la || (ls.la === base.la && ls.turns > base.turns))) return false;
         try { return sha256File(l.path) !== sha256File(plan.W.path); } catch { return false; }
       };
       const displaced = plan.losers.filter((loser) => loser.folder !== L && loser.inoKey !== snap && reallyNewer(loser));
       if (!displaced.length) continue;
       state.conflicts ||= {};
       const prev = state.conflicts[plan.id];
-      // deduped on the set of other copies (the winner's inode changes with every save and is not part of the key)
-      if (prev && displaced.every((l) => (prev.loserInos ?? [prev.loserIno]).includes(l.inoKey))) continue;
+      // deduped on the identity of the other copies, folder and id (every save gives the winner AND a parked copy a new inode, so an
+      // inode is no identity): one report per episode, which ends when the conflict list is cleared (a switch or a new app run)
+      if (prev && displaced.every((l) => (prev.losers ?? [prev.loser]).includes(l.folder))) continue;
       // N1: one entry names every displaced copy (the first is `loser`, all are in `losers`), not only the last one met
       const c = {
         at: new Date(ctx.now()).toISOString(), winner: L, loser: displaced[0].folder, losers: displaced.map((l) => l.folder),
@@ -530,7 +561,7 @@ function run(group, o, rep) {
     if (err) return false;
     const a = statSync(dst, { bigint: true });
     if (`${a.dev}:${a.ino}` !== linked) throw new Error(`re-link of ${dst} did not share the inode`);
-    recordOwn(loser.id, linked, loser.folder);
+    recordOwn(loser.id, linked, loser.folder, W.folder);
     return true;
   }
 
@@ -540,7 +571,7 @@ function run(group, o, rep) {
     const dst = join(folderPath[F], W.name);
     try {
       linkSync(W.path, dst);
-      try { const t = statSync(dst, { bigint: true }); recordOwn(id, `${t.dev}:${t.ino}`, F); } catch { /* recorded next time */ }
+      try { const t = statSync(dst, { bigint: true }); recordOwn(id, `${t.dev}:${t.ino}`, F, W.folder); } catch { /* recorded next time */ }
       return true;
     } catch (e) {
       if (e.code === 'EEXIST') { note(id, `${F}: name appeared meanwhile; next pass`); return false; }

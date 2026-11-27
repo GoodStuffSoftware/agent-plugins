@@ -216,7 +216,7 @@ export function tickMutation() {
 export const OWN_LINKS_MAX_AGE_MS = 6 * 3600 * 1000;
 export const OWN_LINKS_CAP = 8;
 
-/** {links: {id: [{ino, f, at}]}, resetAt?: iso}; entries older than 6 h are dropped on load. */
+/** {links: {id: [{ino, f, at}]}}; entries older than 6 h are dropped on load. The one-time hold reset marker is its own file (holds-reset.json). */
 export function loadOwnLinks(ctx) {
   const o = readJson(accPath(ctx, 'own-links.json'), null);
   const own = o && typeof o === 'object' && !Array.isArray(o) ? o : {};
@@ -226,7 +226,7 @@ export function loadOwnLinks(ctx) {
     const keep = (Array.isArray(list) ? list : []).filter((x) => x && typeof x.ino === 'string' && now - (x.at || 0) < OWN_LINKS_MAX_AGE_MS).slice(-OWN_LINKS_CAP);
     if (keep.length) links[id] = keep;
   }
-  return { ...(own.resetAt ? { resetAt: own.resetAt } : {}), links };
+  return { links };
 }
 
 /** The inode keys of recent links of ours for one id (a Set); with a folder, only the names we linked IN that folder (the winner's own name shares the inode but is not ours). */
@@ -235,3 +235,8 @@ export function ownInos(own, id, folder = null) {
 }
 
 export function saveOwnLinks(ctx, own) { writeJsonAtomic(accPath(ctx, 'own-links.json'), own); }
+
+/** The one-time hold reset is done once this small file EXISTS (whatever it holds): a missing or corrupt own-links.json never repeats it. */
+export const holdsResetDone = (ctx) => existsSync(accPath(ctx, 'holds-reset.json'));
+/** Written atomically before any hold is dropped. Throws when it cannot be written (the caller then skips the reset). */
+export function markHoldsReset(ctx) { writeJsonAtomic(accPath(ctx, 'holds-reset.json'), { at: new Date(ctx.now()).toISOString() }); }
