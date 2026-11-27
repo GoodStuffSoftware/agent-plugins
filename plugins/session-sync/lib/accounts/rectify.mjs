@@ -300,11 +300,11 @@ function run(group, o, rep) {
   // 0.5.16: it runs only when no older-version waiter is alive (it would re-hold, unrecorded, right after) and only once its done-marker
   // (holds-reset.json, atomic, its own file) is written: before any hold is dropped, and no reset when that write fails.
   let resetHolds = mode === 'targeted' && !holdsResetDone(ctx);
-  if (resetHolds && !dryRun) {
+  if (resetHolds) {
     let clear = true;
-    try { clear = oldWaiterGate(ctx) !== false; } catch { clear = false; }
+    try { clear = oldWaiterGate(ctx, { dry: dryRun }) !== false; } catch { clear = false; }   // a dry run asks without ending anything
     if (!clear) { resetHolds = false; rep.holdsResetDeferred = 'an older waiter is alive'; }
-    else { try { markHoldsReset(ctx); } catch { resetHolds = false; rep.holdsResetDeferred = 'the done-marker could not be written'; } }
+    else if (!dryRun) { try { markHoldsReset(ctx); } catch { resetHolds = false; rep.holdsResetDeferred = 'the done-marker could not be written'; } }
   }
   const groupKeys = group.map((f) => f.key);
   const folderPath = Object.fromEntries(group.map((f) => [f.key, f.path]));
@@ -314,7 +314,7 @@ function run(group, o, rep) {
   state.records ||= {};
   // 0.5.16: what the app loaded, as its record read then (la, turns): the base a continuation is judged against (see noteConflict).
   // Taken on the first pass after the snapshot, while the loaded folder still holds the snapshot's inode.
-  if (mode === 'targeted' && !dryRun) {
+  if (mode === 'targeted') {   // (a dry run writes it to its clone of the state)
     const lb = (state.loadedBase ||= {});
     for (const L of roles.loaded) {
       for (const [sid, sino] of Object.entries(state.loadedSnapshot?.[L] ?? {})) {
@@ -459,12 +459,7 @@ function run(group, o, rep) {
     // S1: the version a pass of ours left in the other folders, replaced by the next save of the same folder's session (the loaded app,
     // or a parked session), is an ancestor of that save: it needs no backup. Only a copy from another history (a stale continuation,
     // a switch flush, field drift) is backed up.
-    const prevWin = state.records?.[plan.id]?.win;
-    // 0.5.16: the loser is the inode a link of ours put in ITS folder (own-links) from the very inode the last pass recorded for the
-    // winner's folder (prevWin), not any inode of ours; or the last winner's inode itself
-    const supersedes = (loser) => mode === 'targeted' && !!prevWin && prevWin.f === plan.W.folder
-      && (prevWin.ino === loser.inoKey || (own.links[plan.id] ?? []).some((x) => x.f === loser.folder && x.ino === loser.inoKey && x.w === plan.W.folder))
-      && (roles.loaded.has(plan.W.folder) || isHeld(plan.W));
+    const supersedes = (loser) => superseded(plan, loser);
     for (const loser of plan.losers) {
       if (mode === 'live' && live.has(loser.folder)) { owe(plan.id, 'split-loser-live', loser.folder); continue; }
       const why = blockedWhy(loser);
@@ -487,6 +482,29 @@ function run(group, o, rep) {
   }
 
   /**
+   * 0.5.16: is this loser an ancestor of the winner, so replacing it needs no backup and is no conflict? Only for a winner the app (or a
+   * parked session) writes. True when the loser is (1) the very inode the last pass recorded as the winner's, in the same folder; (2) a link
+   * of ours (own-links) put in the loser's folder from the winner's folder; or (3) the inode the app loaded in the winner's folder at the
+   * switch (the winner is that copy, saved: an ordinary save breaks the link the loaded file shared with the other folders).
+   */
+  function superseded(plan, loser) {
+    if (mode !== 'targeted' || !plan.W) return false;
+    const Wf = plan.W.folder;
+    if (!(roles.loaded.has(Wf) || isHeld(plan.W))) return false;
+    const prevWin = state.records?.[plan.id]?.win;
+    if (prevWin && prevWin.f === Wf && prevWin.ino === loser.inoKey) return true;
+    if ((own.links[plan.id] ?? []).some((x) => x.f === loser.folder && x.ino === loser.inoKey && x.w === Wf)) return true;
+    return roles.loaded.has(Wf) && state.loadedSnapshot?.[Wf]?.[plan.id.toLowerCase()] === loser.inoKey;
+  }
+
+  /** Does this copy hold work the base lacks (a later record timestamp, or the same one and more completed turns) and differ from the winner's bytes? */
+  function holdsNewerWork(l, W, base) {
+    const ls = summarize(l);
+    if (!ls.ok || !base || !(ls.la > base.la || (ls.la === base.la && ls.turns > base.turns))) return false;
+    try { return sha256File(l.path) !== sha256File(W.path); } catch { return false; }
+  }
+
+  /**
    * The app continued a copy it loaded stale: the winner is in a loaded folder under an inode the app made after it loaded the folder,
    * and another folder holds a DIFFERENT newer version than the one the app loaded. Still the newest wins (the user's last action is
    * there and the shared transcript holds every turn); the loser is backed up when it is replaced, and the case is recorded for
@@ -503,21 +521,17 @@ function run(group, o, rep) {
       // has moved to now and proves nothing), and its content differs from the winner's. A copy that is an older save, or an ancestor
       // of the loaded one (an ordinary save of an up-to-date conversation), is not one. Without a base the winner's record stands in.
       const base = state.loadedBase?.[L]?.[plan.id.toLowerCase()] ?? plan.summary;
-      const reallyNewer = (l) => {
-        const ls = summarize(l);
-        if (!(ls.la > base.la || (ls.la === base.la && ls.turns > base.turns))) return false;
-        try { return sha256File(l.path) !== sha256File(plan.W.path); } catch { return false; }
-      };
-      const displaced = plan.losers.filter((loser) => loser.folder !== L && loser.inoKey !== snap && reallyNewer(loser));
+      const displaced = plan.losers.filter((loser) => loser.folder !== L && loser.inoKey !== snap && !superseded(plan, loser) && holdsNewerWork(loser, plan.W, base));
       if (!displaced.length) continue;
       state.conflicts ||= {};
       const prev = state.conflicts[plan.id];
-      // deduped on the identity of the other copies, folder and id (every save gives the winner AND a parked copy a new inode, so an
-      // inode is no identity): one report per episode, which ends when the conflict list is cleared (a switch or a new app run)
-      if (prev && displaced.every((l) => (prev.losers ?? [prev.loser]).includes(l.folder))) continue;
+      // deduped within one episode, which a retaken snapshot (a switch, a new app run) ends: a later stale continuation of the same id and
+      // folder is a new conflict and is reported again (the copy it displaced is backed up when it is replaced)
+      const ep = state.snapEpoch ?? 0;
+      if (prev && (prev.ep ?? 0) === ep && displaced.every((l) => (prev.losers ?? [prev.loser]).includes(l.folder))) continue;
       // N1: one entry names every displaced copy (the first is `loser`, all are in `losers`), not only the last one met
       const c = {
-        at: new Date(ctx.now()).toISOString(), winner: L, loser: displaced[0].folder, losers: displaced.map((l) => l.folder),
+        at: new Date(ctx.now()).toISOString(), ep, winner: L, loser: displaced[0].folder, losers: displaced.map((l) => l.folder),
         winnerIno: plan.W.inoKey, loserIno: displaced[0].inoKey, loserInos: displaced.map((l) => l.inoKey),
         cliChanged: displaced.some((l) => summarize(l).cli !== (plan.summary?.cli ?? null)), notified: false,
       };
@@ -529,11 +543,13 @@ function run(group, o, rep) {
   /* ---------------- operations ---------------- */
 
   /** true: re-linked. false: busy (EPERM and the like). A string: the target changed since the inventory, left as it is. */
-  function relink(W, loser, superseded = false) {
+  function relink(W, loser, ancestor = false) {
     check('relink', loser.folder, loser);
     if (dryRun) {
-      let backup = false; try { backup = !superseded && sha256File(loser.path) !== sha256File(W.path); } catch { /* unreadable: no backup claimed */ }
-      rep.dry.push({ op: 'relink', id: loser.id, folder: loser.folder, from: W.folder, backup, newerThanWinner: loser.mtimeMs > W.mtimeMs });
+      let backup = false; try { backup = !ancestor && sha256File(loser.path) !== sha256File(W.path); } catch { /* unreadable: no backup claimed */ }
+      // the replaced copy holds work the winner's base lacks (the conflict condition; the winner's own time is the newest by construction)
+      const base = (mode === 'targeted' && state.loadedBase?.[W.folder]?.[loser.id.toLowerCase()]) || summarize(W);
+      rep.dry.push({ op: 'relink', id: loser.id, folder: loser.folder, from: W.folder, backup, newerThanWinner: !ancestor && holdsNewerWork(loser, W, base) });
       return true;
     }
     const dst = loser.path;
@@ -549,7 +565,7 @@ function run(group, o, rep) {
         const t = statSync(tmp, { bigint: true });
         linked = `${t.dev}:${t.ino}`;
         // the backup only when a copy that differs is really about to be replaced; N8: look at the target again right after it (it takes a while)
-        if (!superseded && sha256File(dst) !== sha256File(tmp)) backupCopy(ctx, dst, { reason: 'split-loser', folder: loser.folder, name: loser.name });
+        if (!ancestor && sha256File(dst) !== sha256File(tmp)) backupCopy(ctx, dst, { reason: 'split-loser', folder: loser.folder, name: loser.name });
         const late = restat(loser);
         if (late) { try { unlinkSync(tmp); } catch { /* gone */ } note(loser.id, `${loser.folder}: ${late}; next pass`); return late; }
         renameSync(tmp, dst); err = null; break;

@@ -192,7 +192,7 @@ export function evaluateRunning(s1, s2, rec, now) {
  * Persists lock-stale.json when the stale counter changes.
  */
 export function appState(opts = {}) {
-  const { probeProcesses = false, ctx } = opts;
+  const { probeProcesses = false, ctx, readOnly = false } = opts;   // readOnly: the stale-lock record is read, never written (a dry run)
   const now = opts.now ?? ctx.now();
   const seam = testSeam();
   let s1; let s2; let signedIn; let startedAtMs; let s2Detail = null;
@@ -209,7 +209,7 @@ export function appState(opts = {}) {
   const prev = readJson(staleFile, null);
   const ev = evaluateRunning(!!s1, s2, prev, now);
   const changed = JSON.stringify(prev) !== JSON.stringify(ev.rec);
-  if (changed) {
+  if (changed && !readOnly) {
     try {
       if (ev.rec) writeJsonAtomic(staleFile, ev.rec);
       else unlinkSync(staleFile);

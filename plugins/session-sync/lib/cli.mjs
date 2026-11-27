@@ -35,8 +35,7 @@ import { requestDeferred, refreshDeferred, settleDeferred, readDeferred } from '
 import { makeCtx, loadState, saveState, accPath, readJson, writeJsonAtomic, rollbackActive, rollbackMarkerFile } from './accounts/state.mjs';
 import { listFolders, groupOf, accountsOf, pendingPairs, answerPairs } from './accounts/folders.mjs';
 import { appState, lockfilePresent } from './accounts/appstate.mjs';
-import { fullPass, livePass, link, unlink } from './accounts/pass.mjs';
-import { rectify as rectifyPass } from './accounts/rectify.mjs';
+import { fullPass, livePass, link, unlink, dryRectify } from './accounts/pass.mjs';
 import { ensureWaiter, runWaiter, replaceOldWaiter } from './accounts/waiter.mjs';
 import { rcSettings, wakeWithRelink, rcLogonStep, liveRelinkPass, rcSweep } from './accounts/rcrestore.mjs';
 import { rcRepair, turnEndHook, runTurnEnd } from './accounts/rcrepair.mjs';
@@ -891,7 +890,7 @@ async function accountsCommand(sub, args) {
       // 0.5.16: the rectify pass on a clone of the state, no lock and no writes; prints what it would change
       const state = loadState(ctx);
       if (!state.linked) return refused('not-linked', REASON('not-linked'));
-      const rec = rectifyPass(groupOf(state, listFolders(ctx.store)), { mode: 'full', ctx, state, dryRun: true });
+      const rec = dryRectify(ctx, { state });
       const dry = rec.dry ?? [];
       const ops = (op) => dry.filter((d) => d.op === op);
       const facts = {

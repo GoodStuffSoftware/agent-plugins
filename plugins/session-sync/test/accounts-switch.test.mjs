@@ -13,7 +13,7 @@ import { readFileSync, existsSync, readdirSync, writeFileSync, lstatSync, unlink
 import { fullPass, livePass, owedWork } from '../lib/accounts/pass.mjs';
 import { runWaiter } from '../lib/accounts/waiter.mjs';
 import { summaryStats, rectify, setOldWaiterGate } from '../lib/accounts/rectify.mjs';
-import { pruneBackups, backupCopy, resetBackupCache } from '../lib/accounts/backup.mjs';
+import { pruneBackups, backupCopy, resetBackupCache, sha256Buf } from '../lib/accounts/backup.mjs';
 import { loadState, saveState, emptyState, resetMutations, readJson } from '../lib/accounts/state.mjs';
 import { answerPairs, pairKey, listFolders, groupOf, pendingPairs, accountsOf } from '../lib/accounts/folders.mjs';
 import { G_SWITCH_MS, nameIsHeld } from '../lib/accounts/appstate.mjs';
@@ -25,6 +25,7 @@ import {
 import { createSim } from './fixtures/appsim.mjs';
 
 afterEach(() => { delete process.env.SESSION_SYNC_TEST_APP_STATE; resetMutations(); });
+const EMPTYOBJ_SHA = sha256Buf(Buffer.from('{}'));   // the content of the backup files the retention tests write
 
 const A = uuid('a', 1); const B = uuid('b', 1); const C = uuid('c', 1);
 const OA = uuid('1', 1); const OB = uuid('2', 2); const OC = uuid('3', 3);
@@ -809,10 +810,10 @@ test('0.5.16 retention: only the conversation-copy backups of a day that ended m
   mkdirSync(join(root, 'keepme'), { recursive: true });
   const at = (y, m, d) => new Date(y, m - 1, d, 12).toISOString();
   const lines = [
-    { at: at(2026, 11, 12), reason: 'split-loser', folder: 'x/y', name: 'old.json', sha256: 'a', dst: '2026-11-12/x/y/old.json' },
-    { at: at(2026, 11, 12), reason: 'delete', folder: 'x/y', name: 'deleted.json', sha256: 'd', dst: '2026-11-12/x/y/deleted.json' },
-    { at: at(2026, 11, 13), reason: 'split-loser', folder: 'x/y', name: 'edge.json', sha256: 'b', dst: '2026-11-13/x/y/edge.json' },
-    { at: at(2026, 11, 27), reason: 'split-loser', folder: 'x/y', name: 'new.json', sha256: 'c', dst: '2026-11-27/x/y/new.json' },
+    { at: at(2026, 11, 12), reason: 'split-loser', folder: 'x/y', name: 'old.json', sha256: EMPTYOBJ_SHA, dst: '2026-11-12/x/y/old.json' },
+    { at: at(2026, 11, 12), reason: 'delete', folder: 'x/y', name: 'deleted.json', sha256: EMPTYOBJ_SHA, dst: '2026-11-12/x/y/deleted.json' },
+    { at: at(2026, 11, 13), reason: 'split-loser', folder: 'x/y', name: 'edge.json', sha256: EMPTYOBJ_SHA, dst: '2026-11-13/x/y/edge.json' },
+    { at: at(2026, 11, 27), reason: 'split-loser', folder: 'x/y', name: 'new.json', sha256: EMPTYOBJ_SHA, dst: '2026-11-27/x/y/new.json' },
   ];
   writeFileSync(join(root, 'index.jsonl'), lines.map((o) => JSON.stringify(o)).join('\n') + '\n');
   // 2026-11-13 ended 13 d 23 h ago: kept. 2026-11-12 ended 14 d 23 h ago: its split-loser copy goes.
@@ -879,7 +880,7 @@ test('0.5.16 retention writes the index first: a file that cannot be deleted lea
   const root = join(r.acc, 'rectify-backups');
   mkdirSync(join(root, '2026-11-01/x'), { recursive: true });
   writeFileSync(join(root, '2026-11-01/x/o.json'), '{}');
-  writeFileSync(join(root, 'index.jsonl'), JSON.stringify({ at: new Date(2026, 10, 1, 12).toISOString(), reason: 'split-loser', name: 'o.json', sha256: 'a', dst: '2026-11-01/x/o.json' }) + '\n');
+  writeFileSync(join(root, 'index.jsonl'), JSON.stringify({ at: new Date(2026, 10, 1, 12).toISOString(), reason: 'split-loser', name: 'o.json', sha256: EMPTYOBJ_SHA, dst: '2026-11-01/x/o.json' }) + '\n');
   mkdirSync(`${join(root, 'index.jsonl')}.${process.pid}.tmp`);   // the index cannot be rewritten
   assert.throws(() => pruneBackups(r.ctx, { days: 14 }));
   assert.equal(existsSync(join(root, '2026-11-01/x/o.json')), true, 'nothing is deleted when the index could not be rewritten');

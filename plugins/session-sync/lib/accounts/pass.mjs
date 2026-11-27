@@ -138,6 +138,37 @@ function runFull(ctx, o, { state, app, group }, rep) {
 
 /* ------------------------------------------------------------------ live pass */
 
+/**
+ * What the app most likely loaded when it opened the signed-in account's folders: a switch, or a new app run. Each retake starts a new
+ * conflict episode (`state.snapEpoch`, which rectify stamps on the conflicts it records).
+ */
+function retakeSnapshot(state, app, group, sw) {
+  if (!(app.signedIn && (sw.changed || state.signed.snapRun !== app.startedAtMs))) return;
+  state.loadedSnapshot = {}; state.loadedBase = {};
+  for (const f of group) if (f.acct === app.signedIn) state.loadedSnapshot[f.key] = snapshotFolder(f.path);
+  state.signed.snapRun = app.startedAtMs;
+  state.snapEpoch = (state.snapEpoch ?? 0) + 1;
+}
+
+/**
+ * 0.5.16: `accounts rectify --dry-run`: the very decisions the next pass would make, written nowhere. App stopped: the full pass the waiter
+ * runs. App running: the targeted pass of livePass (roles, the snapshot a switch would retake, conflicts, the hold reset), on a clone of
+ * the state and without the switch record, the connector marker, the lock or the state file.
+ */
+export function dryRectify(ctx, o = {}) {
+  const app = o.app ?? appState({ ctx, probeProcesses: o.probeProcesses ?? true, readOnly: true });
+  const { state: loaded, group } = setup(ctx, { ...o, app });
+  const state = structuredClone(loaded);
+  if (!state.linked) return { skipped: 'not-linked' };
+  if (!app.running) return rectify(group, { mode: 'full', ctx, state, dryRun: true, remoteList: o.remoteList });
+  const now = ctx.now();
+  noteSignedIn(state, app.signedIn, now);
+  const sw = noteSwitch(state, app.signedIn, now);
+  const roles = folderRoles(app, group, state, now, group.filter((f) => !(state.group ?? []).includes(f.key)).map((f) => f.key));
+  retakeSnapshot(state, app, group, sw);
+  return rectify(group, { mode: 'targeted', ctx, state, roles, remoteList: o.remoteList, appStartedAtMs: app.startedAtMs, dryRun: true });
+}
+
 export async function livePass(ctx, o = {}) {
   const pre = setup(ctx, o);
   const { app } = pre;
@@ -162,11 +193,7 @@ export async function livePass(ctx, o = {}) {
       }
       const roles = folderRoles(app, group, state, now, group.filter((f) => !(state.group ?? []).includes(f.key)).map((f) => f.key));
       // what the app most likely loaded when it opened the signed-in account's folders: a switch, or a new app run
-      if (app.signedIn && (sw.changed || state.signed.snapRun !== app.startedAtMs)) {
-        state.loadedSnapshot = {}; state.loadedBase = {};
-        for (const f of group) if (f.acct === app.signedIn) state.loadedSnapshot[f.key] = snapshotFolder(f.path);
-        state.signed.snapRun = app.startedAtMs;
-      }
+      retakeSnapshot(state, app, group, sw);
       const pinned = new Set([...roles.loaded, ...roles.cooling]);
       rep.live = [...roles.loaded]; rep.cooling = [...roles.cooling]; rep.switched = sw.changed;
       const rec = rectify(group, { mode: 'targeted', roles, ctx, state, locked: true, remoteList: o.remoteList, appStartedAtMs: app.startedAtMs, testHook: o.testHook });

@@ -144,19 +144,42 @@ export function pruneBackups(ctx, { days = 14, force = false } = {}) {
   const files = [];
   const index = join(root, 'index.jsonl');
   if (existsSync(index)) {
-    const keep = [];
+    const shaOf = (rel) => { try { return sha256File(join(root, ...rel.split('/'))); } catch { return null; } };
+    const parsed = [];
     for (const line of readFileSync(index, 'utf8').split('\n')) {
       if (!line.trim()) continue;
-      let drop = false;
-      try {
-        const o = JSON.parse(line);
-        const rel = lineDst(o);
-        const day = rel ? rel.split('/')[0] : null;
-        if (day && aged(day) && PRUNABLE_REASONS.has(o.reason)) { drop = true; files.push(rel); gone.add(day); }
-      } catch { /* torn line: keep */ }
-      if (!drop) keep.push(line);
+      let o = null;
+      try { o = JSON.parse(line); } catch { /* torn line: kept */ }
+      parsed.push({ line, o });
     }
-    if (files.length) {
+    // The file of a line: its recorded `dst`. Lines written before 0.5.16 have none, and backupCopy gave a later copy of the same name
+    // and day the suffix .1, .2 ...: the file is the first of name, name.1, ... whose sha256 is the line's and that no other line holds.
+    const claimed = new Set();
+    const resolve = (o) => {
+      if (typeof o.dst === 'string' && o.dst) return o.dst;
+      const base = lineDst(o);
+      if (!base || typeof o.sha256 !== 'string') return null;
+      for (let i = 0; i < 200; i++) {
+        const rel = i === 0 ? base : `${base}.${i}`;
+        if (!claimed.has(rel) && shaOf(rel) === o.sha256) return rel;
+      }
+      return null;
+    };
+    const isDrop = (o) => { const rel = lineDst(o); const day = rel ? rel.split('/')[0] : null; return !!day && aged(day) && PRUNABLE_REASONS.has(o.reason); };
+    // lines that stay (another reason, or not old enough) claim their files first: a pruned line never takes one of theirs
+    for (const p of parsed) if (p.o && !isDrop(p.o)) { const rel = resolve(p.o); if (rel) claimed.add(rel); }
+    const keepIdx = new Set();
+    parsed.forEach((p, i) => {
+      if (!p.o || !isDrop(p.o)) { keepIdx.add(i); return; }
+      const rel = resolve(p.o);
+      const abs = rel ? join(root, ...rel.split('/')) : null;
+      if (rel) claimed.add(rel);
+      // a file is deleted only when its content is the one the line recorded; a changed file and its line stay
+      if (abs && existsSync(abs)) { if (shaOf(rel) !== p.o.sha256) { keepIdx.add(i); return; } files.push(rel); }
+      gone.add(lineDst(p.o).split('/')[0]);
+    });
+    if (keepIdx.size < parsed.length) {
+      const keep = parsed.filter((_, i) => keepIdx.has(i)).map((p) => p.line);
       const tmp = `${index}.${process.pid}.tmp`;
       writeFileSync(tmp, keep.length ? `${keep.join('\n')}\n` : '');
       renameSync(tmp, index);   // a failure here throws before anything is deleted

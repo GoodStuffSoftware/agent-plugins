@@ -170,6 +170,7 @@ export function replaceOldWaiter(ctx, deps = {}) {
   }
   const lockHeld = () => { const h = readJson(accPath(ctx, 'accounts.lock'), null); return !!h && h.pid === st.pid && pidAlive(h.pid); };
   if (lockHeld()) return { replaced: false, reason: 'busy', pid: st.pid };
+  if (deps.dry) return { replaced: false, reason: 'would-replace', pid: st.pid, version };   // a dry run: nothing is ended
   const claimedAt = mine?.at ?? (Date.parse(st.armedAt ?? '') || NaN);
   const v = (deps.verify ?? ((pid, want) => verifyProcess(pid, want)))(st.pid, { marker: WAITER_MARKER, claimedAt });
   if (v.reason === 'unverified') return { replaced: false, reason: 'unverified', pid: st.pid };
@@ -192,9 +193,10 @@ export function replaceOldWaiter(ctx, deps = {}) {
 
 // 0.5.16: the one-time hold reset (rectify.mjs) waits until no older-version waiter is alive: replaceOldWaiter ended it or found none
 // (a current or newer waiter is no older one). An older waiter that is unverified, busy or will not die defers the reset to a later pass.
-setOldWaiterGate((ctx) => {
-  const r = replaceOldWaiter(ctx);
-  return r.replaced === true || ['no-waiter', 'current', 'newer'].includes(r.reason);
+setOldWaiterGate((ctx, o = {}) => {
+  // a dry run (`accounts rectify --dry-run`) asks the same question and ends nothing: an older waiter it would replace is no obstacle
+  const r = replaceOldWaiter(ctx, o.dry ? { dry: true } : {});
+  return r.replaced === true || ['no-waiter', 'current', 'newer', 'would-replace'].includes(r.reason);
 });
 
 /**
